@@ -8,6 +8,7 @@ import warnings
 
 import functools
 import torch
+import os
 
 import transformer_engine_torch as tex
 
@@ -55,6 +56,10 @@ __all__ = ["GroupedLinear"]
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
     Calls custom cuda extensions.
+    """
+    
+    """
+    自定义 Autograd Function，用于执行多个 GEMM 操作（Grouped GEMM），支持 FP8 量化、权重缓存、CPU offload、梯度累积等。
     """
 
     @staticmethod
@@ -173,6 +178,7 @@ class _GroupedLinear(torch.autograd.Function):
             bias=biases,
             use_bias=use_bias,
             use_split_accumulator=use_split_accumulator,
+            gemm_type=os.getenv("AIS_GROUPGEMM_TYPE_FPROP", "te")
         )
 
         if fp8_calibration:
@@ -340,6 +346,7 @@ class _GroupedLinear(torch.autograd.Function):
                     m_splits=ctx.m_splits,
                     grad=True,
                     use_split_accumulator=dgrad_gemm_use_split_accumulator,
+                    gemm_type=os.getenv("AIS_GROUPGEMM_TYPE_DGRAD", "te")
                 )
 
             if ctx.weights_requires_grad:
@@ -368,6 +375,7 @@ class _GroupedLinear(torch.autograd.Function):
                     bias=biases,
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate_wgrad_into_param_main_grad,
+                    gemm_type=os.getenv("AIS_GROUPGEMM_TYPE_WGRAD", "te")
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():

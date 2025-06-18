@@ -1,0 +1,112 @@
+{
+  "configs": [
+    {
+    "group_config": [
+        [
+            8192,
+            4096,
+            8192
+        ],
+        [
+            8192,
+            4096,
+            8192
+        ]
+    ],
+      "gemm_type": "te",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    },
+    {
+    "group_config": [
+        [
+            8192,
+            4096,
+            8192
+        ],
+        [
+            8192,
+            4096,
+            8192
+        ]
+    ],
+      "gemm_type": "cublas",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    },
+    {
+    "group_config": [
+        [
+            8192,
+            4096,
+            8192
+        ],
+        [
+            8192,
+            4096,
+            8192
+        ]
+    ],
+      "gemm_type": "cutlass",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    },
+    {
+    "group_config": [
+        [
+            8192,
+            8192,
+            8192
+        ],
+        [
+            8192,
+            8192,
+            8192
+        ]
+    ],
+      "gemm_type": "te",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    },
+    {
+    "group_config": [
+        [
+            8192,
+            8192,
+            8192
+        ],
+        [
+            8192,
+            8192,
+            8192
+        ]
+    ],
+      "gemm_type": "cublas",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    },
+    {
+    "group_config": [
+        [
+            8192,
+            8192,
+            8192
+        ],
+        [
+            8192,
+            8192,
+            8192
+        ]
+    ],
+      "gemm_type": "cutlass",
+      "check_performance": true,
+      "transa": true,
+      "transb": false
+    }
+  ]
+}

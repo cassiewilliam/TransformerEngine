@@ -1,0 +1,220 @@
+import torch
+import time
+from typing import List, Tuple
+from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+from transformer_engine.pytorch.module.base import get_multi_stream_cublas_workspace
+import argparse
+import json
+
+class TEGPUGroupGemmTester:
+    def __init__(self, group_config, dtype=torch.float16, accumulate=False, transa = False, transb = False):
+        self.dtype = dtype
+        self.accumulate = accumulate
+        
+        self.num_groups = len(group_config)
+        
+        self.group_config = group_config
+        
+        self.m_splits = []
+        for i in range(self.num_groups):
+            self.m_splits.append(group_config[i][0])
+        
+        self.transa = transa
+        self.transb = transb
+        self.device = torch.cuda.get_device_name(0)
+    
+    def generate_inputs_outputs(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        #               Python    B * A                     |                  cuBLAS                |                CUTLASS                 |
+        # transa transb layout A     B     C     ldb ldb ldc| transa transb layout A     B     C     | transa transb layout A     B     C     |  
+        # false  fasle  NN     k * m n * k n * m  m   k   m | false  fasle  NN     k * m n * k n * m | false  fasle  NN     k * m n * k m * n |  
+        # true   false  TN     m * k n * k n * m  k   k   m | true   false  TN     m * k k * n n * m | true   false  TN     m * k k * n n * m |  
+        # false  true   NT     k * m k * n n * m  m   n   m | false  true   NT     k * m n * k n * m | false  true   NT     k * m n * k n * m |  
+        # true   true   not support yet                     | true   true   not support yet          | true   true   not support yet          |  
+        
+        '''
+            layout NN
+            cuBLAS m x n x k : 64 x 128 x 1024
+            A (1024x64, row-major)     B (128x1024, row-major)
+            === 被 cuBLAS 看成 ===       === 被 cuBLAS 看成 ===
+            描述(col-major):               描述(col-major):
+             A (64 x 1024)                 B (1024 x 128)
+                lda 64                         ldb 1024
+                    ↓                              ↓
+                    →→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+                                GEMM
+                    ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+                                  ↓
+                    真实为: D col_major(128 x 64)
+                               ldd 64
+
+                        描述为(row-major): 
+                            D (64 x 128)
+            ============================================================
+            CUTLASS m x n x k: 64 x 128 x 1024
+            真实: A (1024x64, row-major)       B (128x1024, row-major)            
+                        ----                            ----
+                            ----                    ----
+                                ----            ---- 
+                                    ----    ----
+                                        ----
+                                    ----    ----
+                                ----            ---- 
+                            ----                    ----
+                      <----                             ---->
+            === 被 CUTLASS 看成 ===             === 被 CUTLASS 看成 ===
+                描述(row-major):                    描述(row-major):
+                B (128 x 1024)                      A (1024 x 64)
+                SrideB (1024, _1, 0)                SrideA (64, _1, 0)
+                        ↓                                  ↓
+                            →→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+                                        GEMM
+                            ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+                                         ↓
+                                 D row_major(128 x 64)
+                                      StrideD (64, _1, 0)
+        '''
+        
+        A_list, B_list, C_list = [], [], []
+        for n, m, k in self.group_config:
+            A = torch.randn(k if not self.transa else m, m if not self.transa else k, dtype=self.dtype, device='cuda')
+            B = torch.randn(n if not self.transb else k, k if not self.transb else n, dtype=self.dtype, device='cuda')
+            C = torch.zeros(n, m, dtype=self.dtype, device='cuda')  # Output
+            A_list.append(A)
+            B_list.append(B)
+            C_list.append(C)
+        return A_list, B_list, C_list
+    
+    def test_grouped_gemm(self, atol=1e-2, rtol=1e-2, check_accuracy=True, check_performance=False, gemm_type='te'):
+        
+        WARM_ITERS = 10
+        ITERS = 1000
+    
+        A, B, C = self.generate_inputs_outputs()
+
+        if not self.transa and not self.transb:
+            layout="NN"
+        elif not self.transa:
+            layout="NT"
+        elif not self.transb:
+            layout="TN"
+        else:
+            print("Not Support TT")
+            return
+
+        torch.cuda.synchronize()
+        general_grouped_gemm(
+            A,
+            B,
+            C,
+            self.dtype,
+            get_multi_stream_cublas_workspace(),
+            layout=layout,
+            m_splits=self.m_splits,
+            accumulate=self.accumulate,
+            gemm_type=gemm_type
+        )
+        torch.cuda.synchronize()
+        # 精度验证部分
+        print(f"\n=== 精度测试 Layout:{layout} GemmType:{gemm_type} ===")
+        if check_accuracy:
+            # 先计算参考输出
+            
+            # for a, b in zip(A, B):
+            #     print("a: shape", a.shape)
+            #     print("b: shape", b.shape)
+                
+            ref_out = [torch.matmul(b if not self.transb else b.T, a if not self.transa else a.T) for b, a in zip(B, A)]
+
+            max_abs_err = []
+            max_rel_err = []
+            for i in range(self.num_groups):
+                abs_err = (ref_out[i] - C[i]).abs()
+                print(ref_out[i].shape)
+                print(C[i].shape)
+                rel_err = abs_err / (ref_out[i].abs() + 1e-5)
+                max_abs_err.append(abs_err.max().item())
+                max_rel_err.append(rel_err.max().item())
+
+                if not torch.allclose(C[i], ref_out[i], atol=atol, rtol=rtol):
+                    print(f"[Group {i}] ❌ Mismatch:")
+                    print(f"  Max Abs Error = {max_abs_err[-1]:.6f}")
+                    print(f"  Max Rel Error = {max_rel_err[-1]:.6f}")
+                else:
+                    print(f"[Group {i}] ✅ Passed: max abs error = {max_abs_err[-1]:.6f}, max rel error = {max_rel_err[-1]:.6f}")
+
+        if check_performance:
+            print("\n=== 性能测试 ===")
+            # warm up
+            torch.cuda.synchronize()
+            for _ in range(WARM_ITERS):
+                general_grouped_gemm(
+                    A,
+                    B,
+                    C,
+                    self.dtype,
+                    get_multi_stream_cublas_workspace(),
+                    layout=layout,
+                    m_splits=self.m_splits,
+                    accumulate=self.accumulate,
+                    gemm_type=gemm_type
+                )
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            for _ in range(ITERS):
+                general_grouped_gemm(
+                    A,
+                    B,
+                    C,
+                    self.dtype,
+                    get_multi_stream_cublas_workspace(),
+                    layout=layout,
+                    m_splits=self.m_splits,
+                    accumulate=self.accumulate,
+                    gemm_type=gemm_type
+                )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            exec_time = end_time - start_time
+            
+            avg_time_ms = exec_time * 1000 / ITERS
+            
+            # FLOPs 计算
+            total_flops = sum([2 * m * n * k for (m, n, k) in self.group_config])
+            tflops = total_flops / (avg_time_ms * 1e9)
+
+            print(f"🔥 平均耗时: {avg_time_ms:.3f} ms/iter")
+            print(f"⚡ 平均性能: {tflops:.2f} TFLOPs")
+
+def run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb):
+    print(f"🔧 Running grouped GEMM with:")
+    print(f"  group_config = {group_config}")
+    print(f"  gemm_type = {gemm_type}")
+    print(f"  check_performance = {check_performance}")
+    print(f"  transa = {transa}, transb = {transb}")
+    print("-" * 50)
+    # TODO: 调用你的实际 CutlassGroupedGemm 函数或其他逻辑
+    # CutlassGroupedGemm(transa, transb, ...)
+    tester = TEGPUGroupGemmTester(group_config, transa=transa, transb=transb)
+    tester.test_grouped_gemm(gemm_type=gemm_type, check_performance=check_performance)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Grouped GEMM test from JSON config")
+    parser.add_argument("--config_file", type=str, required=True,
+                        help="Path to JSON config file with test cases")
+    args = parser.parse_args()
+
+    with open(args.config_file, 'r') as f:
+        config_data = json.load(f)
+
+    for i, case in enumerate(config_data["configs"]):
+        group_config = [tuple(x) for x in case["group_config"]]
+        gemm_type = case["gemm_type"]
+        check_performance = case.get("check_performance", False)
+        # NOTE(Alan): for cublas weight is A, input is B
+        #             so we need to swap A B
+        transb = case.get("transa", False)
+        transa = case.get("transb", False)
+
+        print(f"\n🧪 Case {i+1}:")
+        run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb)

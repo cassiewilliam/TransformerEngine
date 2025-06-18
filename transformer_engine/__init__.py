@@ -64,4 +64,5 @@ except FileNotFoundError as e:
                 category=RuntimeWarning,
             )
 
-__version__ = str(metadata.version("transformer_engine"))
+__version__ = "release_v2.5_opt_groupgemm"
+# __version__ = str(metadata.version("transformer_engine"))
