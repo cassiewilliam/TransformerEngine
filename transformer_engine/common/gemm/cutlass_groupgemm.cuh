@@ -116,12 +116,13 @@ typename GemmT::Arguments MakeArguments(int num_experts, void* problem_sizes_hos
                                         void* problem_sizes, const ElementA** ptr_A,
                                         StrideA* stride_A, const ElementB** ptr_B,
                                         StrideB* stride_B, ElementC** ptr_C, StrideC* stride_C,
-                                        float alpha, float beta, int device) {
+                                        float alpha, float beta, int device, int math_sm_count) {
   // Change device_id to another value if you are running on a machine with multiple GPUs and wish
   // to use a GPU other than that with device ID 0.
 
   cutlass::KernelHardwareInfo kernel_hw_info =
-      cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename GemmT::GemmKernel>(device);
+      cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename GemmT::GemmKernel>(
+          device, math_sm_count);
 
   typename GemmT::Arguments arguments;
   decltype(arguments.epilogue.thread) fusion_args;
@@ -197,7 +198,7 @@ int64_t inline getLddSize(int64_t num_gemms) {
 template <bool trans_a, bool trans_b, typename Element>
 void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVTETensor* B,
                         NVTETensor* D, NVTETensor* workspace, float alpha, float beta,
-                        int num_gemms, cudaStream_t stream, int device) {
+                        int num_gemms, cudaStream_t stream, int device, int math_sm_count) {
   using Gemm = GemmGrouped<Element, trans_a, trans_b>;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
@@ -214,8 +215,8 @@ void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVT
   typename Gemm::Arguments arguments;
   size_t workspace_size = Gemm::get_workspace_size(arguments);
 
-  char* all_workspace =
-      (char*)(reinterpret_cast<const transformer_engine::Tensor*>(workspace[0])->data.dptr);
+  transformer_engine::Tensor* wspace = transformer_engine::convertNVTETensor(workspace[0]);
+  char* all_workspace = (char*)(wspace->data.dptr);
 
   char* workspace_ptr = nullptr;
   auto gemm_coord_size = getGemmCoordSize(num_gemms);
@@ -240,11 +241,10 @@ void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVT
       reinterpret_cast<StrideC*>(host_workspace + gemm_coord_size + 3 * ptr_size + 2 * ldd_size);
 
   for (size_t i = 0; i < num_gemms; i++) {
-    const transformer_engine::Tensor* inputA =
-        reinterpret_cast<const transformer_engine::Tensor*>(A[i]);
-    const transformer_engine::Tensor* inputB =
-        reinterpret_cast<const transformer_engine::Tensor*>(B[i]);
-    transformer_engine::Tensor* outputD = reinterpret_cast<transformer_engine::Tensor*>(D[i]);
+
+    const transformer_engine::Tensor* inputA = transformer_engine::convertNVTETensorCheck(A[i]);
+    const transformer_engine::Tensor* inputB = transformer_engine::convertNVTETensorCheck(B[i]);
+    transformer_engine::Tensor* outputD = transformer_engine::convertNVTETensor(D[i]);
 
     const int m = transa ? inputA->data.shape[1] : inputA->data.shape[0];
     const int k = transa ? inputA->data.shape[0] : inputA->data.shape[1];
@@ -296,7 +296,7 @@ void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVT
 
   arguments = MakeArguments<Gemm, ElementA, ElementB, ElementC, StrideA, StrideB, StrideC>(
       num_gemms, problem_sizes_host, problem_sizes_device, ptr_A, lda, ptr_B, ldb, ptr_C, ldc,
-      alpha, beta, device);
+      alpha, beta, device, math_sm_count);
 
   Gemm gemm;
 
@@ -332,16 +332,16 @@ void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVT
 template <typename T>
 void CutlassGroupedGemm(bool transa, bool transb, const NVTETensor* A, const NVTETensor* B,
                         NVTETensor* D, NVTETensor* workspace, float alpha, float beta,
-                        int num_gemms, cudaStream_t stream, int device) {
+                        int num_gemms, cudaStream_t stream, int device, int math_sm_count) {
   if (!transa && !transb) {
     CutlassGroupedGemm<false, false, T>(transa, transb, A, B, D, workspace, alpha, beta, num_gemms,
-                                        stream, device);
+                                        stream, device, math_sm_count);
   } else if (transa) {
     CutlassGroupedGemm<true, false, T>(transa, transb, A, B, D, workspace, alpha, beta, num_gemms,
-                                       stream, device);
+                                       stream, device, math_sm_count);
   } else if (transb) {
     CutlassGroupedGemm<false, true, T>(transa, transb, A, B, D, workspace, alpha, beta, num_gemms,
-                                       stream, device);
+                                       stream, device, math_sm_count);
   } else {
     throw std::invalid_argument("Invalid transpose combination");
   }

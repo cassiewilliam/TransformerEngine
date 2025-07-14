@@ -52,7 +52,7 @@ uint32_t _getAlignment(uintptr_t address) {
   }
 }
 
-inline void CreateCublasLtHandle(cublasLtHandle_t *handle) {
+inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
 }
 
@@ -63,8 +63,6 @@ inline void CreateCublasLtHandle(cublasLtHandle_t *handle) {
  * Transformer Engine.
  *
  */
-inline void CreateCublasHandle(cublasHandle_t *handle) { NVTE_CHECK_CUBLAS(cublasCreate(handle)); }
-
 struct GemmParam {
   void *A = nullptr;
   void *B = nullptr;
@@ -230,8 +228,7 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
 
 namespace transformer_engine {
 
-using cublasLtHandleManager = detail::HandleManager<cublasLtHandle_t, CreateCublasLtHandle>;
-using cublasHandleManager = detail::HandleManager<cublasHandle_t, CreateCublasHandle>;
+using cublasHandleManager = detail::HandleManager<cublasLtHandle_t, CreateCublasHandle>;
 
 void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
                  const Tensor *inputBias, Tensor *outputPreGelu, cublasOperation_t transa,
@@ -300,7 +297,7 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   float zero = 0.0;
   float beta = (accumulate) ? one : zero;
 
-  cublasLtHandle_t handle = cublasLtHandleManager::Instance().GetHandle();
+  cublasLtHandle_t handle = cublasHandleManager::Instance().GetHandle();
 
   cublasLtMatmulDesc_t operationDesc = nullptr;
   cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr, Ddesc = nullptr;
@@ -674,154 +671,6 @@ using cublasHandleManager = detail::HandleManager<cublasLtHandle_t, CreateCublas
 void nvte_cublas_handle_init() { auto _ = cublasHandleManager::Instance().GetHandle(); }
 
 }  //  namespace transformer_engine
-static void check_equal(const std::vector<int> &a, const std::vector<int> &b,
-                        const std::string &err_msg) {
-  for (int i = 0; i < a.size(); ++i) {
-    NVTE_CHECK(a[i] == b[i], err_msg);
-  }
-}
-
-// static torch::Tensor create_ptr_pointer(const std::vector<void *> &ptrs, cudaStream_t stream) {
-//   auto options = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
-//   torch::Tensor gpu_ptrs = torch::empty({static_cast<int>(ptrs.size())}, options);
-//   NVTE_CHECK(cudaMemcpyAsync(gpu_ptrs.data_ptr(), ptrs.data(), sizeof(void *) * ptrs.size(),
-//                              cudaMemcpyHostToDevice, stream) == CUBLAS_STATUS_SUCCESS);
-//   return gpu_ptrs;
-// }
-
-void **CopyPointerArrayToDeviceVoid(const std::vector<void *> &host_ptrs, cudaStream_t stream) {
-  void **device_typed_ptrs = nullptr;
-  size_t total_bytes = host_ptrs.size() * sizeof(void *);
-
-  NVTE_CHECK_CUDA(cudaMalloc(&device_typed_ptrs, total_bytes));
-  NVTE_CHECK_CUDA(cudaMemcpyAsync(device_typed_ptrs, host_ptrs.data(), total_bytes,
-                                  cudaMemcpyHostToDevice, stream));
-  return device_typed_ptrs;
-}
-
-void nvte_cublas_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
-                              const NVTETensor *bias, NVTETensor *pre_gelu_out, const int num_gemms,
-                              bool transa, bool transb, bool grad, NVTETensor *workspace,
-                              bool accumulate, bool use_split_accumulator, int math_sm_count,
-                              cudaStream_t stream) {
-  NVTE_API_CALL(nvte_cublas_grouped_gemm);
-  using namespace transformer_engine;
-
-  // wait for current stream to finish
-  static cudaEvent_t finish_event;
-  static std::once_flag event_init_flag;
-  std::call_once(event_init_flag, []() { NVTE_CHECK_CUDA(cudaEventCreate(&finish_event)); });
-
-  std::vector<cublasOperation_t> transa_array(num_gemms);
-  std::vector<cublasOperation_t> transb_array(num_gemms);
-
-  // Get dim arrays
-  std::vector<int> m_array(num_gemms);
-  std::vector<int> n_array(num_gemms);
-  std::vector<int> k_array(num_gemms);
-
-  // Get leading dimensions
-  std::vector<int> lda_array(num_gemms);
-  std::vector<int> ldb_array(num_gemms);
-  std::vector<int> ldd_array(num_gemms);
-
-  // Use default scaling factors
-  std::vector<float> alpha_array(num_gemms, 1.0);
-  std::vector<float> beta_array(num_gemms, 0.0);
-
-  cudaDataType_t A_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(A[0])->data.dtype);
-  cudaDataType_t B_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(B[0])->data.dtype);
-  cudaDataType_t D_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(D[0])->data.dtype);
-
-  std::vector<void *> a_array(num_gemms);
-  std::vector<void *> b_array(num_gemms);
-  std::vector<void *> d_array(num_gemms);
-
-  for (int i = 0; i < num_gemms; i++) {
-    const Tensor *inputA = reinterpret_cast<const Tensor *>(A[i]);
-    const Tensor *inputB = reinterpret_cast<const Tensor *>(B[i]);
-    Tensor *outputD = reinterpret_cast<Tensor *>(D[i]);
-
-    transa_array[i] = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
-    transb_array[i] = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
-
-    const int m = transa ? inputA->data.shape[0] : inputA->data.shape[1];
-    const int k = transa ? inputA->data.shape[1] : inputA->data.shape[0];
-    const int n = transb ? inputB->data.shape[1] : inputB->data.shape[0];
-
-    m_array[i] = m;
-    n_array[i] = n;
-    k_array[i] = k;
-
-    int lda, ldb, ldd;
-    if (transa && !transb) {  // TN
-      lda = k;
-      ldb = k;
-      ldd = m;
-    } else if (!transa && !transb) {  // NN
-      lda = m;
-      ldb = k;
-      ldd = m;
-    } else if (!transa && transb) {  // NT
-      lda = m;
-      ldb = n;
-      ldd = m;
-    } else {  // TT
-      NVTE_ERROR("TT layout not allowed.");
-    }
-
-    lda_array[i] = lda;
-    ldb_array[i] = ldb;
-    ldd_array[i] = ldd;
-
-    a_array[i] = inputA->data.dptr;
-    b_array[i] = inputB->data.dptr;
-    d_array[i] = outputD->data.dptr;
-  }
-
-  cublasHandle_t handle = cublasHandleManager::Instance().GetHandle();
-
-  // NOTE(Alan): 用于判定A,B,D Array中的每个group含有多少个指针
-  std::vector<int> group_size(num_gemms, 1);
-
-  // Should allocate tensors for storage of pointers
-
-  void **d_a = CopyPointerArrayToDeviceVoid(a_array, stream);
-  void **d_b = CopyPointerArrayToDeviceVoid(b_array, stream);
-  void **d_d = CopyPointerArrayToDeviceVoid(d_array, stream);
-
-  // clang-format off
-#if defined CUDA_VERSION && CUDA_VERSION >= 12050
-  auto status = cublasGemmGroupedBatchedEx(
-      handle,
-      transa_array.data(),
-      transb_array.data(),
-      m_array.data(),
-      n_array.data(),
-      k_array.data(),
-      alpha_array.data(),
-      d_a, A_type, lda_array.data(),
-      d_b, B_type, ldb_array.data(),
-      beta_array.data(),
-      d_d, D_type, ldd_array.data(),
-      num_gemms, group_size.data(), CUBLAS_COMPUTE_32F);
-  NVTE_CHECK(status == CUBLAS_STATUS_SUCCESS,
-             "cublas grouped gemm failed: ", cublasGetStatusString(status));
-
-  NVTE_CHECK_CUDA(cudaFree(d_a));
-  NVTE_CHECK_CUDA(cudaFree(d_b));
-  NVTE_CHECK_CUDA(cudaFree(d_d));
-
-    // 非阻塞同步，记录事件，由上层决定是否同步等待
-  NVTE_CHECK_CUDA(cudaEventRecord(finish_event, stream));
-  NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream, finish_event));
-
-  return;
-#endif
-  // clang-format on
-
-  NVTE_CHECK(false, "Cublas GroupGemm is not implemented with current compute capability");
-}
 
 void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
                                const NVTETensor *bias, NVTETensor *pre_gelu_out,
@@ -836,9 +685,12 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   static std::once_flag event_init_flag;
   std::call_once(event_init_flag, []() { NVTE_CHECK_CUDA(cudaEventCreate(&finish_event)); });
 
-  cudaDataType_t A_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(A[0])->data.dtype);
-  cudaDataType_t B_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(B[0])->data.dtype);
-  cudaDataType_t D_type = get_cuda_dtype(reinterpret_cast<const Tensor *>(D[0])->data.dtype);
+  const Tensor *inputA = convertNVTETensorCheck(A[0]);
+  const Tensor *inputB = convertNVTETensorCheck(B[0]);
+  Tensor *outputD = convertNVTETensor(D[0]);
+  cudaDataType_t A_type = get_cuda_dtype(inputA->data.dtype);
+  cudaDataType_t B_type = get_cuda_dtype(inputB->data.dtype);
+  cudaDataType_t D_type = get_cuda_dtype(outputD->data.dtype);
 
   float one = 1.0;
   float zero = 0.0;
@@ -848,11 +700,11 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   int device = transformer_engine::cuda::current_device();
 
   if (A_type == CUDA_R_16BF) {
-    grouped_gemm::CutlassGroupedGemm<cutlass::bfloat16_t>(transb, transa, B, A, D, workspace, alpha,
-                                                          beta, num_gemms, stream, device);
+    grouped_gemm::CutlassGroupedGemm<cutlass::bfloat16_t>(
+        transb, transa, B, A, D, workspace, alpha, beta, num_gemms, stream, device, math_sm_count);
   } else if (A_type == CUDA_R_16F) {
-    grouped_gemm::CutlassGroupedGemm<cutlass::half_t>(transb, transa, B, A, D, workspace, alpha,
-                                                      beta, num_gemms, stream, device);
+    grouped_gemm::CutlassGroupedGemm<cutlass::half_t>(
+        transb, transa, B, A, D, workspace, alpha, beta, num_gemms, stream, device, math_sm_count);
   } else {
     NVTE_ERROR("Invalid data type: only CUDA_R_16BF (BF16) and CUDA_R_16F (FP16) are supported.");
   }

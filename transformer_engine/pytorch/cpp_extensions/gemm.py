@@ -170,28 +170,8 @@ def general_grouped_gemm(
             for o in out
         ]  # this should differ with respect to single output
 
-    # TODO(Alan): 需要增加判断条件，去除某些参数当前cublas或者cutlass group gemm 没法发支持的情况
-    if gemm_type == 'cublas':
-        bias = tex.cublas_general_grouped_gemm(
-            A,
-            transa,
-            B,
-            transb,
-            out,
-            out_dtype,
-            m_splits,
-            grad_bias if grad else bias,
-            bias_dtype,
-            single_output,
-            gelu_input,  # this is pre_gelu_out
-            grad,  # grad
-            workspaces,
-            workspaces[0].shape[0],
-            accumulate,
-            use_split_accumulator,
-            sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
-        )
-    elif gemm_type == 'cutlass':
+    # TODO(Alan): 需要增加判断条件，去除某些参数当前cutlass group gemm 没法发支持的情况
+    if gemm_type == 'cutlass':
         bias = tex.cutlass_general_grouped_gemm(
             A,
             transa,
