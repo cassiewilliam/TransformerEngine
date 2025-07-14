@@ -67,7 +67,7 @@ def _make_graphed_callables(
     _num_layers_per_chunk: Optional[List[int]] = None,
     pool: Optional[Tuple[int, ...]] = None,
     retain_graph_in_backward: bool = False,
-    _reuse_graph_input_output_buffers: bool = False,
+    _reuse_graph_input_output_buffers: bool = True,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -784,7 +784,7 @@ def make_graphed_callables(
     _num_layers_per_chunk: Optional[List[int]] = None,
     pool: Optional[Tuple[int, ...]] = None,
     retain_graph_in_backward: bool = False,
-    _reuse_graph_input_output_buffers: bool = False,
+    _reuse_graph_input_output_buffers: bool = True,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
