@@ -74,22 +74,24 @@ class TEGPUGroupGemmTester:
                                       StrideD (64, _1, 0)
         '''
         
-        A_list, B_list, C_list = [], [], []
+        A_list, B_list, C_list, ref_C_list = [], [], [], []
         for n, m, k in self.group_config:
             A = torch.randn(k if not self.transa else m, m if not self.transa else k, dtype=self.dtype, device='cuda')
             B = torch.randn(n if not self.transb else k, k if not self.transb else n, dtype=self.dtype, device='cuda')
-            C = torch.zeros(n, m, dtype=self.dtype, device='cuda')  # Output
+            ref_C = torch.randn(n, m, dtype=self.dtype, device='cuda')
+            C = ref_C.clone()
             A_list.append(A)
             B_list.append(B)
             C_list.append(C)
-        return A_list, B_list, C_list
+            ref_C_list.append(ref_C)
+        return A_list, B_list, C_list, ref_C_list
     
     def test_grouped_gemm(self, atol=1e-2, rtol=1e-2, check_accuracy=True, check_performance=False, gemm_type='te'):
         
         WARM_ITERS = 10
         ITERS = 1000
     
-        A, B, C = self.generate_inputs_outputs()
+        A, B, C, ref_C = self.generate_inputs_outputs()
 
         if not self.transa and not self.transb:
             layout="NN"
@@ -122,8 +124,11 @@ class TEGPUGroupGemmTester:
             # for a, b in zip(A, B):
             #     print("a: shape", a.shape)
             #     print("b: shape", b.shape)
+            
+            alpha = 1.0
+            beta = 1.0 if self.accumulate else 0.0
                 
-            ref_out = [torch.matmul(b if not self.transb else b.T, a if not self.transa else a.T) for b, a in zip(B, A)]
+            ref_out = [alpha * torch.matmul(b if not self.transb else b.T, a if not self.transa else a.T) + beta * c for b, a, c in zip(B, A, ref_C)]
 
             max_abs_err = []
             max_rel_err = []
@@ -186,7 +191,7 @@ class TEGPUGroupGemmTester:
             print(f"🔥 平均耗时: {avg_time_ms:.3f} ms/iter")
             print(f"⚡ 平均性能: {tflops:.2f} TFLOPs")
 
-def run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb):
+def run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb, accumulate):
     print(f"🔧 Running grouped GEMM with:")
     print(f"  group_config = {group_config}")
     print(f"  gemm_type = {gemm_type}")
@@ -195,7 +200,7 @@ def run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb)
     print("-" * 50)
     # TODO: 调用你的实际 CutlassGroupedGemm 函数或其他逻辑
     # CutlassGroupedGemm(transa, transb, ...)
-    tester = TEGPUGroupGemmTester(group_config, transa=transa, transb=transb)
+    tester = TEGPUGroupGemmTester(group_config, transa=transa, transb=transb, accumulate=accumulate)
     tester.test_grouped_gemm(gemm_type=gemm_type, check_performance=check_performance)
 
 if __name__ == "__main__":
@@ -210,6 +215,7 @@ if __name__ == "__main__":
     for i, case in enumerate(config_data["configs"]):
         group_config = [tuple(x) for x in case["group_config"]]
         gemm_type = case["gemm_type"]
+        accumulate = case.get("accumulate", False)
         check_performance = case.get("check_performance", False)
         # NOTE(Alan): for cublas weight is A, input is B
         #             so we need to swap A B
@@ -217,4 +223,4 @@ if __name__ == "__main__":
         transa = case.get("transb", False)
 
         print(f"\n🧪 Case {i+1}:")
-        run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb)
+        run_grouped_gemm(group_config, gemm_type, check_performance, transa, transb, accumulate)
