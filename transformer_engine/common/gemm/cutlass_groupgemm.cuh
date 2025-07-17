@@ -143,7 +143,7 @@ typename GemmT::Arguments MakeArguments(int num_experts, void* problem_sizes_hos
       {ptr_A, stride_A, ptr_B, stride_B},
       {
           fusion_args,
-          nullptr,
+          (beta > 0.0) ? (const ElementC**)ptr_C : nullptr,
           stride_C,
           ptr_C,
           stride_C,
