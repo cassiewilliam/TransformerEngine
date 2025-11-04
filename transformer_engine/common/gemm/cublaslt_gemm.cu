@@ -738,6 +738,20 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
              "cuBLAS workspace pointer must be aligned to 256 bytes, got ",
              new_workspace_alignment);
 
+  /*
+  // ---- Debug Info ----
+  printf("[DEBUG] GEMM dims: m=%d, n=%d, k=%d\n", m, n, k);
+  printf("[DEBUG] transA=%d, transB=%d, bias=%d, gelu=%d, grad=%d\n", transa, transb, bias, gelu,
+         grad);
+  printf("[DEBUG] A_type=%d, B_type=%d, D_type=%d\n", A_type, B_type, D_type);
+  printf("[DEBUG] scaling_mode_a=%d, scaling_mode_b=%d\n", (int)inputA->scaling_mode,
+         (int)inputB->scaling_mode);
+  printf("[DEBUG] use_fp8=%d, use_fp4=%d, use_split_accumulator=%d\n", use_fp8, use_fp4,
+         use_split_accumulator);
+  printf("[DEBUG] cuBLAS version: %d, CUDA version: %d\n", cublas_version(), CUDA_VERSION);
+  printf("[DEBUG] workspaceSize=%zu\n", workspaceSize);
+  //*/
+
   const auto status =
       cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,
                                      1, &heuristicResult, &returnedResults);
@@ -1084,6 +1098,18 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
            ((A_type == CUDA_R_16BF) || (A_type == CUDA_R_16F));
   };
 
+  auto is_supported_fp8_dtype = [&]() -> bool {
+    auto *inputA = transformer_engine::convertNVTETensorCheck(A[0]);
+    auto *inputB = transformer_engine::convertNVTETensorCheck(B[0]);
+    auto *OutputD = transformer_engine::convertNVTETensorCheck(D[0]);
+    auto A_type = get_cuda_dtype(inputA->data.dtype);
+    auto B_type = get_cuda_dtype(inputB->data.dtype);
+    auto D_type = get_cuda_dtype(OutputD->data.dtype);
+
+    return (A_type == B_type) && (A_type == CUDA_R_8F_E4M3) &&
+           ((D_type == CUDA_R_16BF) || (D_type == CUDA_R_16F));
+  };
+
   // CUTLASS Grouped GEMM fast path (SM90/TMA)
   // Conditions:
   //  - No fused epilogue: both bias and pre_gelu_out are empty.
@@ -1093,10 +1119,21 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   //  - grad is irrelevant when bias/pre_gelu_out are empty.
   //
   // Otherwise, fall back to cuBLAS.
-  if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
-      all_groups_uniform_k128(B, transb)) {
-    cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
-                         current_device, math_sm_count, stream);
+  if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && all_groups_uniform_k128(B, transb)) {
+    if (is_supported_dtype()) {
+      cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+                           current_device, math_sm_count, stream);
+    } else if (is_supported_fp8_dtype() && use_split_accumulator && (transa || transb)) {
+      // need use_split_accumulator = True
+      // printf("===Debug run cutlass_grouped_gemm_fp8\n");
+      cutlass_grouped_gemm_fp8(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+                               current_device, math_sm_count, stream);
+    } else {
+      if (warn_fallback) {
+        NVTE_WARN("Fallback to cuBLAS grouped GEMM.");
+      }
+      cublas_path();
+    }
   } else {
     if (warn_fallback) {
       NVTE_WARN("Fallback to cuBLAS grouped GEMM.");

@@ -346,3 +346,387 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
+
+namespace transformer_engine {
+namespace grouped_gemm_fp8 {
+
+template <bool trans_c>
+using GroupedGemmOutputCLayout =
+    std::conditional_t<trans_c, ::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor>;
+
+using ProblemShapeType = cute::Shape<int, int, int>;
+using ProblemShape = cutlass::gemm::GroupProblemShape<ProblemShapeType>;  // <M,N,K> per group
+
+// for block scaling
+static constexpr int ScaleGranularityM = 1;
+static constexpr int ScaleGranularityN = 128;
+static constexpr int ScaleGranularityK = 128;
+
+using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                              ScaleGranularityK>;
+
+using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
+using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());  // Layout type for SFB matrix operand
+
+template <typename ScheduleConfig>
+struct GemmGivenSchedule {
+  using ElementA = cutlass::float_e4m3_t;              // Element type for A matrix operand
+  using ElementB = cutlass::float_e4m3_t;              // Element type for B matrix operand
+  using ElementC = typename ScheduleConfig::DataType;  // Element type for C and D matrix operands
+
+  // A matrix configuration
+  using LayoutA = typename ScheduleConfig::LayoutA;  // Layout type for A matrix operand
+  static constexpr int AlignmentA =
+      128 / cutlass::sizeof_bits<
+                ElementA>::value;  // Alignment of A matrix in units of elements (up to 16 bytes)
+
+  // B matrix configuration
+  using LayoutB = typename ScheduleConfig::LayoutB;  // Layout type for B matrix operand
+  static constexpr int AlignmentB =
+      128 / cutlass::sizeof_bits<
+                ElementB>::value;  // Alignment of B matrix in units of elements (up to 16 bytes)
+
+  // C/D matrix configuration
+  using LayoutC = typename ScheduleConfig::LayoutC;  // Layout type for C and D matrix operands
+  static constexpr int AlignmentC =
+      128 / cutlass::sizeof_bits<
+                ElementC>::value;  // Alignment of C matrix in units of elements (up to 16 bytes)
+
+  // Core kernel configurations
+  using ElementAccumulator = float;  // Element type for internal accumulation
+  using ElementBlockScale = float;   // Element type for blockscaling during accumulation
+  using ElementCompute = float;      // Element type for epilogue computation
+
+  using ArchTag =
+      cutlass::arch::Sm90;  // Tag indicating the minimum SM that supports the intended feature
+  using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag
+  using StageCountType =
+      cutlass::gemm::collective::StageCountAuto;  // Stage count maximized based on the tile size
+
+  using TileShape = typename ScheduleConfig::TileShape;  // Threadblock-level tile size
+  using ClusterShape =
+      typename ScheduleConfig::ClusterShape;  // Shape of the threadblocks in a cluster
+  using KernelSchedule = typename ScheduleConfig::KernelSchedule;      // Kernel to launch
+  using EpilogueSchedule = typename ScheduleConfig::EpilogueSchedule;  // Epilogue to launch
+
+  static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+  using CustomEVTIdentity =  // acc
+      cutlass::epilogue::fusion::Sm90EVT<
+          cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Identity, ElementC,
+                                                 ElementAccumulator, RoundStyle>,
+          cutlass::epilogue::fusion::Sm90AccFetch>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC*, AlignmentC, ElementC, LayoutC*, AlignmentC, EpilogueSchedule,
+      CustomEVTIdentity>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, ElementA, cute::tuple<LayoutA*, LayoutSFA*>, AlignmentA, ElementB,
+      cute::tuple<LayoutB*, LayoutSFB*>, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
+                                                          CollectiveEpilogue, void>;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <typename DataType_, bool trans_c>
+struct ScheduleConfig {
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8Blockwise;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
+
+  // TODO(Alan): Add tuning for different scenarios to select the optimal configuration,
+  //             as the current configuration may not be the best.
+
+  // using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+  // using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  // using TileShape = Shape<cute::_256, cute::_128, cute::_128>;
+  // using ClusterShape = Shape<cute::_1, cute::_2, cute::_1>;
+
+  using LayoutA = ::cutlass::layout::RowMajor;
+  using LayoutB = ::cutlass::layout::ColumnMajor;
+  using LayoutC = GroupedGemmOutputCLayout<trans_c>;
+  using DataType = DataType_;
+};
+
+template <typename DataType_, bool trans_c>
+using GemmGrouped = typename GemmGivenSchedule<ScheduleConfig<DataType_, trans_c>>::Gemm;
+
+template <typename GemmT, typename ElementA, typename ElementB, typename ElementC, typename StrideA,
+          typename StrideB, typename StrideC, typename ElementBlockScale, typename LayoutSFA,
+          typename LayoutSFB>
+typename GemmT::Arguments MakeArguments(
+    int num_experts, void* problem_sizes_host, void* problem_sizes, const ElementA** ptr_A,
+    StrideA* stride_A, const ElementB** ptr_B, StrideB* stride_B, ElementC** ptr_C,
+    StrideC* stride_C, const ElementBlockScale** ptr_blockscale_A, LayoutSFA* layout_SFA,
+    const ElementBlockScale** ptr_blockscale_B, LayoutSFB* layout_SFB, float alpha, float beta,
+    int device, int math_sm_count) {
+  // Change device_id to another value if you are running on a machine with multiple GPUs and wish
+  // to use a GPU other than that with device ID 0.
+
+  cutlass::KernelHardwareInfo kernel_hw_info =
+      cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename GemmT::GemmKernel>(
+          device, math_sm_count);
+
+  typename GemmT::Arguments arguments;
+
+  arguments =
+      typename GemmT::Arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
+                                {num_experts, reinterpret_cast<ProblemShapeType*>(problem_sizes),
+                                 reinterpret_cast<ProblemShapeType const*>(problem_sizes_host)},
+                                {
+                                    ptr_A,
+                                    stride_A,
+                                    ptr_B,
+                                    stride_B,
+                                    ptr_blockscale_A,
+                                    layout_SFA,
+                                    ptr_blockscale_B,
+                                    layout_SFB,
+                                },
+                                {
+                                    {},
+                                    (beta > 0.0) ? (const ElementC**)ptr_C : nullptr,  // NOLINT(*)
+                                    stride_C,
+                                    ptr_C,
+                                    stride_C,
+                                },
+                                kernel_hw_info};
+
+  // TODO(Alan): 调试性能
+  // arguments.scheduler.raster_order = options.raster_order;
+  // // The tile scheduler will swizzle up to 8 and with the nearest multiple of 2 (i.e., 1, 2, 4, and 8)
+  // arguments.scheduler.max_swizzle_size = options.swizzle;
+
+  return arguments;
+}
+
+template <typename T>
+inline __device__ __host__ T ROUND_UP(T m, T n) {
+  return (m + n - 1) / n * n;
+}
+
+template <typename T>
+void debug_type() {
+  std::cout << typeid(T).name() << std::endl;
+}
+
+int64_t inline getGemmCoordSize(int64_t num_gemms) {
+  return (int64_t)(ROUND_UP(num_gemms * sizeof(ProblemShapeType), 128UL));
+}
+
+int64_t inline getPtrSize(int64_t num_gemms) {
+  return (int64_t)(ROUND_UP(num_gemms * sizeof(half*), 128UL));
+}
+
+int64_t inline getLddSize(int64_t num_gemms) {
+  return (int64_t)(ROUND_UP(num_gemms * sizeof(int64_t), 128UL));
+}
+
+int64_t inline getBlockScalePtrSize(int64_t num_gemms) {
+  return (int64_t)(ROUND_UP(num_gemms * sizeof(float*), 128UL));
+}
+
+template <typename Layout>
+int64_t inline getBlockScaleLayoutSize(int64_t num_gemms) {
+  return (int64_t)(ROUND_UP(num_gemms * sizeof(Layout), 128UL));
+}
+
+// cpu workspace size is 4MB
+static constexpr size_t kCPUWorkSpaceSize = 4 * 1024 * 1024;
+
+static char* getHostWorkspace() {
+  static std::once_flag flag;
+  static std::shared_ptr<char> workspace;
+
+  std::call_once(flag, [&]() {
+    workspace =
+        std::shared_ptr<char>(reinterpret_cast<char*>(std::malloc(kCPUWorkSpaceSize)), [](char* p) {
+          if (p) std::free(p);
+        });
+
+    if (!workspace) {
+      throw std::bad_alloc();
+    }
+  });
+
+  return workspace.get();
+}
+
+template <bool trans_c, typename Element>
+void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                        NVTETensor* workspace, float alpha, float beta, int num_gemms,
+                        cudaStream_t stream, int device, int math_sm_count) {
+  using Gemm = GemmGrouped<Element, trans_c>;
+  using LayoutA = typename Gemm::LayoutA;
+  using LayoutB = typename Gemm::LayoutB;
+  using LayoutC = typename Gemm::LayoutC;
+
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementC = typename Gemm::ElementC;
+
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+
+  using ElementBlockScale = float;
+  typename Gemm::Arguments arguments;
+  size_t kernel_workspace_size = Gemm::get_workspace_size(arguments);
+  auto gemm_coord_size = getGemmCoordSize(num_gemms);
+  auto ptr_size = getPtrSize(num_gemms);
+  auto ldd_size = getLddSize(num_gemms);
+  auto ptr_blockscale_size = getBlockScalePtrSize(num_gemms);
+  auto blockscale_A_layout_size = getBlockScaleLayoutSize<LayoutSFA>(num_gemms);
+  auto blockscale_B_layout_size = getBlockScaleLayoutSize<LayoutSFB>(num_gemms);
+  auto param_workspace_size = 3 * ptr_size + 3 * ldd_size + 2 * ptr_blockscale_size +
+                              gemm_coord_size + blockscale_A_layout_size + blockscale_B_layout_size;
+
+  NVTE_CHECK(
+      param_workspace_size < kCPUWorkSpaceSize,
+      "Insufficient kCPUWorkSpaceSize size: required=", static_cast<int64_t>(param_workspace_size),
+      ", available=", static_cast<int64_t>(kCPUWorkSpaceSize), " for CUTLASS grouped GEMM.");
+
+  auto total_workspace_size = param_workspace_size + kernel_workspace_size;
+  transformer_engine::Tensor* wspace = transformer_engine::convertNVTETensor(workspace[0]);
+
+  NVTE_CHECK(total_workspace_size < wspace->numel(), "Insufficient workspace[0] size: required=",
+             static_cast<int64_t>(total_workspace_size),
+             ", available=", static_cast<int64_t>(wspace->numel()), " for CUTLASS grouped GEMM.");
+
+  char* workspace_ptr = reinterpret_cast<char*>(wspace->data.dptr);
+
+  char* kernel_workspace_ptr = nullptr;
+
+  char* host_workspace = getHostWorkspace();
+
+  ProblemShapeType* problem_sizes_host = reinterpret_cast<ProblemShapeType*>(host_workspace);
+
+  ElementA** ptr_A_host = reinterpret_cast<ElementA**>(host_workspace + gemm_coord_size);
+  ElementB** ptr_B_host = reinterpret_cast<ElementB**>(host_workspace + gemm_coord_size + ptr_size);
+  ElementC** ptr_C_host =
+      reinterpret_cast<ElementC**>(host_workspace + gemm_coord_size + 2 * ptr_size);
+  int64_t* lda_host =
+      reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size + 0 * ldd_size);
+  int64_t* ldb_host =
+      reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size + 1 * ldd_size);
+  int64_t* ldc_host =
+      reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size + 2 * ldd_size);
+
+  ElementBlockScale** ptr_A_blockscale_host = reinterpret_cast<ElementBlockScale**>(
+      host_workspace + gemm_coord_size + 3 * ptr_size + 3 * ldd_size + 0 * ptr_blockscale_size);
+  ElementBlockScale** ptr_B_blockscale_host = reinterpret_cast<ElementBlockScale**>(
+      host_workspace + gemm_coord_size + 3 * ptr_size + 3 * ldd_size + 1 * ptr_blockscale_size);
+
+  LayoutSFA* layout_SFA_host = reinterpret_cast<LayoutSFA*>(
+      host_workspace + gemm_coord_size + 3 * ptr_size + 3 * ldd_size + 2 * ptr_blockscale_size);
+
+  LayoutSFB* layout_SFB_host =
+      reinterpret_cast<LayoutSFB*>(host_workspace + gemm_coord_size + 3 * ptr_size + 3 * ldd_size +
+                                   2 * ptr_blockscale_size + blockscale_A_layout_size);
+
+  for (size_t i = 0; i < num_gemms; i++) {
+    const transformer_engine::Tensor* inputA = transformer_engine::convertNVTETensorCheck(A[i]);
+    const transformer_engine::Tensor* inputB = transformer_engine::convertNVTETensorCheck(B[i]);
+    transformer_engine::Tensor* outputD = transformer_engine::convertNVTETensor(D[i]);
+
+    // only support A row major B column major
+    // trans_a is false
+    // trans_b is true
+    const int m = inputA->data.shape[0];
+    const int k = inputA->data.shape[1];
+    const int n = inputB->data.shape[0];
+
+    auto problem = ProblemShapeType(m, n, k);
+    problem_sizes_host[i] = problem;
+
+    ptr_A_host[i] = reinterpret_cast<ElementA*>(inputA->data.dptr);
+    ptr_B_host[i] = reinterpret_cast<ElementB*>(inputB->data.dptr);
+    ptr_C_host[i] = reinterpret_cast<ElementC*>(outputD->data.dptr);
+
+    lda_host[i] = LayoutA::packed({m, k}).stride(0);
+    ldb_host[i] = LayoutB::packed({k, n}).stride(0);
+    ldc_host[i] = LayoutC::packed({m, n}).stride(0);
+
+    ptr_A_blockscale_host[i] = reinterpret_cast<ElementBlockScale*>(inputA->scale_inv.dptr);
+    ptr_B_blockscale_host[i] = reinterpret_cast<ElementBlockScale*>(inputB->scale_inv.dptr);
+
+    layout_SFA_host[i] = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+    layout_SFB_host[i] = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  }
+
+  cudaMemcpyAsync(workspace_ptr, host_workspace, param_workspace_size, cudaMemcpyHostToDevice,
+                  stream);
+
+  char* param_workspace_ptr = workspace_ptr;
+  ProblemShapeType* problem_sizes_device = reinterpret_cast<ProblemShapeType*>(param_workspace_ptr);
+  const ElementA** ptr_A = reinterpret_cast<const ElementA**>(
+      reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size);
+  const ElementB** ptr_B = reinterpret_cast<const ElementB**>(
+      reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size + 1 * ptr_size);
+  ElementC** ptr_C = reinterpret_cast<ElementC**>(reinterpret_cast<char*>(param_workspace_ptr) +
+                                                  gemm_coord_size + 2 * ptr_size);
+
+  StrideA* lda = reinterpret_cast<StrideA*>(reinterpret_cast<char*>(param_workspace_ptr) +
+                                            gemm_coord_size + 3 * ptr_size + 0 * ldd_size);
+  StrideB* ldb = reinterpret_cast<StrideB*>(reinterpret_cast<char*>(param_workspace_ptr) +
+                                            gemm_coord_size + 3 * ptr_size + 1 * ldd_size);
+  StrideC* ldc = reinterpret_cast<StrideC*>(reinterpret_cast<char*>(param_workspace_ptr) +
+                                            gemm_coord_size + 3 * ptr_size + 2 * ldd_size);
+
+  const ElementBlockScale** ptr_A_blockscale = reinterpret_cast<const ElementBlockScale**>(
+      reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size + 3 * ptr_size + 3 * ldd_size +
+      0 * ptr_blockscale_size);
+
+  const ElementBlockScale** ptr_B_blockscale = reinterpret_cast<const ElementBlockScale**>(
+      reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size + 3 * ptr_size + 3 * ldd_size +
+      1 * ptr_blockscale_size);
+
+  LayoutSFA* layout_SFA =
+      reinterpret_cast<LayoutSFA*>(reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size +
+                                   3 * ptr_size + 3 * ldd_size + 2 * ptr_blockscale_size);
+
+  LayoutSFB* layout_SFB = reinterpret_cast<LayoutSFB*>(
+      reinterpret_cast<char*>(param_workspace_ptr) + gemm_coord_size + 3 * ptr_size + 3 * ldd_size +
+      2 * ptr_blockscale_size + blockscale_A_layout_size);
+
+  kernel_workspace_ptr = workspace_ptr + param_workspace_size;
+
+  arguments = MakeArguments<Gemm, ElementA, ElementB, ElementC, StrideA, StrideB, StrideC,
+                            ElementBlockScale, LayoutSFA, LayoutSFB>(
+      num_gemms, problem_sizes_host, problem_sizes_device, ptr_A, lda, ptr_B, ldb, ptr_C, ldc,
+      ptr_A_blockscale, layout_SFA, ptr_B_blockscale, layout_SFB, alpha, beta, device,
+      math_sm_count);
+
+  Gemm gemm;
+
+  // Check can implement the kernel.
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) {
+    NVTE_CHECK(false, "Failed to implement CUTLASS Grouped GEMM");
+  }
+
+  // Initialize the kernel.
+  if (gemm.initialize(arguments, kernel_workspace_ptr) != cutlass::Status::kSuccess) {
+    NVTE_CHECK(false, "Failed to initialize CUTLASS Grouped GEMM");
+  }
+
+  // Execute the kernel in the current stream.
+  if (gemm.run(stream) != cutlass::Status::kSuccess) {
+    NVTE_CHECK(false, "Failed to run CUTLASS Grouped GEMM");
+  }
+}
+
+}  // namespace grouped_gemm_fp8
+}  // namespace transformer_engine
+
+void cutlass_grouped_gemm_fp8(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device, int math_sm_count,
+                              cudaStream_t stream);

@@ -75,3 +75,87 @@ void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* 
     NVTE_ERROR("Unsupported dtype: only BF16(FP16) are supported.");
   }
 }
+
+namespace transformer_engine {
+namespace grouped_gemm_fp8 {
+
+// Explicit template instantiation to match the template declarations in the .cuh
+// template void CutlassGroupedGemm<false, false, cutlass::half_t>(const NVTETensor*,
+//                                                                 const NVTETensor*, NVTETensor*,
+//                                                                 NVTETensor*, float, float, int,
+//                                                                 cudaStream_t, int, int);
+// template void CutlassGroupedGemm<true, false, cutlass::half_t>(const NVTETensor*, const NVTETensor*,
+//                                                                NVTETensor*, NVTETensor*, float,
+//                                                                float, int, cudaStream_t, int, int);
+
+// template void CutlassGroupedGemm<false, false, cutlass::bfloat16_t>(const NVTETensor*,
+//                                                                     const NVTETensor*, NVTETensor*,
+//                                                                     NVTETensor*, float, float, int,
+//                                                                     cudaStream_t, int, int);
+// template void CutlassGroupedGemm<true, false, cutlass::bfloat16_t>(const NVTETensor*,
+//                                                                    const NVTETensor*, NVTETensor*,
+//                                                                    NVTETensor*, float, float, int,
+//                                                                    cudaStream_t, int, int);
+template void CutlassGroupedGemm<false, cutlass::half_t>(const NVTETensor*, const NVTETensor*,
+                                                         NVTETensor*, NVTETensor*, float, float,
+                                                         int, cudaStream_t, int, int);
+template void CutlassGroupedGemm<true, cutlass::half_t>(const NVTETensor*, const NVTETensor*,
+                                                        NVTETensor*, NVTETensor*, float, float, int,
+                                                        cudaStream_t, int, int);
+template void CutlassGroupedGemm<false, cutlass::bfloat16_t>(const NVTETensor*, const NVTETensor*,
+                                                             NVTETensor*, NVTETensor*, float, float,
+                                                             int, cudaStream_t, int, int);
+template void CutlassGroupedGemm<true, cutlass::bfloat16_t>(const NVTETensor*, const NVTETensor*,
+                                                            NVTETensor*, NVTETensor*, float, float,
+                                                            int, cudaStream_t, int, int);
+
+}  // namespace grouped_gemm_fp8
+}  // namespace transformer_engine
+
+void cutlass_grouped_gemm_fp8(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device, int math_sm_count,
+                              cudaStream_t stream) {
+  using namespace transformer_engine;
+  auto* outputD = convertNVTETensorCheck(D[0]);
+
+  float one = 1.0;
+  float zero = 0.0;
+  float alpha = one;
+  float beta = (accumulate) ? one : zero;
+
+  auto dispatch = [&](auto tag) {
+    using T = decltype(tag);
+    /*
+    if (!transa && !transb) {
+      grouped_gemm_fp8::CutlassGroupedGemm<false, false, T>(
+          B, A, D, workspace, alpha, beta, num_gemms, stream, device, math_sm_count);
+    } else if (!transb && transa) {
+      grouped_gemm_fp8::CutlassGroupedGemm<false, true, T>(
+          B, A, D, workspace, alpha, beta, num_gemms, stream, device, math_sm_count);
+    } else if (transb && !transa) {
+      grouped_gemm_fp8::CutlassGroupedGemm<true, false, T>(
+          B, A, D, workspace, alpha, beta, num_gemms, stream, device, math_sm_count);
+    } else {
+      NVTE_ERROR("Layout 'TT' is not supported by cutlass_grouped_gemm.");
+    }
+    */
+    if (!transb && transa) {
+      grouped_gemm_fp8::CutlassGroupedGemm<false, T>(B, A, D, workspace, alpha, beta, num_gemms,
+                                                     stream, device, math_sm_count);
+    } else if (transb && !transa) {
+      grouped_gemm_fp8::CutlassGroupedGemm<true, T>(A, B, D, workspace, alpha, beta, num_gemms,
+                                                    stream, device, math_sm_count);
+    } else {
+      NVTE_ERROR("Layout 'TT' is not supported by cutlass_grouped_gemm.");
+    }
+  };
+
+  if (outputD->data.dtype == DType::kBFloat16) {
+    dispatch(cutlass::bfloat16_t{});
+  } else if (outputD->data.dtype == DType::kFloat16) {
+    dispatch(cutlass::half_t{});
+  } else {
+    NVTE_ERROR("Unsupported dtype: only BF16(FP16) are supported.");
+  }
+}
