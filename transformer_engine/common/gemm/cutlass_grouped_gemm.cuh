@@ -340,9 +340,223 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   }
 }
 
+template <bool trans_a, bool trans_b, typename ElementD = float>
+struct GemmGivenScheduleWgrad;
+
+// Base config shared by both FP32 and BF16 output specialisations.
+// Subclasses override TileShape / ClusterShape / KernelSchedule / EpilogueSchedule.
+template <bool trans_a, bool trans_b, typename ElementD>
+struct GemmGivenScheduleWgradBase {
+  using ElementA = cutlass::bfloat16_t;
+  using ElementB = cutlass::bfloat16_t;
+  using ElementC = ElementD;
+  using ElementAccumulator = float;
+  using ArchTag = cutlass::arch::Sm90;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using LayoutA = GroupedGemmInputALayout<trans_a>;
+  using LayoutB = GroupedGemmInputBLayout<trans_b>;
+  using LayoutC = cutlass::layout::RowMajor;
+  // TMA minimum 16 B: 8×BF16 or 4×FP32.
+  static constexpr int AlignmentA = 8;
+  static constexpr int AlignmentB = 8;
+  static constexpr int AlignmentC = static_cast<int>(16 / sizeof(ElementD));
+};
+
+// FP32 output: Cooperative 128×128×64, ClusterShape 1×1×1.
+// Two warpgroups keep both the MMA pipeline and the FP32 epilogue busy.
+template <bool trans_a, bool trans_b>
+struct GemmGivenScheduleWgrad<trans_a, trans_b, float>
+    : GemmGivenScheduleWgradBase<trans_a, trans_b, float> {
+  using Base = GemmGivenScheduleWgradBase<trans_a, trans_b, float>;
+  using ElementD = float;
+  using ElementC = float;
+  using ElementAccumulator = float;
+  using ArchTag = cutlass::arch::Sm90;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using LayoutA = typename Base::LayoutA;
+  using LayoutB = typename Base::LayoutB;
+  using LayoutC = typename Base::LayoutC;
+  static constexpr int AlignmentA = Base::AlignmentA;
+  static constexpr int AlignmentB = Base::AlignmentB;
+  static constexpr int AlignmentC = Base::AlignmentC;
+
+  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_64>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentC, EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator>>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, typename Base::ElementA, LayoutA*, AlignmentA,
+      typename Base::ElementB, LayoutB*, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// BF16-output specialization: TileShape 128x128x128, ClusterShape 1x2x1, Ptr-Array TMA
+// warp-specialized Pingpong schedule (SM90). The 8-element (kWgradMinAlign) alignment on the
+// expert/hidden dims is validated before launch; any remaining tile/shape constraints are
+// enforced by the kernel's can_implement check inside CutlassGroupedGemmWgrad.
+template <bool trans_a, bool trans_b>
+struct GemmGivenScheduleWgrad<trans_a, trans_b, cutlass::bfloat16_t>
+    : GemmGivenScheduleWgradBase<trans_a, trans_b, cutlass::bfloat16_t> {
+  using Base = GemmGivenScheduleWgradBase<trans_a, trans_b, cutlass::bfloat16_t>;
+  using ElementD = cutlass::bfloat16_t;
+  using ElementC = cutlass::bfloat16_t;
+  using ElementAccumulator = float;
+  using ArchTag = cutlass::arch::Sm90;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using LayoutA = typename Base::LayoutA;
+  using LayoutB = typename Base::LayoutB;
+  using LayoutC = typename Base::LayoutC;
+  static constexpr int AlignmentA = Base::AlignmentA;
+  static constexpr int AlignmentB = Base::AlignmentB;
+  static constexpr int AlignmentC = Base::AlignmentC;
+
+  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentC, EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator>>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, typename Base::ElementA, LayoutA*, AlignmentA,
+      typename Base::ElementB, LayoutB*, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <bool trans_a, bool trans_b, typename ElementD = float>
+using GemmGroupedWgrad = typename GemmGivenScheduleWgrad<trans_a, trans_b, ElementD>::Gemm;
+
+template <bool trans_a, bool trans_b, typename ElementD = float>
+void CutlassGroupedGemmWgrad(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                             NVTETensor* workspace, float alpha, float beta, int num_gemms,
+                             cudaStream_t stream, int device, int math_sm_count) {
+  using Config = GemmGivenScheduleWgrad<trans_a, trans_b, ElementD>;
+  using Gemm = GemmGroupedWgrad<trans_a, trans_b, ElementD>;
+  using LayoutA = typename Config::LayoutA;
+  using LayoutB = typename Config::LayoutB;
+  using LayoutC = typename Config::LayoutC;
+  using ElementA = typename Config::ElementA;
+  using ElementB = typename Config::ElementB;
+  using ElementC = typename Config::ElementC;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+
+  typename Gemm::Arguments arguments;
+  const size_t kernel_workspace_size = Gemm::get_workspace_size(arguments);
+  const auto gemm_coord_size = getGemmCoordSize(num_gemms);
+  const auto ptr_size = getPtrSize(num_gemms);
+  const auto ldd_size = getLddSize(num_gemms);
+  const auto param_workspace_size = 3 * ptr_size + 3 * ldd_size + gemm_coord_size;
+
+  NVTE_CHECK(param_workspace_size < kCPUWorkSpaceSize,
+             "Insufficient kCPUWorkSpaceSize for wgrad grouped GEMM: required=",
+             static_cast<int64_t>(param_workspace_size));
+
+  const auto total_workspace_size = param_workspace_size + kernel_workspace_size;
+  transformer_engine::Tensor* wspace = transformer_engine::convertNVTETensor(workspace[0]);
+
+  NVTE_CHECK(total_workspace_size < wspace->numel(),
+             "Insufficient workspace[0] for wgrad grouped GEMM: required=",
+             static_cast<int64_t>(total_workspace_size),
+             ", available=", static_cast<int64_t>(wspace->numel()));
+
+  char* workspace_ptr = reinterpret_cast<char*>(wspace->data.dptr);
+  char* host_workspace = getHostWorkspace();
+
+  auto* problem_sizes_host = reinterpret_cast<ProblemShapeType*>(host_workspace);
+  auto* ptr_A_host = reinterpret_cast<ElementA**>(host_workspace + gemm_coord_size);
+  auto* ptr_B_host = reinterpret_cast<ElementB**>(host_workspace + gemm_coord_size + ptr_size);
+  auto* ptr_C_host = reinterpret_cast<ElementC**>(host_workspace + gemm_coord_size + 2 * ptr_size);
+  auto* lda_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size);
+  auto* ldb_host =
+      reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size + ldd_size);
+  auto* ldc_host =
+      reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 3 * ptr_size + 2 * ldd_size);
+
+  for (int i = 0; i < num_gemms; i++) {
+    const auto* inputA = transformer_engine::convertNVTETensorCheck(A[i]);
+    const auto* inputB = transformer_engine::convertNVTETensorCheck(B[i]);
+    auto* outputD = transformer_engine::convertNVTETensor(D[i]);
+
+    const int m =
+        trans_a ? static_cast<int>(inputA->data.shape[1]) : static_cast<int>(inputA->data.shape[0]);
+    const int k =
+        trans_a ? static_cast<int>(inputA->data.shape[0]) : static_cast<int>(inputA->data.shape[1]);
+    const int n =
+        trans_b ? static_cast<int>(inputB->data.shape[0]) : static_cast<int>(inputB->data.shape[1]);
+
+    problem_sizes_host[i] = ProblemShapeType(m, n, k);
+    ptr_A_host[i] = reinterpret_cast<ElementA*>(inputA->data.dptr);
+    ptr_B_host[i] = reinterpret_cast<ElementB*>(inputB->data.dptr);
+    ptr_C_host[i] = reinterpret_cast<ElementC*>(outputD->data.dptr);
+    lda_host[i] = LayoutA::packed({m, k}).stride(0);
+    ldb_host[i] = LayoutB::packed({k, n}).stride(0);
+    ldc_host[i] = LayoutC::packed({m, n}).stride(0);
+  }
+
+  cudaMemcpyAsync(workspace_ptr, host_workspace, param_workspace_size, cudaMemcpyHostToDevice,
+                  stream);
+
+  auto* problem_sizes_device = reinterpret_cast<ProblemShapeType*>(workspace_ptr);
+  const ElementA** ptr_A = reinterpret_cast<const ElementA**>(workspace_ptr + gemm_coord_size);
+  const ElementB** ptr_B =
+      reinterpret_cast<const ElementB**>(workspace_ptr + gemm_coord_size + ptr_size);
+  ElementC** ptr_C = reinterpret_cast<ElementC**>(workspace_ptr + gemm_coord_size + 2 * ptr_size);
+  auto* lda = reinterpret_cast<StrideA*>(workspace_ptr + gemm_coord_size + 3 * ptr_size);
+  auto* ldb = reinterpret_cast<StrideB*>(workspace_ptr + gemm_coord_size + 3 * ptr_size + ldd_size);
+  auto* ldc =
+      reinterpret_cast<StrideC*>(workspace_ptr + gemm_coord_size + 3 * ptr_size + 2 * ldd_size);
+
+  char* kernel_workspace_ptr = workspace_ptr + param_workspace_size;
+
+  arguments = MakeArguments<Gemm, ElementA, ElementB, ElementC, StrideA, StrideB, StrideC>(
+      num_gemms, problem_sizes_host, problem_sizes_device, ptr_A, lda, ptr_B, ldb, ptr_C, ldc,
+      alpha, beta, device, math_sm_count);
+
+  Gemm gemm;
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("Wgrad grouped GEMM: can_implement check failed (", num_gemms, " groups)");
+  }
+  if (gemm.initialize(arguments, kernel_workspace_ptr) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("Wgrad grouped GEMM: initialize failed (", num_gemms, " groups)");
+  }
+  if (gemm.run(stream) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("Wgrad grouped GEMM: run failed (", num_gemms, " groups)");
+  }
+}
+
 }  // namespace grouped_gemm
 }  // namespace transformer_engine
 
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
+
+void cutlass_grouped_gemm_varlen_k(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                                   int num_gemms, bool transa, bool transb, bool grad,
+                                   NVTETensor* workspace, bool accumulate, int device,
+                                   int math_sm_count, cudaStream_t stream);
