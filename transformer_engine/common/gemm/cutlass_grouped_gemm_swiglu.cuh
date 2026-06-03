@@ -948,21 +948,55 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
                cute::size<1>(typename Config::ClusterShape{}),
                cute::size<2>(typename Config::ClusterShape{}));
 
-  // PERSISTENT launch: a FIXED, smaller grid of persistent clusters; each cluster grid-strides over a
-  // subset of the total_tiles logical tiles, processing each fully before the next.  This amortizes the
-  // per-cluster setup (TMEM alloc/free, cluster_sync) over many tiles AND lets the scheduler keep MORE
-  // clusters resident per SM.  cluster_size = ClusterShape.M (= cluster.x = 2 for 2-SM, 1 for 1-SM) is
-  // the number of SMs one cluster occupies.  We OVERSUBSCRIBE 2 clusters per SM-pair:
-  //   persistent_clusters = 2 * (sm_count / cluster_size)
-  // (the 1-tile-per-cluster launch topped out at 1 cluster/SM-pair = 12.5% achieved occupancy; sizing the
-  // persistent grid to 2/SM-pair lets the scheduler pack 2 → up to 25%).  Capped at total_tiles so we
-  // never launch idle clusters (a cluster with cluster_id >= total_tiles would run zero loop iterations).
-  int sm_count_eff = (sm_count > 0)
-                         ? sm_count
-                         : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
-  int cluster_size = int(cluster.x);                       // SMs per cluster (ClusterShape.M)
-  int persistent_clusters = 2 * (sm_count_eff / cluster_size);
+  // Kernel resource info — defined BEFORE the grid so the occupancy query below sees the real smem
+  // opt-in and cluster attribute (cudaOccupancyMaxActiveClusters reads them from the launch config).
+  dim3 block(Kernel::MaxThreadsPerBlock, 1, 1);
+  int smem_size = Kernel::SharedStorageSize;
+  void const* kernel_ptr = reinterpret_cast<void const*>(cutlass::device_kernel<Kernel>);
+
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size);
+    if (attr != cudaSuccess) return attr;
+  }
+  // Allow non-portable cluster size (matches ClusterLauncher::init).  Set BEFORE the occupancy query.
+  cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+  // PERSISTENT launch (occupancy-driven, SINGLE wave — mirrors CUTLASS StaticPersistentTileScheduler /
+  // KernelHardwareInfo::query_device_max_active_clusters and MegaMoE's grid = num_sms).  Each cluster
+  // grid-strides over a subset of the total_tiles logical tiles, amortizing the per-cluster setup (TMEM
+  // alloc/free, cluster_sync) over many tiles.  We launch EXACTLY the number of clusters that actually
+  // co-reside on the device for THIS kernel — NOT a guessed multiple of the SM count: this is a heavy
+  // (kStages=16, large-smem, TMEM) kernel that packs ~1 CTA/SM, so over-launching merely queues a 2nd
+  // wave and re-pays the setup the persistent design exists to amortize (ncu confirmed achieved occupancy
+  // = 12.5% = 1 cluster/SM-pair; the 2-SM cluster co-residency is a HW cap, not raised by more blocks).
+  // cudaOccupancyMaxActiveClusters accounts for smem/reg + 2-SM cluster gang-scheduling (TMEM is runtime-
+  // allocated and not counted, but smem is the binding limiter here, so the count is correct).
+  // cluster_size = ClusterShape.M (= cluster.x = 2 for 2-SM, 1 for 1-SM) is the CTAs per cluster.
+  int cluster_size = int(cluster.x);
+  int persistent_clusters = 0;
+  {
+    // Build the occupancy config WITH the real dynamic smem (the bare CUTLASS one-liner helper omits it
+    // and would over-count for a large-smem kernel).  grid = one cluster is the "minimum valid grid";
+    // cudaOccupancyMaxActiveClusters still returns the DEVICE-WIDE max active cluster count.
+    auto occ_cfg = cutlass::ClusterLauncher::make_cluster_launch_config(cluster, cluster, block,
+                                                                        smem_size, stream);
+    int max_active_clusters = 0;
+    if (cudaOccupancyMaxActiveClusters(&max_active_clusters, kernel_ptr, &occ_cfg.launch_config) ==
+            cudaSuccess &&
+        max_active_clusters > 0) {
+      persistent_clusters = max_active_clusters;
+    }
+  }
+  if (persistent_clusters < 1) {
+    // Fallback: one cluster per cluster_size SMs (single wave, occupancy-1 — matches MegaMoE grid=num_sms).
+    int sm_count_eff = (sm_count > 0)
+                           ? sm_count
+                           : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
+    persistent_clusters = sm_count_eff / cluster_size;
+  }
   if (persistent_clusters < 1) persistent_clusters = 1;    // always launch at least one cluster
+  // Capped at total_tiles so we never launch idle clusters (cluster_id >= total_tiles → zero iterations).
   int num_clusters = persistent_clusters < total_tiles ? persistent_clusters : total_tiles;
 
   params.total_tiles = total_tiles;
@@ -972,18 +1006,6 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
   // Grid is 1-D in clusters: cluster.x CTAs per cluster, num_clusters clusters → grid.x = num_clusters *
   // cluster.x.  In-kernel cluster_id = blockIdx.x / cluster.x (both CTAs of a cluster share it).
   dim3 grid(num_clusters * cluster.x, 1, 1);
-  dim3 block(Kernel::MaxThreadsPerBlock, 1, 1);
-  int smem_size = Kernel::SharedStorageSize;
-
-  void const* kernel_ptr = reinterpret_cast<void const*>(cutlass::device_kernel<Kernel>);
-
-  if (smem_size >= (48 << 10)) {
-    cudaError_t attr = cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            smem_size);
-    if (attr != cudaSuccess) return attr;
-  }
-  // Allow non-portable cluster size (matches ClusterLauncher::init).
-  cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
 
   auto cfg = cutlass::ClusterLauncher::make_cluster_launch_config(grid, cluster, block, smem_size,
                                                                   stream);

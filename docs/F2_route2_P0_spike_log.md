@@ -392,4 +392,18 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **compute-heavy regime 单点最大增益**：用户 shape **394→546 TFLOPS（+39%）**，**累计 292→546（+87%）**。
 - mem-bound 小-NK 持平（epilogue 本就只占小比例，bottleneck 在 load）。
 - **AccStages sweep：2=545.6/404.3，4=546.0/404.9（持平），3 编译失败**（kTmemCols=384 非 2 的幂，static_assert）。→ **AccStages=2 为 sweet spot**：MMA 是 bottleneck，epilogue 落后从不超过 1 tile，2 buffer 已完全 hide，更深无益。default 锁定 AccStages=2。
-- **ncu（用户 shape, AccStages=2）：Compute(SM) 37%→49.76%**（MMA 不再被 epilogue 阻塞 → overlap 生效）；**新 bottleneck = L1/TEX 79.91% / Memory 75.14%**（smem 流量：load TMA + epilogue staging），DRAM 仅 15.24%（已 compute/smem-bound，非 DRAM-bound）；占用率仍 12.48%（2-SM 硬上限不变，增益纯 latency-hiding）。→ 后续若再推：降 smem 流量（DSMEM 共享 X / epilogue staging 精简）。
+- **ncu（用户 shape, AccStages=2）：Compute(SM) 37%→49.76%**（MMA 不再被 epilogue 阻塞 → overlap 生效）；**新 bottleneck = L1/TEX 79.91% / Memory 75.14%**（smem 流量：load TMA + epilogue staging），DRAM 仅 15.24%（已 compute/smem-bound，非 DRAM-bound）；占用率仍 12.48%（2-SM 硬上限不变，增益纯 latency-hiding）。
+- commit `18ffde6c`。tile/stage re-tune sweep（double-buffer 后重扫）：256_64_16_16 仍最优，128_128_16_16 噪声内（+0.4%），TileN=128 伤小-N shape（404→328），kStages=10 中性 → **tile/stage 已收敛**。
+
+## P1 Step-10：persistent grid 单波化（occupancy-driven launch）✅ **意外 +8~9%**
+**问题（persistent_grid_fix.md 提出，已核实）：** 旧 launch `persistent_clusters = 2*(sm_count/cluster_size)` 用硬编码 ×2 过订阅，假设每 SM-pair 驻留 2 cluster。但 ncu 已证 achieved occupancy=12.5%=**1 cluster/SM-pair（2-SM co-residency 硬件上限）**→ ×2 发 296 CTA 但仅 148 co-reside → **强制第二波**：74 个 2nd-wave cluster 在 wave 边界空等 + 重付 per-cluster setup（TMEM alloc/free + cluster_sync）= **wave quantization 尾巴**。
+**修复：** 用 `cudaOccupancyMaxActiveClusters`（自建带真实 `smem_size` 的 config，比裸 CUTLASS helper 不漏 smem）查设备实际可驻留 cluster 数（≈74，单波），失败退回 `sm_count/cluster_size`。kernel_ptr/block/smem + func-attr opt-in 上移到查询前。镜像 CUTLASS `query_device_max_active_clusters` + MegaMoE `grid=num_sms`。
+**结果（正确性全 PASS，n_fail=0）：**
+| shape | ×2 过订阅 | **occupancy 单波** | 提升 |
+|---|---|---|---|
+| (32,512,512,2048) M16384 **用户** | 546 | **596.6** | **+9.3%** |
+| (32,1024,256,1024) M32768 | 404 | **440.4** | **+9%** |
+| (32,2048,128,512) M65536 | 226 | **243.9** | **+8%** |
+| (4,256,256,512) M1024 | 24 | 23 | 持平（太小） |
+- 比预期（中性）好：×2 是真 perf bug（wave 量化尾巴），非仅设计瑕疵。**累计 292→596.6 = +104%（2.04×）。**
+- 注：doc 称 occupancy query「含 TMEM」不准（TMEM 运行时 tcgen05.alloc，API 不可见）——但 smem 是 binding limiter，count 仍正确；单波仅对 uniform grouped 最优，uneven expert 需 dynamic scheduler（CLC）。
