@@ -294,6 +294,14 @@ struct Sm100SwiGluKernel {
     int M, N, K;  // M == G*Me, N == I, K == d
     int Me;       // tokens per expert (uniform)
     int W1N;      // == G*2I, the N-extent of the single W1 TMA descriptor
+    // PERSISTENT (software grid-stride) scheduling fields.  The grid launches a FIXED, smaller set of
+    // persistent clusters; each cluster grid-strides over a subset of the logical (m_tile,n_tile) tiles,
+    // processing each fully before the next.  total_tiles = num_m_tiles * n_local_tiles is the LOGICAL
+    // tile count (NOT multiplied by cluster); n_local_tiles = I/kTileN lets the kernel decode
+    // m_tile = tile / n_local_tiles, n_tile = tile % n_local_tiles; num_clusters is the grid-stride step.
+    int total_tiles;    // num_m_tiles * num_n_local_tiles (logical tiles to process)
+    int n_local_tiles;  // num_n_local_tiles == I/kTileN (decode stride for m_tile/n_tile)
+    int num_clusters;   // number of persistent clusters launched (grid-stride step)
   };
 
   // ---- device entry ----
@@ -377,32 +385,30 @@ struct Sm100SwiGluKernel {
     const bool is_mma_leader_cta =
         (block_rank_in_cluster % size(typename TiledMma::AtomThrID{})) == 0;
 
-    // Tile scheduler (1-SM, GROUPED): each block (= one cluster) computes one OUTPUT (m_tile,
-    // n_tile_local) tile.  grid = (nI_per_expert, G*Me/kTileM, 1).  kTileM/kTileN are the FULL
-    // cluster-tile extents (TileShape); the per-CTA M-block (2-SM within-cluster split) is added
-    // separately via block_rank below.
+    // Tile scheduler (PERSISTENT, GROUPED): the grid launches a FIXED set of params.num_clusters
+    // persistent clusters; each cluster grid-strides over a subset of the logical (m_tile,n_tile_local)
+    // tiles, processing each fully before the next (software grid-stride, NO hardware CLC).  kTileM/kTileN
+    // are the FULL cluster-tile extents (TileShape); the per-CTA M-block (2-SM within-cluster split) is
+    // added separately via block_rank in the epilogue.
     constexpr int kTileM = size<0>(take<0, 2>(TileShape{}));  // 128 (1-SM) / 256 (2-SM)
     constexpr int kTileN = size<1>(take<0, 2>(TileShape{}));  // 128
     constexpr int kClusterX = size<0>(ClusterShape{});        // 1 (1-SM) / 2 (2-SM)
-    // A cluster covers ONE (m_tile, n_tile_local); its kClusterX CTAs split the M-tile (via block_rank).
-    // grid.x = nI_per_expert * kClusterX, so n_tile_local = cluster-x index = blockIdx.x / kClusterX.
-    const int m_tile = blockIdx.y;                  // GLOBAL token m-tile, across ALL experts
-    const int n_tile_local = blockIdx.x / kClusterX;  // OUTPUT column tile, ∈ [0, nI_per_expert)
+    // PERSISTENT: this CTA's cluster id.  BOTH CTAs of a cluster share the same cluster_id (blockIdx.x is
+    // contiguous within a cluster: CTAs [cluster_id*kClusterX, cluster_id*kClusterX+kClusterX)), so both
+    // process the SAME tile sequence — required for the 2-SM cta_group::2 MMA (the M-split is per-CTA via
+    // block_rank, not per-tile).  The grid-stride loop in each role branch is
+    //   for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters)
+    // and decodes m_tile = tile / n_local_tiles, n_tile_local = tile % n_local_tiles.
+    const int cluster_id = blockIdx.x / kClusterX;
 
-    // GROUPED expert derivation (contiguous, uniform Me).  Tokens are contiguous by expert, so the
-    // expert is DERIVED FROM THE M-TILE — no pointer arrays / tensormap swaps.  Assumes Me % kTileM
-    // == 0 and I % kTileN == 0 (uniform Me, no boundary predication).  NOTE: non-uniform Me would
-    // need per-expert cumulative-offset arrays (prefix sums of Mₑ → m-tile→expert lookup) instead.
+    // GROUPED expert derivation constants (contiguous, uniform Me) — tile-INVARIANT, computed once.
+    // Tokens are contiguous by expert, so the expert is DERIVED FROM THE M-TILE — no pointer arrays /
+    // tensormap swaps.  Assumes Me % kTileM == 0 and I % kTileN == 0 (uniform Me, no boundary predication).
+    // NOTE: non-uniform Me would need per-expert cumulative-offset arrays (prefix sums of Mₑ) instead.
+    // The per-tile expert e and gate/up n-tile derivation move INSIDE each role's grid-stride loop.
     const int mtiles_per_expert = params.Me / kTileM;        // m-tiles per expert
     const int nI_per_expert = N / kTileN;                    // output n-tiles per expert (I/kTileN)
     const int n2_per_expert = (2 * N) / kTileN;              // W1 n-tiles per expert ((2*I)/kTileN)
-    const int e = m_tile / mtiles_per_expert;                // which expert this m-tile belongs to
-    // W1 row math (verified): gate_w1_ntile*kTileN = e*2I + n_tile_local*kTileN  → gate rows of e ✓
-    //                         up_w1_ntile  *kTileN = e*2I + I + n_tile_local*kTileN → up rows of e ✓
-    // ONE W1 descriptor over [G*2I,d] covers all of it with no OOB (contrast the old W1+I*d shifted
-    // descriptor, which would OOB past the last expert).
-    const int gate_w1_ntile = e * n2_per_expert + n_tile_local;
-    const int up_w1_ntile = gate_w1_ntile + nI_per_expert;
 
     // MMA→Epilogue handoff for the TMEM base pointer: the MMA warp allocates TMEM and publishes
     // ss.tmem_base_ptr; the epilogue must not read it until then (stock NamedBarrier,
@@ -458,27 +464,38 @@ struct Sm100SwiGluKernel {
       uint16_t mcast_mask_x = create_tma_multicast_mask<2>(cta_layout_vmnk, cta_coord_vmnk);
       uint16_t mcast_mask_b = create_tma_multicast_mask<1>(cta_layout_vmnk, cta_coord_vmnk);
 
-      // Slice THIS CTA's output tile; iterate K only.  X picks the GLOBAL m_tile (over [G*Me,d]);
-      // gate picks the expert's gate row-tile (gate_w1_ntile), up picks the expert's up row-tile
-      // (up_w1_ntile = gate_w1_ntile + nI_per_expert) — BOTH from the SAME W1 descriptor [G*2I,d].
-      // (gate_w1_ntile*kTileN = e*2I + n_tile_local*kTileN; up adds +I — the grouped generalization
-      // of the single-expert "up = W1 + I*d" base-pointer trick.)
-      Tensor tXgX_k = tXgX(_, m_tile, _, _0{});            // (TMA, k)
-      Tensor tWggWg_k = tWggW(_, gate_w1_ntile, _, _0{});
-      Tensor tWugWu_k = tWugW(_, up_w1_ntile, _, _0{});
+      // PERSISTENT grid-stride over logical tiles.  load_prod is NOT re-init per tile: it advances
+      // continuously across tiles (TMA pipelines are designed for continuous use; the producer state
+      // wraps by Stages).  producer_tail is drained ONCE after the loop (a per-tile tail would stall).
+      for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters) {
+        const int m_tile = tile / params.n_local_tiles;        // GLOBAL token m-tile, across ALL experts
+        const int n_tile_local = tile % params.n_local_tiles;  // OUTPUT column tile, ∈ [0, nI_per_expert)
+        const int e = m_tile / mtiles_per_expert;              // which expert this m-tile belongs to
+        // W1 row math (verified): gate_w1_ntile*kTileN = e*2I + n_tile_local*kTileN  → gate rows of e ✓
+        //                         up_w1_ntile  *kTileN = e*2I + I + n_tile_local*kTileN → up rows of e ✓
+        const int gate_w1_ntile = e * n2_per_expert + n_tile_local;
+        const int up_w1_ntile = gate_w1_ntile + nI_per_expert;
 
-      for (int k = 0; k < k_tile_count; ++k) {
-        pipeline_load.producer_acquire(load_prod);
-        auto* bar = pipeline_load.producer_get_barrier(load_prod);
-        int wr = load_prod.index();
-        if (cute::elect_one_sync()) {
-          copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
-          copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWggWg_k(_, k), tWgsWg(_, wr));
-          copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWugWu_k(_, k), tWusWu(_, wr));
+        // Slice THIS CTA's output tile; iterate K only.  X picks the GLOBAL m_tile (over [G*Me,d]);
+        // gate picks the expert's gate row-tile (gate_w1_ntile), up picks the expert's up row-tile
+        // (up_w1_ntile = gate_w1_ntile + nI_per_expert) — BOTH from the SAME W1 descriptor [G*2I,d].
+        Tensor tXgX_k = tXgX(_, m_tile, _, _0{});            // (TMA, k)
+        Tensor tWggWg_k = tWggW(_, gate_w1_ntile, _, _0{});
+        Tensor tWugWu_k = tWugW(_, up_w1_ntile, _, _0{});
+
+        for (int k = 0; k < k_tile_count; ++k) {
+          pipeline_load.producer_acquire(load_prod);
+          auto* bar = pipeline_load.producer_get_barrier(load_prod);
+          int wr = load_prod.index();
+          if (cute::elect_one_sync()) {
+            copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
+            copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWggWg_k(_, k), tWgsWg(_, wr));
+            copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWugWu_k(_, k), tWusWu(_, wr));
+          }
+          ++load_prod;
         }
-        ++load_prod;
       }
-      // Drain so peer CTAs in the cluster don't exit early.
+      // Drain ONCE after all tiles so peer CTAs in the cluster don't exit early.
       pipeline_load.producer_tail(load_prod);
     }
 
@@ -508,34 +525,46 @@ struct Sm100SwiGluKernel {
       Tensor tCrWg = TiledMma::make_fragment_B(sWg);  // (MMA,MMA_N,MMA_K,PIPE)
       Tensor tCrWu = TiledMma::make_fragment_B(sWu);
 
-      pipeline_epi.producer_acquire(epi_prod);  // claim the (single) acc->epi slot (both CTAs)
-
-      // 2-SM: only the leader CTA issues the tcgen05 MMA, consumes/releases the load pipe (its
-      // umma_arrive multicasts to BOTH CTAs' empty barriers), and commits the acc pipe. The peer
-      // CTA must do none of these (stock sm100_gemm_tma_warpspecialized.hpp:761-771).
-      if (is_mma_leader_cta) {
-        tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;  // first k_block zeroes both accs
-        for (int k = 0; k < k_tile_count; ++k) {
-          pipeline_load.consumer_wait(load_cons);
-          int rs = load_cons.index();
-          CUTLASS_PRAGMA_UNROLL
-          for (int kb = 0; kb < size<2>(tCrX); ++kb) {
-            // Both MMAs are INDEPENDENT and share tCrX; the accumulate_ flag is shared, so we zero on
-            // the very first k_block (k==0 && kb==0) and set One thereafter for BOTH accs.
-            cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWg(_, _, kb, rs), acc_gate);
+      // PERSISTENT grid-stride over the SAME tile sequence the Load/Epilogue warps walk (identical
+      // cluster_id + loop bounds → identical tile count → both CTAs reach the post-loop cluster_sync).
+      // load_cons / epi_prod advance CONTINUOUSLY across tiles (NOT re-init per tile).  The accumulator
+      // TMEM region (allocated ONCE above) is REUSED every tile: the K-loop's first k_block writes it
+      // with ScaleOut::Zero (OVERWRITE, not accumulate), so there is no cross-tile contamination.
+      for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters) {
+        // 2-SM: only the leader CTA touches the acc pipe (producer_acquire/commit), issues the tcgen05
+        // MMA, and consumes/releases the load pipe (its umma_arrive multicasts to BOTH CTAs). The PEER
+        // CTA must do NONE of these (stock sm100_gemm_tma_warpspecialized.hpp:761-771). CRITICAL for the
+        // PERSISTENT loop: the epi empty-barrier arrivals from BOTH epilogues redirect to the LEADER's
+        // barrier (Sm100MmaPeerBitMask), so the follower's own empty barrier never advances — a follower
+        // producer_acquire would pass tile-0 (initial state) then DEADLOCK on tile-1. Gate it to leader.
+        if (is_mma_leader_cta) {
+          // 1-stage PipelineEpi: this acquire WAITS for the previous tile's epilogue consumer_release —
+          // it cannot re-claim (and the K-loop cannot overwrite) the accumulator until the epilogue has
+          // read the previous tile's result. This is the per-tile serialization preventing acc clobber.
+          pipeline_epi.producer_acquire(epi_prod);
+          tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;  // first k_block zeroes both accs THIS tile
+          for (int k = 0; k < k_tile_count; ++k) {
+            pipeline_load.consumer_wait(load_cons);
+            int rs = load_cons.index();
+            CUTLASS_PRAGMA_UNROLL
+            for (int kb = 0; kb < size<2>(tCrX); ++kb) {
+              // Both MMAs are INDEPENDENT and share tCrX; the accumulate_ flag is shared, so we zero on
+              // the very first k_block (k==0 && kb==0) and set One thereafter for BOTH accs.
+              cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWg(_, _, kb, rs), acc_gate);
 #ifndef SWIGLU_SINGLE_ACC
-            cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWu(_, _, kb, rs), acc_up);
+              cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWu(_, _, kb, rs), acc_up);
 #endif
-            tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+              tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+            }
+            pipeline_load.consumer_release(load_cons);
+            ++load_cons;
           }
-          pipeline_load.consumer_release(load_cons);
-          ++load_cons;
+          // Signal epilogue: both accs complete. The PipelineUmmaAsync commit inserts the tcgen05
+          // commit (multicast to both CTAs' full barriers) so the epilogue's TMEM loads are ordered.
+          pipeline_epi.producer_commit(epi_prod);
+          ++epi_prod;  // leader-only: advance the producer state only where we acquire/commit
         }
-        // Signal epilogue: both accs complete. The PipelineUmmaAsync commit inserts the tcgen05
-        // commit (multicast to both CTAs' full barriers) so the epilogue's TMEM loads are ordered.
-        pipeline_epi.producer_commit(epi_prod);
       }
-      ++epi_prod;
       // (TMEM release_lock + free happen AFTER the cluster_sync() below, issued by this same MMA warp.)
     }
 
@@ -547,9 +576,11 @@ struct Sm100SwiGluKernel {
     else if (role == kEpilogue) {
       cutlass::arch::warpgroup_reg_alloc<160>();
 
+      // TMEM is published ONCE (before the persistent loop); wait here once.  All tile-invariant epilogue
+      // setup (MMA layout, TMEM accumulator views, coordinate tile, TMEM-load tiling, register tensors,
+      // sA/mA) is hoisted out of the loop below — only cta_row_offset/cta_col_offset and the per-tile
+      // pipeline handshake (consumer_wait/release) + the coalesced sA→global write are per-tile.
       tmem_alloc_bar.arrive_and_wait();  // wait for MMA to publish ss.tmem_base_ptr (#3)
-      pipeline_epi.consumer_wait(epi_cons);
-      cutlass::arch::fence_view_async_tmem_store();  // make UMMA TMEM writes visible to TMEM loads
 
       TiledMma tiled_mma;
       // partition_fragment_C(tiled_mma, (256,128)) returns the PER-CTA accumulator fragment, NOT a
@@ -595,14 +626,6 @@ struct Sm100SwiGluKernel {
       ThrMMA cta_mma_epi = tiled_mma.get_slice(0);
       Tensor cAcc = make_identity_tensor(take<0, 2>(TileShape{}));   // (256,128) coords; V-0 → local rows[0,128)
       Tensor cAcc_cta = cta_mma_epi.partition_C(cAcc);               // (MMA,MMA_M,MMA_N) local coords (aligned w/ data)
-      // Global row offset = this tile's M-base (m_tile * kTileM) + the per-CTA M-block within a 2-SM
-      // cluster (block_rank * kTileM/AtomThrID; 0 for 1-SM). Column offset = this tile's N-base.
-      const int cta_row_offset =
-          m_tile * kTileM +
-          int(block_rank_in_cluster) * (kTileM / int(size(typename TiledMma::AtomThrID{})));
-      // Output A is [G*Me, I]: col ∈ [0, I).  The expert's row-block is selected by the GLOBAL m_tile
-      // (cta_row_offset = m_tile*kTileM, already global), so the column only needs the LOCAL n-tile.
-      const int cta_col_offset = n_tile_local * kTileN;
 
       // TMEM load atom: 4 warps × 32 lanes, 128 cols of 32b (FMHA mainloop:539).
       using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
@@ -642,19 +665,9 @@ struct Sm100SwiGluKernel {
       //     ordering — it does not drop or alter the +128 offset.
       Tensor tTMc = thr_tmem_load.partition_D(cAcc_cta);       // (T2R,T2R_M,T2R_N) global (row,col), DST order
 
+      // Per-tile register staging (tile-invariant SHAPE; values overwritten each tile by the TMEM copies).
       Tensor rGate = make_tensor<ElementAcc>(shape(tTMc));
       Tensor rUp = make_tensor<ElementAcc>(shape(tTMc));
-      copy(tiled_tmem_load, tTMgate, rGate);
-      copy(tiled_tmem_load, tTMup, rUp);
-
-#ifdef SWIGLU_DEBUG_PRINT
-      if (thread_idx == 0 && block_rank_in_cluster == 0) {
-        for (int i = 0; i < size(rGate) && i < 24; ++i) {
-          printf("T0 i=%2d row=%3d col=%3d gate=% .4f\n", i,
-                 get<0>(tTMc(i)) + cta_row_offset, get<1>(tTMc(i)), float(rGate(i)));
-        }
-      }
-#endif
 
       // A in global as a row-major (M,N) tensor; write each owned element.
       // Rank-2 layout: shape (M,N) with row-major stride (N,1). (params.dA is the rank-3 (M,N,L)
@@ -673,58 +686,109 @@ struct Sm100SwiGluKernel {
       Tensor sA = make_tensor(make_smem_ptr(ss.tensors.smem_out.begin()),
                               make_layout(make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
                                           make_stride(Int<kEpiTileN>{}, _1{})));  // row-major (M_local,N)
-
-      // (1) compute rA, (2) scatter into SMEM at the LOCAL (row,col).  No row<M/col<N guard here: the
-      // LOCAL (row,col) is always in [0,kEpiTileM)×[0,kEpiTileN) by construction; OOB global rows/cols
-      // are dropped in the global-write loop below (uniform-Me/I assumption ⇒ in practice never OOB).
       cutlass::epilogue::thread::SiLu<ElementAcc> silu{};
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(rGate); ++i) {
-#if defined(SWIGLU_DEBUG_RAW_GATE)
-        ElementOut rA = static_cast<ElementOut>(rGate(i));  // ISOLATION: raw gate acc (= X·W1[0:I]ᵀ)
-#elif defined(SWIGLU_DEBUG_RAW_UP)
-        ElementOut rA = static_cast<ElementOut>(rUp(i));    // ISOLATION: raw up acc (= X·W1[I:2I]ᵀ)
-#else
-        ElementOut rA = static_cast<ElementOut>(silu(rGate(i)) * rUp(i));
-#endif
-        int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
-        int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
-        sA(lrow, lcol) = rA;
-      }
 
-      // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
-      // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns the acc->epi
-      // slot so the MMA warp can free TMEM.  The free is deferred to the cluster_sync() below.
-      cutlass::arch::fence_view_async_tmem_load();
-      pipeline_epi.consumer_release(epi_cons);
-      ++epi_cons;
+      // PERSISTENT grid-stride over the SAME tile sequence the Load/MMA warps walk (identical cluster_id
+      // + bounds → identical tile count → all 128 epilogue threads loop the same number of times and the
+      // post-loop cluster_sync is reached in lockstep).  epi_cons advances CONTINUOUSLY across tiles (NOT
+      // re-init per tile).  Each tile: consumer_wait (waits for THIS tile's MMA commit) → TMEM-load →
+      // silu·mul → sA scatter → consumer_release (frees the acc slot so the NEXT tile's MMA may overwrite
+      // TMEM) → epi_smem_bar → coalesced sA→global write.
+      for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters) {
+        const int m_tile = tile / params.n_local_tiles;        // GLOBAL token m-tile, across ALL experts
+        const int n_tile_local = tile % params.n_local_tiles;  // OUTPUT column tile, ∈ [0, nI_per_expert)
+        // Global row offset = this tile's M-base (m_tile * kTileM) + the per-CTA M-block within a 2-SM
+        // cluster (block_rank * kTileM/AtomThrID; 0 for 1-SM). Column offset = this tile's N-base.
+        const int cta_row_offset =
+            m_tile * kTileM +
+            int(block_rank_in_cluster) * (kTileM / int(size(typename TiledMma::AtomThrID{})));
+        // Output A is [G*Me, I]: col ∈ [0, I).  The expert's row-block is selected by the GLOBAL m_tile
+        // (cta_row_offset = m_tile*kTileM, already global), so the column only needs the LOCAL n-tile.
+        const int cta_col_offset = n_tile_local * kTileN;
 
-      // Make all of sA visible across the 128 epilogue threads BEFORE the cooperative global write.
-      // MUST be a NamedBarrier over EXACTLY the NumEpiThreads(=128) epilogue threads, NOT __syncthreads():
-      // __syncthreads() would block on all 256 block threads, but the Load/MMA/empty warps have already
-      // left their role branches and are parked at the cluster_sync() below — they will NEVER reach a
-      // barrier inside this epilogue branch, so __syncthreads() here would DEADLOCK.  All 128 epilogue
-      // threads reach this NamedBarrier (no early return/divergent exit precedes it within the branch),
-      // and it is a distinct (user id 0 → effective id 8) barrier from tmem_alloc_bar (id 6), so it is
-      // deadlock-free and independent of the consumer_release / cluster_sync ordering.
-      cutlass::arch::NamedBarrier epi_smem_bar(NumEpiThreads, /*id=*/0u);
-      epi_smem_bar.arrive_and_wait();
+        // Wait for THIS tile's MMA commit, then order the UMMA TMEM writes before the TMEM loads.
+        pipeline_epi.consumer_wait(epi_cons);
+        cutlass::arch::fence_view_async_tmem_store();  // make UMMA TMEM writes visible to TMEM loads
 
-      // (3) COALESCED SMEM→global copy: the 128 epilogue threads cooperatively flush sA[kEpiTileM×kEpiTileN]
-      // to global A.  Flat thread-strided loop over (r,c) in row-major order: consecutive flat indices idx,
-      // idx+1 map to consecutive columns c, c+1 (same row, or wrapping to the next row), so consecutive
-      // threads write CONSECUTIVE global columns gcol → CONSECUTIVE global addresses (mA stride is (N,1))
-      // ⇒ COALESCED.  Same global (grow,gcol)=(cta_row_offset+r, cta_col_offset+c) and same value as the
-      // old per-element scatter; the row<M/col<N guard is preserved verbatim.
-      CUTLASS_PRAGMA_NO_UNROLL
-      for (int idx = thread_idx; idx < kEpiTileM * kEpiTileN; idx += NumEpiThreads) {
-        int r = idx / kEpiTileN;
-        int c = idx % kEpiTileN;
-        int grow = cta_row_offset + r;  // local row + tile M-base (+ 2-SM split) → global
-        int gcol = cta_col_offset + c;  // local col + tile N-base → global
-        if (grow < M && gcol < N) {
-          mA(grow, gcol) = sA(r, c);
+        copy(tiled_tmem_load, tTMgate, rGate);
+        copy(tiled_tmem_load, tTMup, rUp);
+
+#ifdef SWIGLU_DEBUG_PRINT
+        // Guard to the FIRST tile only (tile == cluster_id) so the persistent loop doesn't spam.
+        if (tile == cluster_id && thread_idx == 0 && block_rank_in_cluster == 0) {
+          for (int i = 0; i < size(rGate) && i < 24; ++i) {
+            printf("T0 i=%2d row=%3d col=%3d gate=% .4f\n", i,
+                   get<0>(tTMc(i)) + cta_row_offset, get<1>(tTMc(i)), float(rGate(i)));
+          }
         }
+#endif
+
+        // (1) compute rA, (2) scatter into SMEM at the LOCAL (row,col).  No row<M/col<N guard here: the
+        // LOCAL (row,col) is always in [0,kEpiTileM)×[0,kEpiTileN) by construction; OOB global rows/cols
+        // are dropped in the global-write loop below (uniform-Me/I assumption ⇒ in practice never OOB).
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(rGate); ++i) {
+#if defined(SWIGLU_DEBUG_RAW_GATE)
+          ElementOut rA = static_cast<ElementOut>(rGate(i));  // ISOLATION: raw gate acc (= X·W1[0:I]ᵀ)
+#elif defined(SWIGLU_DEBUG_RAW_UP)
+          ElementOut rA = static_cast<ElementOut>(rUp(i));    // ISOLATION: raw up acc (= X·W1[I:2I]ᵀ)
+#else
+          ElementOut rA = static_cast<ElementOut>(silu(rGate(i)) * rUp(i));
+#endif
+          int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
+          int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
+          sA(lrow, lcol) = rA;
+        }
+
+        // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
+        // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns the acc->epi
+        // slot so the MMA warp may reuse/free TMEM.  On the 1-stage PipelineEpi this release is what lets
+        // the NEXT tile's MMA producer_acquire proceed — i.e. it gates the next tile's accumulator write.
+        cutlass::arch::fence_view_async_tmem_load();
+        pipeline_epi.consumer_release(epi_cons);
+        ++epi_cons;
+
+        // Make all of sA visible across the 128 epilogue threads BEFORE the cooperative global write.
+        // MUST be a NamedBarrier over EXACTLY the NumEpiThreads(=128) epilogue threads, NOT __syncthreads():
+        // __syncthreads() would block on all 256 block threads, but the Load/MMA/empty warps are off in
+        // their own grid-stride loops / parked at the cluster_sync() below — they will NEVER reach a
+        // barrier inside this epilogue branch, so __syncthreads() here would DEADLOCK.  All 128 epilogue
+        // threads reach this NamedBarrier every iteration (no early/divergent exit precedes it within the
+        // loop body), and it is a distinct (user id 0 → effective id 8) barrier from tmem_alloc_bar (id 6).
+        // It is per-tile (NOT hoisted): it orders THIS tile's sA writes before THIS tile's global flush.
+        cutlass::arch::NamedBarrier epi_smem_bar(NumEpiThreads, /*id=*/0u);
+        epi_smem_bar.arrive_and_wait();
+
+        // (3) COALESCED SMEM→global copy: the 128 epilogue threads cooperatively flush sA[kEpiTileM×kEpiTileN]
+        // to global A.  Flat thread-strided loop over (r,c) in row-major order: consecutive flat indices idx,
+        // idx+1 map to consecutive columns c, c+1 (same row, or wrapping to the next row), so consecutive
+        // threads write CONSECUTIVE global columns gcol → CONSECUTIVE global addresses (mA stride is (N,1))
+        // ⇒ COALESCED.  Same global (grow,gcol)=(cta_row_offset+r, cta_col_offset+c) and same value as the
+        // old per-element scatter; the row<M/col<N guard is preserved verbatim.
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int idx = thread_idx; idx < kEpiTileM * kEpiTileN; idx += NumEpiThreads) {
+          int r = idx / kEpiTileN;
+          int c = idx % kEpiTileN;
+          int grow = cta_row_offset + r;  // local row + tile M-base (+ 2-SM split) → global
+          int gcol = cta_col_offset + c;  // local col + tile N-base → global
+          if (grow < M && gcol < N) {
+            mA(grow, gcol) = sA(r, c);
+          }
+        }
+        // PERSISTENT WAR guard: sA (ss.tensors.smem_out) is a SINGLE shared staging buffer REUSED every
+        // tile.  Without this barrier a fast thread could finish THIS tile's flush, loop, pass the next
+        // tile's consumer_wait (its gating chain only requires THIS tile's consumer_release at line ~747,
+        // which precedes the flush), and start the NEXT tile's sA SCATTER (write) while a slow thread is
+        // still READING sA in THIS tile's flush above → cross-tile WAR race on sA.  This NamedBarrier
+        // (same id 0 / NumEpiThreads as epi_smem_bar) forces ALL 128 epilogue threads to finish this
+        // tile's flush reads before ANY proceeds to the next tile's scatter.  All 128 threads reach it
+        // every iteration (no divergent exit precedes it), so it is deadlock-free; the empty/Load/MMA
+        // warps never enter this branch so this barrier never involves them.
+        // DISTINCT id from epi_smem_bar (which uses id 0u → hw barrier 8): using the SAME id makes both
+        // arrive_and_wait()s hit the SAME hardware barrier, which deadlocks across the persistent tile
+        // loop (two same-barrier syncs per iteration interleave). id 1u → hw barrier 9.
+        cutlass::arch::NamedBarrier epi_done_bar(NumEpiThreads, /*id=*/1u);
+        epi_done_bar.arrive_and_wait();
       }
     } else {
       cutlass::arch::warpgroup_reg_dealloc<40>();
@@ -814,18 +878,43 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
   params.Me = Me;     // tokens per expert (uniform)
   params.W1N = W1N;   // G*2I
 
-  // Grid: one OUTPUT (m_tile, n_tile_local) tile per cluster.  m_tile spans ALL experts' tokens
-  // (num_m_tiles = G*Me/kTileM); n_tile_local spans ONE expert's output width (I/kTileN).  1-SM
-  // (ClusterShape (1,1,1)) → one block per tile; blockIdx.x=n_tile_local, blockIdx.y=m_tile in-kernel.
-  // (2-SM restoration needs a cluster→tile remap since the 2 CTAs split the M-tile — TODO with 2-SM.)
+  // Logical tile grid: m_tile spans ALL experts' tokens (num_m_tiles = G*Me/kTileM); n_tile_local spans
+  // ONE expert's output width (I/kTileN).  total_tiles = num_m_tiles * num_n_local_tiles is the LOGICAL
+  // tile count (NOT multiplied by cluster.x).  The kernel decodes m_tile = tile / num_n_local_tiles,
+  // n_tile_local = tile % num_n_local_tiles from a linear tile id (see Sm100SwiGluKernel::operator()).
   constexpr int kTileM = cute::size<0>(typename Config::TileShape{});
   constexpr int kTileN = cute::size<1>(typename Config::TileShape{});
   int num_m_tiles = (M + kTileM - 1) / kTileM;
   int num_n_local_tiles = (I + kTileN - 1) / kTileN;
+  int total_tiles = num_m_tiles * num_n_local_tiles;
   dim3 cluster(cute::size<0>(typename Config::ClusterShape{}),
                cute::size<1>(typename Config::ClusterShape{}),
                cute::size<2>(typename Config::ClusterShape{}));
-  dim3 grid(num_n_local_tiles * cluster.x, num_m_tiles * cluster.y, cluster.z);
+
+  // PERSISTENT launch: a FIXED, smaller grid of persistent clusters; each cluster grid-strides over a
+  // subset of the total_tiles logical tiles, processing each fully before the next.  This amortizes the
+  // per-cluster setup (TMEM alloc/free, cluster_sync) over many tiles AND lets the scheduler keep MORE
+  // clusters resident per SM.  cluster_size = ClusterShape.M (= cluster.x = 2 for 2-SM, 1 for 1-SM) is
+  // the number of SMs one cluster occupies.  We OVERSUBSCRIBE 2 clusters per SM-pair:
+  //   persistent_clusters = 2 * (sm_count / cluster_size)
+  // (the 1-tile-per-cluster launch topped out at 1 cluster/SM-pair = 12.5% achieved occupancy; sizing the
+  // persistent grid to 2/SM-pair lets the scheduler pack 2 → up to 25%).  Capped at total_tiles so we
+  // never launch idle clusters (a cluster with cluster_id >= total_tiles would run zero loop iterations).
+  int sm_count_eff = (sm_count > 0)
+                         ? sm_count
+                         : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
+  int cluster_size = int(cluster.x);                       // SMs per cluster (ClusterShape.M)
+  int persistent_clusters = 2 * (sm_count_eff / cluster_size);
+  if (persistent_clusters < 1) persistent_clusters = 1;    // always launch at least one cluster
+  int num_clusters = persistent_clusters < total_tiles ? persistent_clusters : total_tiles;
+
+  params.total_tiles = total_tiles;
+  params.n_local_tiles = num_n_local_tiles;
+  params.num_clusters = num_clusters;
+
+  // Grid is 1-D in clusters: cluster.x CTAs per cluster, num_clusters clusters → grid.x = num_clusters *
+  // cluster.x.  In-kernel cluster_id = blockIdx.x / cluster.x (both CTAs of a cluster share it).
+  dim3 grid(num_clusters * cluster.x, 1, 1);
   dim3 block(Kernel::MaxThreadsPerBlock, 1, 1);
   int smem_size = Kernel::SharedStorageSize;
 

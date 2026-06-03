@@ -360,3 +360,17 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - 占用率被 2-SM cluster 共驻硬顶 12.5%，smem/reg/TMEM 修复（MinBlocks=2/kStages=10/TMEM 128 列）都无法在 2-SM 下叠 2 block/SM。
 - Config 已模板化，可后续 autotune/JIT。
 **剩余 roadmap（更大结构性工程）：#1 dual-gemm 单计算单元、#2 Cluster Sync + DSMEM、#3 persistent kernel + CLC（可能松动 2-SM 占用率上限）。**
+
+## P1 Step-8：#3 Persistent kernel（软件 grid-stride）✅
+**重构：** 每 cluster grid-stride 遍历 tile（`tile=cluster_id; tile<total_tiles; tile+=num_clusters`），TMEM alloc/free + cluster_sync **整个循环只一次**，load/MMA/epi 流水状态跨 tile 连续。launch grid 改为 `num_clusters=min(total_tiles, 2×SM_pairs)` 个 cluster（超订 2/SM-pair 试探占用率）。
+**两个多-tile 死锁（compute-sanitizer 不抓 deadlock，靠分析）：**
+1. **epi_smem_bar 与 epi_done_bar 同 NamedBarrier id 0**（→ 同一 hw barrier 8）→ 跨 tile 两次同 barrier sync 互锁。修：epi_done_bar 用 id 1（hw 9）。
+2. **follower CTA 的 epi `producer_acquire` 跨 tile 死锁**：2-SM 下两 epilogue 的 empty-arrive 经 `Sm100MmaPeerBitMask` 都重定向到 **leader** 的 empty barrier，follower 自己的 empty barrier 永不前进 → tile-0 用初始态过、tile-1 起死锁。修：**把 epi producer_acquire + commit + ++epi_prod 全 gate 到 leader CTA**（follower MMA 不碰 acc pipe）。
+**结果（正确性全 PASS）：**
+| shape | 非-persistent | **persistent** | 提升 |
+|---|---|---|---|
+| (32,512,512,2048) M16384 用户 | 398 | 394 | ≈ 持平 |
+| (32,1024,256,1024) M32768 | 222 | **259** | **+17%** |
+| (32,2048,128,512) M65536 | 174 | **223** | **+28%** |
+- **persistent 在 M 大/N&K 小 regime 大胜（+17~28%）**（per-tile TMEM alloc/free + cluster_sync + setup 被摊薄，小-K tile 计算少、overhead 占比大）；compute-heavy 用户 shape 持平（few tiles/cluster，摊薄少）。
+- 占用率检查中（看是否同时松动了 2-SM co-residency）。
