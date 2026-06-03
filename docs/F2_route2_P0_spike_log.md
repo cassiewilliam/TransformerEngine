@@ -481,3 +481,15 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **结论2：解了也不快**（性能持平 674≈672，L1/TEX 仍 95%）——**bank-conflict 是高-SOL 假象，非 wall-clock bound**：`AccStages=2` double-buffer 让 epilogue 与下一 tile MMA **重叠**，冲突的 store 并发执行、不延长关键路径。
 - （swizzle 的 `sA.compose(tTMc.layout())` 映射有正确性 bug，n_fail 高；但 store 工作量相同→timing 结论不变。已 revert 回 clean 672。）
 - **真正 bound = 2-SM occupancy 12.5% + MMA/memory throughput，非 epilogue。kernel 真正收敛在 673。** swizzle patch 价值仅"消冲突"（不提速），如需 clean 无冲突版可修 compose 正确性（低 ROI）。
+
+## P1 Step-18：occupancy 12.5% 为何这么低 + 能否提高（实测验证）
+**为何 12.5%：** achieved = 1 block/SM × 8 warp/CTA = 8/64 = 12.5%。
+**实测对比（CLEAN kernel, 高方差 target, n_fail=0）：**
+| config | Block Limit Reg/Smem | Theoretical | **Achieved** | 性能 |
+|---|---|---|---|---|
+| baseline (kStages=16, EPI_REGS=160) | 1 / 1 | 12.5% | 12.5% | 673.6 |
+| 2-block 尝试 (kStages=8, EPI_REGS=128) | **2 / 2** | **25%** | **12.50%（仍是！）** | 617.4（更慢） |
+- **theoretical 可升到 25%**：降寄存器（EPI_REGS 160→128）+ 降 smem（kStages 16→8）→ Block Limit Reg/Smem 都变 2 → theoretical 25%。所以**不是纯寄存器/smem 上限**。
+- **但 achieved 仍 12.50%**（即使 theoretical 25%）：调度器每 SM-pair 只放 **1 个 cluster**（=1 block/SM）。**这才是真上限 = 2-SM `cta_group::2` cluster gang-scheduling 的 co-residency**（每 SM-pair 1 cluster）。**实测证实**（theoretical 25% vs achieved 12.5%）——之前这个 claim 是对的。
+- **且强行追求会更慢**：kStages=8/EPI128（启用 theoretical 25%）反而 617<673——牺牲了 pipeline 深度 + epilogue 寄存器，而 achieved 没变。
+- **结论：** 在 **2-SM 设计内（用户要求，为 B-operand 共享 + M-tile 翻倍），achieved occupancy 硬上限 12.5%（cluster co-residency），实际不可升**。且 occupancy 对 **warp-specialized kernel 是错指标**（8 warp 中 load1+MMA1+epi4+idle2，多数故意 idle）——真正看 **Compute(SM)=62%（tensor-core 利用率）**。1-SM kernel 可更高 occupancy 但失去 2-SM B-共享，净更差。**occupancy 非 bound（如 bank-conflict 一样是假象）；kernel 收敛 673。**
