@@ -1,0 +1,164 @@
+diff --git a/transformer_engine/common/gemm/cutlass_grouped_gemm_swiglu.cuh b/transformer_engine/common/gemm/cutlass_grouped_gemm_swiglu.cuh
+index 421470b2..a7cb1eb5 100644
+--- a/transformer_engine/common/gemm/cutlass_grouped_gemm_swiglu.cuh
++++ b/transformer_engine/common/gemm/cutlass_grouped_gemm_swiglu.cuh
+@@ -28,9 +28,12 @@
+ 
+ #include <type_traits>
+ 
++#include "cute/arch/copy_sm90.hpp"             // vectorized/stmatrix copy atoms
+ #include "cute/arch/copy_sm90_tma.hpp"         // cute::SM90_TMA_STORE, tma_store_fence/arrive/wait
+ #include "cute/arch/tmem_allocator_sm100.hpp"  // cute::TMEM::Allocator2Sm, Sm100TmemCapacityColumns
++#include "cute/atom/copy_traits_sm90.hpp"      // AutoVectorizingCopyWithAssumedAlignment traits
+ #include "cute/atom/copy_traits_sm90_tma.hpp"  // make_tma_copy(SM90_TMA_STORE,...) traits + tma_partition
++#include "cute/atom/mma_traits_sm90_gmma.hpp"  // cute::GMMA::Layout_K_SW128_Atom (epilogue smem swizzle)
+ #include "cute/tensor.hpp"
+ #include "cutlass/arch/barrier.h"       // fence_view_async_tmem_store, NamedBarrier
+ #include "cutlass/arch/reg_reconfig.h"  // warpgroup_reg_alloc/dealloc
+@@ -183,13 +186,26 @@ struct SwiGluConfig {
+   static constexpr int kEpiTileM_cfg =
+       cute::size<0>(cute::take<0, 2>(TileShape{})) / int(cute::size(AtomThrShapeMNK{}));
+   static constexpr int kEpiTileN_cfg = cute::size<1>(cute::take<0, 2>(TileShape{}));
+-  // sA smem layout: row-major (kEpiTileM, kEpiTileN). PLAIN (no swizzle) — this is exactly the layout
+-  // the epilogue already uses for ss.tensors.smem_out, and make_tma_copy below builds the matching
+-  // (no-swizzle) TMA-store descriptor box = product_each(shape) = (kEpiTileM,kEpiTileN). The contiguous
+-  // (N) box width = kEpiTileN*sizeof(ElementOut) = 64*2 = 128B (16B-aligned ✓; TMA store needs ≥16B).
+-  using SmemLayoutA = decltype(cute::make_layout(
++  // sA smem layout: SWIZZLED (kEpiTileM, kEpiTileN). Output A is ROW-MAJOR (N-contiguous), so the
++  // GMMA "K-major" SW128 atom is the correct orientation (mirrors the stock SM100 epilogue, which for a
++  // RowMajor D selects UMMA::Major::K → Layout_K_SW128_Atom; sm100_builder.inl:89-92), tiled to the
++  // (kEpiTileM,kEpiTileN) box with Step<_1,_2> exactly as SmemLayoutStageD is built
++  // (sm100_epilogue_tma_warpspecialized.hpp:153-154, is_m_major_D==false → Step<_1,_2>).
++  //   * WHY SWIZZLE: the SW128 atom has a 128-byte (= 64 bf16-elements; one full sA row) swizzle period;
++  //     pairing it with a 128-bit (8-bf16) vectorized store (see the epilogue) makes the staging store
++  //     CONFLICT-FREE. The prior PLAIN row-major layout + a 16-bit SCALAR store was anti-aligned under
++  //     any bank mapping (2.8× worse). Vectorization granularity MUST match the swizzle period.
++  //   * TMA STILL VALID: make_tma_copy(SM90_TMA_STORE, mA, SmemLayoutA) recasts the smem layout to
++  //     uint128 and reads the swizzle; the SW128 atom is the canonical "guaranteed accepted by
++  //     make_gmma_desc" layout (mma_traits_sm90_gmma.hpp:193) → Swizzle M==4 → LayoutType::B128
++  //     (mma_traits_sm90_gmma.hpp:141-149). The contiguous (N) box width is unchanged
++  //     (kEpiTileN*sizeof(ElementOut) = 64*2 = 128B, 16B-aligned ✓).
++  //   * The TMA store reads sA through THIS SAME SmemLayoutA, so the swizzle is PHYSICAL-ONLY: global A
++  //     is byte-identical to the plain-layout version (every (row,col) lands at the same global address).
++  using SmemLayoutA = decltype(cute::tile_to_shape(
++      cute::GMMA::Layout_K_SW128_Atom<ElementOut>{},
+       cute::make_shape(cute::Int<kEpiTileM_cfg>{}, cute::Int<kEpiTileN_cfg>{}),
+-      cute::make_stride(cute::Int<kEpiTileN_cfg>{}, cute::_1{})));
++      cute::Step<cute::_1, cute::_2>{}));
+   // TMA-store descriptor type over the WHOLE output A[M,I] (row-major, rank-2). The descriptor is built
+   // ONCE on the host over the true (M,I) extent; per-tile/per-CTA placement is just the box coordinate
+   // (local_tile by (kEpiTileM,kEpiTileN)). OOB on a partial tile is clamped by the descriptor extent.
+@@ -319,11 +335,17 @@ struct Sm100SwiGluKernel {
+       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutX>> smem_x;
+       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW1>> smem_w1_gate;
+       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW1>> smem_w1_up;
+-      // Epilogue output-staging tile sA (kEpiTileM × kEpiTileN, row-major).  Separate (NOT union-ed)
+-      // field: the input buffers above are DEAD by epilogue time, but a separate field is the simplest
+-      // correct option and the extra smem (128×64×sizeof(ElementOut bf16=2) = 16KB) keeps
+-      // SharedStorageSize well under the 228KB SM100 limit (input tensors ≈128KB at kStages=16).
+-      cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out;
++      // Epilogue output-staging tile sA (kEpiTileM × kEpiTileN, SWIZZLED via SmemLayoutA).  Separate (NOT
++      // union-ed) field: the input buffers above are DEAD by epilogue time, but a separate field is the
++      // simplest correct option and the extra smem keeps SharedStorageSize well under the 228KB SM100 limit
++      // (input tensors ≈128KB at kStages=16).
++      //   * Backing size = cute::cosize_v<SmemLayoutA> (NOT kEpiTileM*kEpiTileN): a swizzled ComposedLayout's
++      //     cosize is the span of physical offsets it addresses, which for the SW128 tile == kEpiTileM*kEpiTileN
++      //     (the swizzle permutes within the tile, it does not enlarge it), but we use cosize_v to be exact.
++      //   * alignas(1024): the SW128 atom's swizzle (Swizzle<3,4,3>) needs the tile base aligned to its
++      //     128-byte swizzle period; 1024B (the TensorStorage aligned_struct granularity, and a multiple of
++      //     128B) guarantees both the swizzle alignment and the 128-bit (16B) vectorized-store alignment.
++      alignas(1024) cute::ArrayEngine<ElementOut, cute::cosize_v<SmemLayoutA>> smem_out;
+     } tensors;
+     struct PipelineStorage : cute::aligned_struct<16, _0> {
+       alignas(16) typename PipelineLoad::SharedStorage load;
+@@ -785,6 +807,10 @@ struct Sm100SwiGluKernel {
+       // Per-tile register staging (tile-invariant SHAPE; values overwritten each tile by the TMEM copies).
+       Tensor rGate = make_tensor<ElementAcc>(shape(tTMc));
+       Tensor rUp = make_tensor<ElementAcc>(shape(tTMc));
++      // Output (ElementOut) fragment, SAME (T2R,T2R_M,T2R_N) shape as rGate/rUp/tTMc; element i holds the
++      // converted silu(gate)*up result for the SAME local (row,col)=tTMc(i) the old scalar store used. It
++      // is copied to the swizzled sA in ONE vectorized cute::copy (see the store below).
++      Tensor rOut = make_tensor<ElementOut>(shape(tTMc));
+ 
+       // ---- TMA-STORE EPILOGUE (stage in SMEM, then async TMA bulk-tensor store SMEM→global) ----------
+       // The result tile is computed into registers rA, scattered into a per-CTA SMEM staging tile sA at
+@@ -795,7 +821,7 @@ struct Sm100SwiGluKernel {
+       // are IDENTICAL: every element lands at the same global (row,col)=(local_row+cta_row_offset,
+       // local_col+cta_col_offset) with the same silu(gate)*up value; sA is only an intermediate.
+       Tensor sA = make_tensor(make_smem_ptr(ss.tensors.smem_out.begin()),
+-                              SmemLayoutA{});  // (kEpiTileM,kEpiTileN) row-major
++                              SmemLayoutA{});  // (kEpiTileM,kEpiTileN) SWIZZLED (SW128, K-major)
+       cutlass::epilogue::thread::SiLu<ElementAcc> silu{};
+ 
+       // TMA-STORE partition (HOISTED — buffer/coord-independent).  mA_tma is the descriptor's identity
+@@ -874,24 +900,46 @@ struct Sm100SwiGluKernel {
+         cutlass::arch::NamedBarrier epi_war_bar(NumEpiThreads, /*id=*/1u);
+         epi_war_bar.arrive_and_wait();
+ 
+-        // (1) compute rA, (2) scatter into SMEM at the LOCAL (row,col).  No row<M/col<N guard here: the
+-        // LOCAL (row,col) is always in [0,kEpiTileM)×[0,kEpiTileN) by construction; OOB global rows/cols
+-        // are clamped by the TMA-store descriptor's box (it never writes past the (M,N) extent).
++        // (1) compute rOut(i) (per-element silu(gate)*up, converted to ElementOut) into the register
++        // fragment, then (2) drain rOut → swizzled sA in ONE 128-bit-VECTORIZED cute::copy.  This replaces
++        // the prior 16-bit SCALAR `sA(lrow,lcol)=rA` store, which under the SW128 swizzle was anti-aligned
++        // (vectorization granularity must MATCH the 16-byte swizzle period → 128-bit; a 16-bit scalar store
++        // hit the same bank set every iteration → 2.8× worse). rOut(i) is element-i-congruent with the old
++        // scalar (row,col): see the tCsA construction below.
+         CUTLASS_PRAGMA_UNROLL
+         for (int i = 0; i < size(rGate); ++i) {
+ #if defined(SWIGLU_DEBUG_RAW_GATE)
+-          ElementOut rA =
+-              static_cast<ElementOut>(rGate(i));  // ISOLATION: raw gate acc (= X·W1[0:I]ᵀ)
++          rOut(i) = static_cast<ElementOut>(rGate(i));  // ISOLATION: raw gate acc (= X·W1[0:I]ᵀ)
+ #elif defined(SWIGLU_DEBUG_RAW_UP)
+-          ElementOut rA = static_cast<ElementOut>(rUp(i));  // ISOLATION: raw up acc (= X·W1[I:2I]ᵀ)
++          rOut(i) = static_cast<ElementOut>(rUp(i));  // ISOLATION: raw up acc (= X·W1[I:2I]ᵀ)
+ #else
+-          ElementOut rA = static_cast<ElementOut>(silu(rGate(i)) * rUp(i));
++          rOut(i) = static_cast<ElementOut>(silu(rGate(i)) * rUp(i));
+ #endif
+-          int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
+-          int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
+-          sA(lrow, lcol) = rA;
+         }
+ 
++        // CONGRUENT swizzled-sA destination.  tTMc is a COORDINATE tensor: tTMc(i) == (local_row,local_col)
++        // (it is partition_D(cAcc_cta), cAcc_cta = partition_C(make_identity_tensor((256,128))) → its layout
++        // has BASIS-vector strides, codomain = the 2-D coord). `sA.compose(tTMc.layout())` therefore builds a
++        // tensor tCsA over sA's SWIZZLED smem whose layout maps logical index i → swizzled physical offset of
++        // sA(row_i,col_i): composition(ComposedLayout sA, tTMc.layout()) pushes the swizzle through to the
++        // basis-strided coord layout (layout_composed.hpp:373; composition_impl basis_get resolves each basis
++        // mode to sA's corresponding mode). Hence tCsA(i) === sA(get<0>(tTMc(i)), get<1>(tTMc(i))) — EXACTLY
++        // the element the old scalar loop wrote, for every i. No row<M/col<N guard: local (row,col) is always
++        // in [0,kEpiTileM)×[0,kEpiTileN) by construction; OOB global rows/cols are clamped by the TMA box.
++        //   * RANK / "Rank too small" wall AVOIDED: we do NOT call partition_D(sA). The rank wall is from
++        //     tidfrg_D's `rank(dtensor) >= rank(Tiler_MN)` (copy_atom.hpp:244) where this kernel's Tiler_MN is
++        //     RANK-3 (make_tmem_copy was given the rank-3 tAcc_gate). `compose` is a pure layout op with no
++        //     such assert; tCsA inherits shape(tTMc) = (T2R,T2R_M,T2R_N) = RANK-3 = shape(rOut), so the copy
++        //     below is shape-congruent on both operands. (The stock SM100 epilogue's partition_D(sD) works
++        //     only because ITS Tiler_MN is rank-2 — sm100_epilogue_tma_warpspecialized.hpp:632,635; we keep
++        //     the existing rank-3 tiled_tmem_load untouched and reach the swizzled smem via compose instead.)
++        Tensor tCsA = sA.compose(tTMc.layout());  // (T2R,T2R_M,T2R_N) → swizzled sA(row_i,col_i)
++        // ONE vectorized copy: rOut → swizzled sA. AutoVectorizingCopyWithAssumedAlignment<128> emits a
++        // 128-bit (8×bf16) store per group; the SW128 swizzle period is 16B = one such group, so consecutive
++        // groups never collide → CONFLICT-FREE. The T2R Dst value mode is contiguous in local columns and sA
++        // is row-major within the swizzle unit, so the inner mode vectorizes to the full 128 bits.
++        copy(cute::AutoVectorizingCopyWithAssumedAlignment<128>{}, rOut, tCsA);
++
+         // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
+         // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns THIS tile's
+         // acc->epi stage (epi_cons.index()) so the MMA warp may reuse/free that buffer. With kAccStages=2
+@@ -1029,8 +1077,11 @@ cudaError_t LaunchSwiGluGrouped(
+   // implicit in the row range — mirrors how ONE W1 load descriptor covers all experts). Built ONCE
+   // over the TRUE (M,I) extent so the descriptor's box clamping handles any partial tile (OOB) for
+   // free; per-tile/per-CTA placement is just the box coordinate (local_tile by (kEpiTileM,kEpiTileN)).
+-  // Stride (I,1) = row-major; sA smem layout = Config::SmemLayoutA (kEpiTileM,kEpiTileN) row-major, the
+-  // SAME layout ss.tensors.smem_out uses → make_tma_copy builds a no-swizzle box (kEpiTileM,kEpiTileN).
++  // Stride (I,1) = global A row-major; sA smem layout = Config::SmemLayoutA — now the SWIZZLED SW128
++  // K-major (kEpiTileM,kEpiTileN) tile (the SAME layout ss.tensors.smem_out uses). make_tma_copy recasts
++  // it to uint128 and reads Swizzle M==4 → LayoutType::B128, a VALID TMA descriptor; the descriptor box is
++  // still (kEpiTileM,kEpiTileN) with a 128B (16B-aligned) contiguous N-width. The swizzle is physical-only:
++  // the TMA store reads sA through THIS SAME SmemLayoutA, so global A is byte-identical to the plain layout.
+   cute::Tensor mA_store = cute::make_tensor(
+       cute::make_gmem_ptr(A),
+       cute::make_layout(cute::make_shape(M, I), cute::make_stride(I, cute::_1{})));

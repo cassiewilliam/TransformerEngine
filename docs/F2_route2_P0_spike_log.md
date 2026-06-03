@@ -456,3 +456,10 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **本 kernel 受阻根因 = CuTe rank 不匹配**：我的 acc = `partition_fragment_C` → **rank-3** `(MMA,MMA_M,MMA_N)` → tmem-copy Tiler rank-3；而 sA rank-2 → `partition_D(sA)` 报 "Rank too small"/"Too many modes"。stock Tiler 是 rank-2，与带 PIPE 的 rank-2 sD_epi + TMA 源一致。
 - **要修 = store-path 重构**：rank-2-congruent tmem-copy + AutoVectorizingCopy R2S + SW128 swizzle + PIPE-bearing sD_epi + 配套 swizzled TMA-store descriptor。**且 dual-accumulator(gate||up) N-halving SwiGLU 不匹配 collective epilogue 的 single-accumulator-elementwise 模型**（其 fusion 是 acc→输出同形 element-wise，无 N 折半 + 双 TMEM-acc 组合）→ 全 collective epilogue 不能直接套。
 **结论：** bank-conflict bound 的真正修复 = store-path 重构（≈ collective epilogue 的 store 部分，手工适配 dual-acc），中高工作量、风险高、4 次尝试已证 CuTe layout 难点。**当前收敛 673/608 TFLOPS（+109%），已在 4.5.1 验证。**
+
+## P1 Step-16：store-path 重构第5/6次尝试（compose + AutoVectorizingCopy）— ❌ CUTLASS 编译墙
+**思路（绕开 rank 墙）：** `tCsA = sA.compose(tTMc.layout())`（用 compose 而非 partition_D(sA) → 不触发 rank assert）+ `copy(AutoVectorizingCopyWithAssumedAlignment<128>{}, rOut, tCsA)` 进 SW128-swizzled sA；128-bit 向量写匹配 swizzle 16B 周期 → 理论 conflict-free。逻辑上 element-i congruent（compose 把 swizzle 推过 basis-strided coord layout）。
+**结果：** **编译失败**，错误全在 CUTLASS `cute/algorithm/copy.hpp` 内部（`copy_if/copy/prefetch already declared` + `Copy_Atom/AutoFilter undefined`）= copy.hpp 被**双重包含/解析顺序破坏**。对比：swizzled SmemLayoutA + **标量**存（Step-13 swizzle 尝试）能编译；只有加上 `compose`+`AutoVectorizingCopy` 才触发 copy.hpp 墙。加 mma_traits/copy_traits include 无效（非缺头，是 copy.hpp 自身解析顺序）。本地无法编译迭代 → 远程往返难诊断。
+**裁决：** revert 回 clean 673（patch 存 `docs/F2_storepath_refactor_WIP.patch`）。**bank-conflict bound 经 6 次尝试（TMA-store/swizzle/stmatrix×2/investigation/compose）确认：在手写 dual-accumulator kernel 内不可解，真正修复需全 collective-epilogue 重写（而 dual-acc N-halving SwiGLU 不匹配其 single-acc 模型）。**
+- 注：double-buffer(AccStages=2) 已部分 hide epilogue，673 是在 bank-conflict **存在**下达到的 → 修复的边际收益受 overlap 限制（非满 +40%）。
+- **F2 route#2 收敛：673（高方差）/608（uniform）/628-647（不均匀）TFLOPS，+109%，varlen-M 验证，CUTLASS 4.5.1。下一步建议：接入 TE GroupedLinear 端到端验证（融合省 [M,2I] 中间 HBM 往返）。**
