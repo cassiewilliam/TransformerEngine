@@ -493,3 +493,16 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **但 achieved 仍 12.50%**（即使 theoretical 25%）：调度器每 SM-pair 只放 **1 个 cluster**（=1 block/SM）。**这才是真上限 = 2-SM `cta_group::2` cluster gang-scheduling 的 co-residency**（每 SM-pair 1 cluster）。**实测证实**（theoretical 25% vs achieved 12.5%）——之前这个 claim 是对的。
 - **且强行追求会更慢**：kStages=8/EPI128（启用 theoretical 25%）反而 617<673——牺牲了 pipeline 深度 + epilogue 寄存器，而 achieved 没变。
 - **结论：** 在 **2-SM 设计内（用户要求，为 B-operand 共享 + M-tile 翻倍），achieved occupancy 硬上限 12.5%（cluster co-residency），实际不可升**。且 occupancy 对 **warp-specialized kernel 是错指标**（8 warp 中 load1+MMA1+epi4+idle2，多数故意 idle）——真正看 **Compute(SM)=62%（tensor-core 利用率）**。1-SM kernel 可更高 occupancy 但失去 2-SM B-共享，净更差。**occupancy 非 bound（如 bank-conflict 一样是假象）；kernel 收敛 673。**
+
+## P1 Step-19：vs TE GroupedLinear（同 shape、参数/FLOP 对齐）—— 决定性 baseline 对比
+**对齐核实（B200 bf16，target shape M=132608, in d=2048, out 2I=1024）：** params 67.11M=67.11M ✓ · FLOP 556.2G=556.2G（=4·M·I·d）✓ · output [M,512]=[M,512] ✓。fused 的 2 GEMM（gate+up）== TE 的单个 [M,d]·[d,2I]。
+| 路径 | ms（3 run） | TFLOPS |
+|---|---|---|
+| TE GroupedLinear（仅 GEMM） | 0.519/0.485/0.484 | **~1090-1150** |
+| TE GroupedLinear + (torch) SwiGLU（e2e） | 0.794/0.813/0.848 | ~656-701 |
+| **fused kernel（GEMM+SwiGLU 一趟）** | 0.824 | 673 |
+- **TE 的 grouped GEMM 比 fused 的有效 GEMM 吞吐快 ~1.65×（1120 vs 673）**。TE/cuBLAS grouped GEMM 远比手写 2-SM warp-spec + 重 SwiGLU-epilogue 高效。
+- **e2e：fused ≈ 打平 TE+SwiGLU**（~0.82ms 双方，均值 0.818 vs 0.824，噪声内）。fusion 省掉 [M,2I] 往返 + SwiGLU pass，把慢-GEMM 的 fused 拉回打平——**但不 win**。（之前"TE 快 4%"是噪声。）
+- **裁决：route#2 fusion 不 beat baseline，只打平**。standalone kernel 无法补上 1.65× GEMM gap（2-SM occupancy 封顶；bank-conflict/occupancy 均已证非 bound）。
+- **真正的赢家方向 = TE 的 1120-TFLOPS GEMM + fused SwiGLU epilogue**（TE GEMM 效率 × fusion IO 省），同时 beat standalone kernel 和 TE+separate-SwiGLU。**继续磨手写 kernel 无意义；杠杆在把 SwiGLU 融进 TE/cuBLAS 的 GEMM。**
+- fused kernel 仍有价值：不物化 [M,2I]（activation-memory 省，对内存受限 MoE 训练）；正确/已验证参考（varlen-M, 4.5.1, n_fail=0）。
