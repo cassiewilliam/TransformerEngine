@@ -1060,6 +1060,14 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
   const bool is_blackwell = (transformer_engine::cuda::sm_arch(current_device) == 100);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
+  // NVTE_USE_SONIC_MOE: entry flag for the SonicMoE fused-MoE integration (sonicmoe-te-integration.html:
+  // F1 gather-into-mainloop, F2 SwiGLU epilogue, F3 combine, backward dH-overlap). The fused MoE ops are
+  // dispatched at the GroupedLinear / MoE-FFN level; at THIS plain grouped-GEMM dispatch the SonicMoE path
+  // shares the same CUTLASS Grouped GEMM base (F0/B0, "共同底座"), so enabling it also takes the CUTLASS
+  // path here. It COEXISTS with — does not replace — NVTE_USE_CUTLASS_GROUPED_GEMM (two independent
+  // optimization approaches; setting either, or both, enables the CUTLASS grouped-GEMM base).
+  const bool use_sonic_moe = transformer_engine::getenv<bool>("NVTE_USE_SONIC_MOE", false);
+  const bool use_cutlass_base = use_cutlass || use_sonic_moe;
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
 
@@ -1069,7 +1077,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   };
 
   // CUTLASS grouped GEMM: Hopper (SM90) fwd + wgrad; Blackwell (SM100) fwd (tcgen05 Ptr-Array).
-  if (!((is_hopper || is_blackwell) && use_cutlass)) {
+  // Enabled by NVTE_USE_CUTLASS_GROUPED_GEMM or NVTE_USE_SONIC_MOE (shared F0/B0 base).
+  if (!((is_hopper || is_blackwell) && use_cutlass_base)) {
     cublas_path();
     return;
   }
