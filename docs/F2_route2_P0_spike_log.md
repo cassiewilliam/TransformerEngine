@@ -517,3 +517,15 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **vs naive 2-GEMM 路径：fused 胜 +26%**（省 2 launch + 2 output 写 + SwiGLU 读两份）。
 - **vs merged-GEMM 路径：打平**（TE merged grouped GEMM per-FLOP 比 fused 的 GEMM 高效 ~1.65×，1120 vs 673，刚好抵消独立 SwiGLU pass）。
 - **裁决：fusion 真有价值——清楚 beat 常见 2-GEMM baseline，打平最强 merged baseline**。比"仅 merged 对比"得出的 tie/loss 更佳。要 beat merged，唯一 gap = 我的 GEMM 慢 1.65×，杠杆仍在 fused-SwiGLU-on-TE-GEMM。bench: `qa/te_grouped_linear_bench.py`。
+
+## P1 Step-21：canonical 4K-MoE shape（qa/moe_bench_configs.md）—— fused 大胜 TE（裁决随 per-expert M 翻转）
+真实 4K MoE FW-Up：H=d=512, I=2048, 2I=4096, G=32, Me=768（avg/uniform 代表点），M=24576, FLOP=103G。同 shape 同 FLOP，B200 bf16，全 n_fail=0：
+| 路径 | ms | TFLOPS |
+|---|---|---|
+| **fused（GEMM+SwiGLU 一趟）** | **0.238** | **433** |
+| fused, heavy-tail varlen [256,768,1280] | 0.233 | 434 |
+| TE merged GEMM + SwiGLU | 0.530 | 195 |
+| TE 2-separate GEMM + SwiGLU | 1.00 | 103 |
+- **fused 在真实 MoE shape 大胜：2.2× over TE-merged，4.2× over TE-2GEMM。**
+- **裁决随 per-expert M 翻转**：之前"TE 胜/平"是在 **合成高方差 shape（M=132608, avg ~4144 tok/expert, d=2048）**——不真实的大 per-expert M，利好 TE 大 GEMM。**真实 MoE avg ~768 tok/expert**（256 expert/EP8/top12），small-M 下 TE grouped GEMM latency/overhead-bound（小-M GEMM + per-expert tensormap + merge）→ 仅 195 TFLOPS；fused 的 single-descriptor + persistent + fused-epilogue 设计专治 small-M → 433。doc 早预言"瓶颈在 group 调度/tail/epilogue 非算力"。
+- **用户"SwiGLU impl 有问题"的疑虑 → 推翻：impl 没问题**，之前 tie/loss 是大-M shape 假象。route#2 fusion 前提成立：真实 MoE 上 fused 决定性 beat TE GroupedLinear + SwiGLU。bench: qa/te_grouped_linear_bench.py（+ 4K 变体）。
