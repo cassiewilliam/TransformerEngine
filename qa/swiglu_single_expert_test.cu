@@ -70,6 +70,13 @@ int main(int argc, char** argv) {
   // default 256,512,768. Unset => UNIFORM (every expert = Me).
   const char* vl = std::getenv("SWIGLU_VARLEN");
   const bool varlen = (vl != nullptr);
+  // F1 GATHER mode (env SWIGLU_GATHER=1): the kernel GATHERS X rows directly from the UNPERMUTED source
+  // X via TMA gather4 using a permutation index m_gather_idx[M] (m_gather_idx[m] = source row in the
+  // unpermuted X for grouped position m), so NO moe_permute is needed.  We build a deterministic
+  // permutation and make the host reference read X_src[m_gather_idx[m]] for grouped row m.  Unset =>
+  // the contiguous (non-gather) path runs UNCHANGED.
+  const char* ge = std::getenv("SWIGLU_GATHER");
+  const bool gather = (ge != nullptr && std::atoi(ge) != 0);
   const int kTM = TILEM;                  // experts are aligned to TileM (token-rounding, like SonicMoE)
   std::vector<int> expert_ntok(G);
   std::vector<int> mtile_expert_h;        // [num_m_tiles] global m-tile -> expert id
@@ -99,8 +106,8 @@ int main(int argc, char** argv) {
   const int Mref = varlen ? (M <= 8192 ? M : 2048) : ((M < 512) ? M : 512);
   const int twoI = 2 * I;
   const int W1rows = G * twoI;            // stacked per-expert weights [G*2I, d]
-  std::printf("GROUPED G=%d Me=%d (M=%d) I=%d d=%d  varlen=%d num_m_tiles=%zu\n", G, Me, M, I, d,
-              (int)varlen, mtile_expert_h.size());
+  std::printf("GROUPED G=%d Me=%d (M=%d) I=%d d=%d  varlen=%d gather=%d num_m_tiles=%zu\n", G, Me, M, I,
+              d, (int)varlen, (int)gather, mtile_expert_h.size());
 
   int dev = 0;
   CHECK_CUDA(cudaSetDevice(dev));
@@ -142,9 +149,35 @@ int main(int argc, char** argv) {
   const int* mte_arg = varlen ? d_mte : nullptr;
   const int M_arg = varlen ? M : 0;
 
+  // F1 GATHER: build a deterministic permutation m_gather_idx[M] (here a reversal-with-stride shuffle
+  // that is a true permutation of [0,M)) and upload it.  In gather mode the device X buffer dX is treated
+  // as the UNPERMUTED source X[M,d]; the kernel gathers row m_gather_idx[m] for grouped position m.  The
+  // host reference (below) reads hX[m_gather_idx[m]] accordingly.  nullptr in non-gather mode.
+  std::vector<int> m_gather_idx_h;
+  int* d_gather = nullptr;
+  if (gather) {
+#if !defined(SWIGLU_ENABLE_GATHER_LOAD)
+    std::printf(
+        "WARNING: SWIGLU_GATHER set but the kernel was built WITHOUT -DSWIGLU_ENABLE_GATHER_LOAD;\n"
+        "         the on-GPU gather4 load is disabled (falls back to the contiguous PERMUTED X), so\n"
+        "         this run is EXPECTED to FAIL correctness. Rebuild with -DSWIGLU_ENABLE_GATHER_LOAD\n"
+        "         to exercise the real TMA gather path.\n");
+#endif
+    m_gather_idx_h.resize(M);
+    // Deterministic permutation: idx[m] = (m * 2654435761u + 12345u) reduced to a Lehmer-style shuffle
+    // is NOT a guaranteed permutation; use the simple invertible map idx[m] = (M-1) - m (reversal),
+    // which is a true permutation of [0,M) and exercises a non-identity source row per grouped row.
+    for (int m = 0; m < M; ++m) m_gather_idx_h[m] = (M - 1) - m;
+    CHECK_CUDA(cudaMalloc(&d_gather, sizeof(int) * M));
+    CHECK_CUDA(cudaMemcpy(d_gather, m_gather_idx_h.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
+  }
+  const int* gather_arg = gather ? d_gather : nullptr;
+  const int T_src_arg = gather ? M : 0;  // pure permutation => unpermuted source has M rows
+
   // ---- launch (grouped) ----
   cudaError_t st = LAUNCH_GROUPED(
-      dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount, mte_arg, M_arg);
+      dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount, mte_arg, M_arg,
+      gather_arg, T_src_arg);
   if (st != cudaSuccess) {
     std::printf("Launch returned: %s\n", cudaGetErrorString(st));
   }
@@ -161,10 +194,12 @@ int main(int argc, char** argv) {
     const int e = varlen ? e_of_token[m] : (m / Me);  // expert of token m → weights W1[e*2I .. (e+1)*2I)
     const size_t gbase = (size_t)(e * twoI) * d;       // gate rows [e*2I, e*2I+I)
     const size_t ubase = (size_t)(e * twoI + I) * d;   // up   rows [e*2I+I, e*2I+2I)
+    // F1 GATHER: in gather mode grouped row m reads the UNPERMUTED source row m_gather_idx[m]; else m.
+    const int src_row = gather ? m_gather_idx_h[m] : m;
     for (int n = 0; n < I; ++n) {
       float gate = 0.0f, up = 0.0f;
       for (int kk = 0; kk < d; ++kk) {
-        float x = static_cast<float>(hX[(size_t)m * d + kk]);
+        float x = static_cast<float>(hX[(size_t)src_row * d + kk]);
         gate += x * static_cast<float>(hW1[gbase + (size_t)n * d + kk]);   // W1[e*2I + n, :]
         up += x * static_cast<float>(hW1[ubase + (size_t)n * d + kk]);     // W1[e*2I + I + n, :]
       }
@@ -240,7 +275,8 @@ int main(int argc, char** argv) {
   const int warm = 10, iters = 100;
   for (int it = 0; it < warm; ++it)
     LAUNCH_GROUPED(
-        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg);
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
+        gather_arg, T_src_arg);
   CHECK_CUDA(cudaDeviceSynchronize());
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0);
@@ -248,7 +284,8 @@ int main(int argc, char** argv) {
   cudaEventRecord(e0);
   for (int it = 0; it < iters; ++it)
     LAUNCH_GROUPED(
-        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg);
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
+        gather_arg, T_src_arg);
   cudaEventRecord(e1);
   CHECK_CUDA(cudaEventSynchronize(e1));
   float ms = 0;
@@ -263,5 +300,7 @@ int main(int argc, char** argv) {
   cudaFree(dX);
   cudaFree(dW1);
   cudaFree(dA);
+  if (d_mte) cudaFree(d_mte);
+  if (d_gather) cudaFree(d_gather);
   return pass ? 0 : 1;
 }

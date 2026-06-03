@@ -177,6 +177,34 @@ struct SwiGluConfig {
   using TMA_X = typename MainloopParams::TMA_A;
   using TMA_W1 = typename MainloopParams::TMA_B;
 
+  // ---- F1 GATHER FUSION descriptor type (optional path) --------------------------------------
+  // Gather TMA descriptor over the FULL UNPERMUTED X as a 2D [T_src, d] tensor (RowMajor, K=d
+  // contiguous).  The gather CopyOp (SM100_TMA_LOAD_MULTICAST_2D_GATHER4 under 2-SM cluster) triggers
+  // make_tma_copy's gather-descriptor transform (copy_traits_sm90_tma.hpp:1153-1165): it reduces the
+  // gmem column basis to (cols,1) and ×4 the box, so ONE gather4 op moves 4 ROWS × the K-tile width
+  // into smem.  The smem layout passed is the SAME per-stage X smem tile the contiguous TMA_X uses —
+  // SmemLayoutX{}(_,_,_,0) — so the swizzle baked into the descriptor matches the MMA-fragment layout
+  // the mma warp reads.  We materialize the type with a 2D placeholder X[0,0] (RowMajor stride (d,1)=
+  // (0,1) here; the runtime descriptor in LaunchSwiGluGrouped uses the true (d,1) stride).
+  //
+  // GUARDED by SWIGLU_ENABLE_GATHER_LOAD: the gather-descriptor decltype exercises make_tma_copy's gather
+  // path against the 3D swizzled SmemLayoutX, which is the UNVERIFIED-without-compile risk.  To keep the
+  // DEFAULT build byte-identical to the validated kernel (and immune to any gather-path type-resolution
+  // failure), TMA_X_GATHER aliases the contiguous TMA_X when the macro is OFF.  The Params member, host
+  // descriptor, and m_gather_idx are still PLUMBED in both modes; only the gather TMA TYPE + the on-GPU
+  // gather4 issue are macro-gated.
+#if defined(SWIGLU_ENABLE_GATHER_LOAD)
+  using TMA_X_GATHER = decltype(make_tma_copy(
+      cute::SM100_TMA_LOAD_MULTICAST_2D_GATHER4{},
+      cute::make_tensor(cute::make_gmem_ptr(static_cast<Element const*>(nullptr)),
+                        cute::make_layout(cute::make_shape(int(0), int(0)),
+                                          cute::make_stride(int(0), cute::_1{}))),
+      SmemLayoutX{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+      cute::size<0>(ClusterShape{})));
+#else
+  using TMA_X_GATHER = TMA_X;  // placeholder (gather disabled): keeps Params well-formed, zero new state
+#endif
+
   static constexpr uint32_t TmaTransactionBytes = CollectiveMma::TmaTransactionBytes;
 
   // ---- TMA-STORE epilogue (sA → global A) ----------------------------------------------------
@@ -238,6 +266,7 @@ struct Sm100SwiGluKernel {
   using StrideW1 = typename Config::StrideW1;
   using StrideA = typename Config::StrideA;
   using TMA_X = typename Config::TMA_X;
+  using TMA_X_GATHER = typename Config::TMA_X_GATHER;  // F1 gather descriptor (unpermuted X [T_src,d])
   using TMA_W1 = typename Config::TMA_W1;
   using TMA_A = typename Config::TMA_A;  // TMA-STORE descriptor type over A[M,I] (row-major)
   using SmemLayoutA =
@@ -373,6 +402,16 @@ struct Sm100SwiGluKernel {
     // expert→W1-slice mapping becomes non-uniform, so this is the single varlen hook.  SonicMoE handles
     // arbitrary token counts upstream via token-rounding (pad each expert to a kTileM multiple).
     const int* m_tile_expert;
+    // ---- F1 GATHER FUSION (optional, strictly backward-compatible) ----------------------------
+    // m_gather_idx != nullptr => the LOAD warp GATHERS X rows directly from the UNPERMUTED source X via
+    // SM100 TMA gather4 instead of reading the contiguous (already-permuted) X.  Length = M (the total
+    // grouped/permuted row count); m_gather_idx[m] = the SOURCE row in the unpermuted X[T_src,d] to load
+    // for grouped position m.  nullptr => the CURRENT contiguous tma_load_x path runs UNCHANGED (byte-
+    // identical to the validated kernel).  tma_load_x_gather is the gather descriptor over the FULL
+    // unpermuted X; it is ONLY referenced on the gather branch (never on the null path).
+    const int* m_gather_idx = nullptr;  // [M] grouped-row -> source-row; nullptr => contiguous path
+    TMA_X_GATHER tma_load_x_gather;     // gather descriptor over the unpermuted X [T_src_gather, d]
+    int T_src_gather = 0;               // row extent of the unpermuted source X (== M for pure permute)
   };
 
   // ---- device entry ----
@@ -391,9 +430,14 @@ struct Sm100SwiGluKernel {
     uint32_t lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
 
-    // Prefetch TMA descriptors from the Load warp (X over [G*Me,d] + ONE W1 over [G*2I,d]).
+    // Prefetch TMA descriptors from the Load warp (X over [G*Me,d] + ONE W1 over [G*2I,d]).  On the F1
+    // gather path the X descriptor is the gather one over the UNPERMUTED X; otherwise the contiguous one.
     if (role == kLoad && lane_predicate) {
-      cute::prefetch_tma_descriptor(params.tma_load_x.get_tma_descriptor());
+      if (params.m_gather_idx != nullptr) {
+        cute::prefetch_tma_descriptor(params.tma_load_x_gather.get_tma_descriptor());
+      } else {
+        cute::prefetch_tma_descriptor(params.tma_load_x.get_tma_descriptor());
+      }
       cute::prefetch_tma_descriptor(params.tma_load_w1.get_tma_descriptor());
     }
     // Prefetch the TMA-STORE descriptor (A[M,I]) from the elected epilogue lane: the store is issued by
@@ -506,6 +550,12 @@ struct Sm100SwiGluKernel {
     if (role == kLoad) {
       cutlass::arch::warpgroup_reg_dealloc<40>();
 
+      // F1 GATHER FUSION: when params.m_gather_idx != nullptr the X tile is GATHERED from the unpermuted
+      // source X via TMA gather4 (one op per 4 rows), instead of the contiguous TMA below.  Strictly
+      // gated: on the null path NONE of the gather setup/tensors are touched and the code path below is
+      // byte-identical to the validated kernel.
+      const bool kGather = (params.m_gather_idx != nullptr);
+
       // Defer-sliced TMA tensors. X is over (M=G*Me, K); W1 is over (W1N=G*2I, K) — ONE descriptor.
       Tensor mX = params.tma_load_x.get_tma_tensor(make_shape(M, K, 1));
       Tensor mW = params.tma_load_w1.get_tma_tensor(make_shape(params.W1N, K, 1));
@@ -546,6 +596,23 @@ struct Sm100SwiGluKernel {
       uint16_t mcast_mask_x = create_tma_multicast_mask<2>(cta_layout_vmnk, cta_coord_vmnk);
       uint16_t mcast_mask_b = create_tma_multicast_mask<1>(cta_layout_vmnk, cta_coord_vmnk);
 
+      // ---- F1 GATHER setup (only compiled when SWIGLU_ENABLE_GATHER_LOAD) ---------------------
+      // gather4 = 4 ROWS per op.  The X smem tile per stage is kEpiTileM=128 rows × TileK (this CTA's
+      // half of the 2-SM 256-row tile) → kGather4Ops = kEpiTileM/4 = 32 gather4 ops per (tile,k).  Each
+      // op supplies 4 source-row indices (from m_gather_idx) as PER-COPY register operands via a zip
+      // tensor (copy_traits_sm100_tma.hpp:248-280 unzip_tensor → (col coord, 4 idx)).  The destination is
+      // the matching 4-row sub-slice of the swizzled SmemLayoutX stage.  The gather descriptor's column
+      // coord (crd0) is the K-tile base (k * TileK) along the K-contiguous dim of the unpermuted X.
+      // Guarded so the default build (and the validated contiguous path) carry zero extra state.
+#if defined(SWIGLU_ENABLE_GATHER_LOAD)
+      constexpr int kGather4Ops = kEpiTileM / 4;  // 32 for kEpiTileM=128
+      Tensor mXg = params.tma_load_x_gather.get_tma_tensor(make_shape(params.T_src_gather, K));
+      // Per-CTA global row base within the 256-row 2-SM tile: leader CTA owns local rows [0,128),
+      // follower [128,256).  Added to m_tile*kTileM in the loop to index m_gather_idx.
+      const int cta_local_row_base =
+          int(block_rank_in_cluster) * (kTileM / int(size(typename TiledMma::AtomThrID{})));
+#endif
+
       // PERSISTENT grid-stride over logical tiles.  load_prod is NOT re-init per tile: it advances
       // continuously across tiles (TMA pipelines are designed for continuous use; the producer state
       // wraps by Stages).  producer_tail is drained ONCE after the loop (a per-tile tail would stall).
@@ -570,12 +637,59 @@ struct Sm100SwiGluKernel {
         Tensor tWggWg_k = tWggW(_, gate_w1_ntile, _, _0{});
         Tensor tWugWu_k = tWugW(_, up_w1_ntile, _, _0{});
 
+        // F1 GATHER: this CTA's GLOBAL grouped-row base = m_tile*kTileM + the per-CTA half offset.
+        // m_gather_idx[ row_base + 4*j + r ] (j∈[0,32), r∈[0,4)) gives the 4 source rows for gather op j.
+#if defined(SWIGLU_ENABLE_GATHER_LOAD)
+        const int row_base = m_tile * kTileM + cta_local_row_base;
+#endif
+
         for (int k = 0; k < k_tile_count; ++k) {
           pipeline_load.producer_acquire(load_prod);
           auto* bar = pipeline_load.producer_get_barrier(load_prod);
           int wr = load_prod.index();
           if (cute::elect_one_sync()) {
-            copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
+            if (kGather) {
+#if defined(SWIGLU_ENABLE_GATHER_LOAD)
+              // ---- F1 GATHER X path (EXPERIMENTAL — gather4 issue; NOT yet on-GPU-verified) --------
+              // gather4 = 4 ROWS per op.  The K-tile column coordinate (crd0) is k*TileK along the
+              // unpermuted X's contiguous K dim.  Stage smem destination = the per-stage X tile
+              // sX(_,_,_,wr).  For each of the 32 gather4 groups j, supply the 4 source-row indices
+              // (from m_gather_idx) and the column coord via a zip tensor; the gather Copy_Atom's
+              // copy_unpack (copy_traits_sm100_tma.hpp:259-279) unzips it into (col, idx0..3) and issues
+              // cp.async.bulk.tensor.2d...tile::gather4 into the matching 4-row sub-slice.  mcast_mask_x
+              // preserves the 2-SM multicast semantics of the contiguous path; the transaction barrier's
+              // expect_tx is UNCHANGED (lp.transaction_bytes already counts the full X tile; the 32
+              // gather4 ops + 2 W1 copies deliver exactly those bytes to the same *bar).
+              //
+              // WARNING: the zip-tensor coordinate construction and the swizzled-smem 4-row destination
+              // partition below are the UNRESOLVED risk points (no gather4 mainloop reference exists in
+              // CUTLASS 4.5.1).  This block is intentionally guarded by SWIGLU_ENABLE_GATHER_LOAD (OFF by
+              // default) so the default build + the validated contiguous path are byte-identical and the
+              // file always compiles.  See the deliverable report for the phased plan to finish this.
+              Tensor sXg = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});
+              Tensor sXg_stage = sXg(_, _, _, wr);  // (MMA,MMA_M,MMA_K) this stage's X smem tile
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < kGather4Ops; ++j) {
+                Tensor idx4 = make_tensor<int>(make_shape(_4{}));
+                idx4(0) = params.m_gather_idx[row_base + 4 * j + 0];
+                idx4(1) = params.m_gather_idx[row_base + 4 * j + 1];
+                idx4(2) = params.m_gather_idx[row_base + 4 * j + 2];
+                idx4(3) = params.m_gather_idx[row_base + 4 * j + 3];
+                Tensor cXcol = mXg(make_coord(_, k * int(size<2>(TileShape{}))));  // K-tile col coord
+                Tensor zsrc = make_zip_tensor(cXcol, idx4);
+                Tensor dst4 = sXg_stage(make_coord(make_coord(4 * j, _), _));  // 4-row smem sub-slice
+                copy(params.tma_load_x_gather.with(*bar, mcast_mask_x), zsrc, dst4);
+              }
+#else
+              // SWIGLU_ENABLE_GATHER_LOAD not defined: the gather descriptor + index are PLUMBED end-to-end
+              // (Params/host/test) but the on-GPU gather4 issue is not enabled.  Fall back to the contiguous
+              // X load so the kernel still runs (it will read the PERMUTED contiguous X, not the gathered
+              // rows — so SWIGLU_GATHER correctness requires building with -DSWIGLU_ENABLE_GATHER_LOAD).
+              copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
+#endif
+            } else {
+              copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
+            }
             copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWggWg_k(_, k), tWgsWg(_, wr));
             copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWugWu_k(_, k), tWusWu(_, wr));
           }
@@ -993,7 +1107,12 @@ cudaError_t LaunchSwiGluGrouped(
     // VARLEN-M (uneven, TileM-aligned experts): device array [M_varlen/kTileM]
     // mapping each global m-tile → expert id, and the total packed token count
     // M_varlen.  nullptr => UNIFORM (M = G*Me).  Experts must be TileM-aligned.
-    const int* d_m_tile_expert = nullptr, int M_varlen = 0) {
+    const int* d_m_tile_expert = nullptr, int M_varlen = 0,
+    // F1 GATHER FUSION (optional): device array [M] mapping each grouped/permuted row m -> its SOURCE
+    // row in the UNPERMUTED X[T_src,d]; the LOAD warp then gathers X rows directly via TMA gather4 (no
+    // moe_permute).  nullptr => the CURRENT contiguous X path is used (byte-identical to the validated
+    // kernel).  T_src = the row extent of the unpermuted source X (defaults to M, i.e. a pure permute).
+    const int* d_m_gather_idx = nullptr, int T_src = 0) {
   using Config = SwiGluConfig<Element, ElementOut, TileM_, TileN_, TileK_, kStages_, ClusterM_,
                               MinBlocks_, AccStages_>;
   using Kernel = Sm100SwiGluKernel<Config>;
@@ -1041,6 +1160,29 @@ cudaError_t LaunchSwiGluGrouped(
   auto tma_store_a =
       make_tma_copy(cute::SM90_TMA_STORE{}, mA_store, typename Config::SmemLayoutA{});
 
+  // ---- F1 GATHER FUSION: build the gather TMA descriptor over the FULL UNPERMUTED X ------------
+  // The gmem tensor is the unpermuted X viewed as a 2D [T_src, d] RowMajor tensor (K=d contiguous,
+  // stride (d,1)).  make_tma_copy with SM100_TMA_LOAD_MULTICAST_2D_GATHER4 auto-detects gather: it
+  // reduces the column basis to (d,1) and ×4 the box so one gather4 op moves 4 ROWS × the K-tile into
+  // smem (copy_traits_sm90_tma.hpp:1153-1165).  cluster_size = ClusterM selects the multicast variant's
+  // box truncation (same num_multicast the contiguous X descriptor uses).  The smem layout is the SAME
+  // per-stage X tile the contiguous TMA_X uses (SmemLayoutX(_,_,_,0)) so the baked-in swizzle matches the
+  // MMA-fragment layout the mma warp reads.  GUARDED by SWIGLU_ENABLE_GATHER_LOAD (see Config::TMA_X_
+  // GATHER): when OFF, the gather descriptor TYPE == TMA_X, so we initialize the Params member from the
+  // contiguous tma_load_a placeholder (it is never read on the null path nor on the disabled gather path).
+  const int T_src_eff = (d_m_gather_idx != nullptr) ? (T_src > 0 ? T_src : M) : M;
+#if defined(SWIGLU_ENABLE_GATHER_LOAD)
+  cute::Tensor mX_gather = cute::make_tensor(
+      cute::make_gmem_ptr(X),
+      cute::make_layout(cute::make_shape(T_src_eff, d), cute::make_stride(d, cute::_1{})));
+  typename Config::TMA_X_GATHER tma_load_x_gather = make_tma_copy(
+      cute::SM100_TMA_LOAD_MULTICAST_2D_GATHER4{}, mX_gather,
+      typename Config::SmemLayoutX{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+      cute::size<0>(typename Config::ClusterShape{}));
+#else
+  typename Config::TMA_X_GATHER tma_load_x_gather = mainloop_params.tma_load_a;  // placeholder (== TMA_X)
+#endif
+
   typename Kernel::Params params;
   params.tma_load_x = mainloop_params.tma_load_a;
   params.tma_load_w1 = mainloop_params.tma_load_b;
@@ -1053,6 +1195,9 @@ cudaError_t LaunchSwiGluGrouped(
   params.Me = Me;    // tokens per expert (uniform fallback; unused when m_tile_expert != nullptr)
   params.W1N = W1N;  // G*2I
   params.m_tile_expert = d_m_tile_expert;  // VARLEN-M expert table (nullptr => uniform fast path)
+  params.m_gather_idx = d_m_gather_idx;    // F1 gather index (nullptr => contiguous X path, unchanged)
+  params.tma_load_x_gather = tma_load_x_gather;  // gather descriptor over the unpermuted X [T_src,d]
+  params.T_src_gather = T_src_eff;               // unpermuted source row extent
 
   // Logical tile grid: m_tile spans ALL experts' tokens (num_m_tiles = G*Me/kTileM); n_tile_local spans
   // ONE expert's output width (I/kTileN).  total_tiles = num_m_tiles * num_n_local_tiles is the LOGICAL
