@@ -28,10 +28,14 @@
 
 #include <type_traits>
 
+// cute/tensor.hpp MUST come first: it pulls cute/atom/copy_atom.hpp (defines Copy_Atom) before
+// cute/algorithm/copy.hpp is parsed. The cute/arch/* + cute/atom/copy_traits_* headers below
+// transitively include copy.hpp; if they precede tensor.hpp, copy.hpp sees Copy_Atom undefined and
+// re-declares copy_if/copy (a latent include-order bug — surfaces as CUTLASS copy.hpp compile errors).
+#include "cute/tensor.hpp"
 #include "cute/arch/copy_sm90_tma.hpp"         // cute::SM90_TMA_STORE, tma_store_fence/arrive/wait
 #include "cute/arch/tmem_allocator_sm100.hpp"  // cute::TMEM::Allocator2Sm, Sm100TmemCapacityColumns
 #include "cute/atom/copy_traits_sm90_tma.hpp"  // make_tma_copy(SM90_TMA_STORE,...) traits + tma_partition
-#include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"       // fence_view_async_tmem_store, NamedBarrier
 #include "cutlass/arch/reg_reconfig.h"  // warpgroup_reg_alloc/dealloc
 #include "cutlass/bfloat16.h"
