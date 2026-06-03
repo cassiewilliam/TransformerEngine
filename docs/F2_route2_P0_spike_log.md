@@ -406,4 +406,17 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 | (32,2048,128,512) M65536 | 226 | **243.9** | **+8%** |
 | (4,256,256,512) M1024 | 24 | 23 | 持平（太小） |
 - 比预期（中性）好：×2 是真 perf bug（wave 量化尾巴），非仅设计瑕疵。**累计 292→596.6 = +104%（2.04×）。**
-- 注：doc 称 occupancy query「含 TMEM」不准（TMEM 运行时 tcgen05.alloc，API 不可见）——但 smem 是 binding limiter，count 仍正确；单波仅对 uniform grouped 最优，uneven expert 需 dynamic scheduler（CLC）。
+- 注：doc 称 occupancy query「含 TMEM」不准（TMEM 运行时 tcgen05.alloc，API 不可见）——但 smem 是 binding limiter，count 仍正确；单波仅对 uniform grouped 最优，uneven expert 需 dynamic scheduler（CLC）。commit `0edfa121`。
+
+## P1 Step-11：TMA-store epilogue（= SonicMoE「async TMA store」）✅ **小-NK regime +23~48%**
+**问题（597 重 profile）：** tcgen05 MMA 从 smem 读操作数走专用通路（不过 L1），所以 **L1/TEX 87% 几乎全是 epilogue 的 `reg→sA→global` LSU staging** + barrier stall 33.7%。
+**修复：** 保留 reg→sA（reorder staging 必需），把 128-thread 手动 coalesced `sA→global` 循环换成 **async TMA store**（`SM90_TMA_STORE` / `cp.async.bulk.tensor`）：单一 A[M,I] descriptor（expert 隐含在行范围，无需 per-expert ptr）；`fence_view_async_shared`→elect-lane `copy(tma_store)`→`tma_store_arrive`；WAR 用 `tma_store_wait<0>`（移到下个 tile TMEM-load+silu 之后）替代 epi_done_bar → **tile N 的 store 与 tile N+1 的 epilogue 计算重叠**；单 sA buffer（smem ~0 增量）。OOB 由 descriptor box clamping 处理。镜像 stock `sm100_epilogue_tma_warpspecialized`。
+**结果（正确性全 PASS n_fail=0）：**
+| shape | manual epi | **TMA-store** | 提升 |
+|---|---|---|---|
+| (32,512,512,2048) M16384 用户 | 597 | 609 | +2%（compute-heavy，epilogue 本就 overlap MMA） |
+| (32,1024,256,1024) M32768 | 440 | **543** | **+23%** |
+| (32,2048,128,512) M65536 | 244 | **360** | **+48%** |
+| (4,256,256,512) M1024 | 23 | 20.5 | −11%（极小问题，TMA-store setup overhead 占比大） |
+- **小-K/mem-bound（epilogue 在关键路径）大胜 +23~48%；compute-heavy 用户 shape +2%**（epilogue 已被 double-buffer overlap，非关键路径）。极小问题轻微回退（可加 size 启发式 fallback，暂不做）。
+- 用户 shape 累计 **292→609 = +109%（2.09×）**。新 stall（用户 shape）= reg→sA smem-scoreboard 40.4%（reorder staging 固有）。

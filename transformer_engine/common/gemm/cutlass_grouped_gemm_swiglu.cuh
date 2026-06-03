@@ -29,6 +29,8 @@
 #include <type_traits>
 
 #include "cute/tensor.hpp"
+#include "cute/arch/copy_sm90_tma.hpp"               // cute::SM90_TMA_STORE, tma_store_fence/arrive/wait
+#include "cute/atom/copy_traits_sm90_tma.hpp"        // make_tma_copy(SM90_TMA_STORE,...) traits + tma_partition
 #include "cute/arch/tmem_allocator_sm100.hpp"       // cute::TMEM::Allocator2Sm, Sm100TmemCapacityColumns
 #include "cutlass/arch/barrier.h"                    // fence_view_async_tmem_store, NamedBarrier
 #include "cutlass/arch/reg_reconfig.h"               // warpgroup_reg_alloc/dealloc
@@ -169,6 +171,31 @@ struct SwiGluConfig {
   using TMA_W1 = typename MainloopParams::TMA_B;
 
   static constexpr uint32_t TmaTransactionBytes = CollectiveMma::TmaTransactionBytes;
+
+  // ---- TMA-STORE epilogue (sA → global A) ----------------------------------------------------
+  // Per-CTA output staging-tile extents (must match Sm100SwiGluKernel::kEpiTileM/kEpiTileN; defined
+  // here too so the host launcher can build the store descriptor and Params can name its type):
+  //   kEpiTileM = TileShape M / AtomThrShapeMNK (per-CTA M slice = 128 for 256/(2,1,1); 128 for 1-SM)
+  //   kEpiTileN = TileShape N (output n-tile width = 64)
+  static constexpr int kEpiTileM_cfg =
+      cute::size<0>(cute::take<0, 2>(TileShape{})) / int(cute::size(AtomThrShapeMNK{}));
+  static constexpr int kEpiTileN_cfg = cute::size<1>(cute::take<0, 2>(TileShape{}));
+  // sA smem layout: row-major (kEpiTileM, kEpiTileN). PLAIN (no swizzle) — this is exactly the layout
+  // the epilogue already uses for ss.tensors.smem_out, and make_tma_copy below builds the matching
+  // (no-swizzle) TMA-store descriptor box = product_each(shape) = (kEpiTileM,kEpiTileN). The contiguous
+  // (N) box width = kEpiTileN*sizeof(ElementOut) = 64*2 = 128B (16B-aligned ✓; TMA store needs ≥16B).
+  using SmemLayoutA = decltype(cute::make_layout(
+      cute::make_shape(cute::Int<kEpiTileM_cfg>{}, cute::Int<kEpiTileN_cfg>{}),
+      cute::make_stride(cute::Int<kEpiTileN_cfg>{}, cute::_1{})));
+  // TMA-store descriptor type over the WHOLE output A[M,I] (row-major, rank-2). The descriptor is built
+  // ONCE on the host over the true (M,I) extent; per-tile/per-CTA placement is just the box coordinate
+  // (local_tile by (kEpiTileM,kEpiTileN)). OOB on a partial tile is clamped by the descriptor extent.
+  using TMA_A = decltype(make_tma_copy(
+      cute::SM90_TMA_STORE{},
+      cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementOut*>(nullptr)),
+                        cute::make_layout(cute::make_shape(int(0), int(0)),
+                                          cute::make_stride(int(0), cute::_1{}))),
+      SmemLayoutA{}));
 };
 
 // ============================================================================================
@@ -205,6 +232,8 @@ struct Sm100SwiGluKernel {
   using StrideA = typename Config::StrideA;
   using TMA_X = typename Config::TMA_X;
   using TMA_W1 = typename Config::TMA_W1;
+  using TMA_A = typename Config::TMA_A;          // TMA-STORE descriptor type over A[M,I] (row-major)
+  using SmemLayoutA = typename Config::SmemLayoutA;  // sA staging-tile smem layout (kEpiTileM,kEpiTileN)
   static constexpr int Stages = Config::Stages;
 
   using ArchTag = cutlass::arch::Sm100;
@@ -246,6 +275,11 @@ struct Sm100SwiGluKernel {
   static constexpr int kEpiTileM =
       cute::size<0>(take<0, 2>(TileShape{})) / int(cute::size(AtomThrShapeMNK{}));  // 128
   static constexpr int kEpiTileN = cute::size<1>(take<0, 2>(TileShape{}));          // 64
+  // The TMA-STORE staging layout (Config::SmemLayoutA) and descriptor (Config::TMA_A) are built from
+  // Config::kEpiTileM_cfg/kEpiTileN_cfg; assert they equal the Kernel's kEpiTileM/kEpiTileN so the smem
+  // sA tile, the descriptor box, and the per-tile local_tile box-coordinate math all agree.
+  static_assert(kEpiTileM == Config::kEpiTileM_cfg && kEpiTileN == Config::kEpiTileN_cfg,
+                "Config TMA-store tile extents must match Kernel kEpiTileM/kEpiTileN");
   // Cols per acc buffer (ONE acc-pipeline stage) = gate(kEpiTileN) + up(kEpiTileN) = 2*kEpiTileN. With
   // AccStages>1 each stage occupies its own [stage*kAccBufStride, (stage+1)*kAccBufStride) TMEM window:
   // gate at stage*kAccBufStride, up at stage*kAccBufStride + kEpiTileN. The MMA writes the producer
@@ -307,6 +341,8 @@ struct Sm100SwiGluKernel {
   struct Params {
     TMA_X tma_load_x;
     TMA_W1 tma_load_w1;  // ONE descriptor over [G*2I, d]; gate/up are per-expert N-tile slices
+    TMA_A tma_store_a;   // ONE TMA-STORE descriptor over the whole output A[M,I] (row-major); the
+                         // per-tile/per-CTA placement is just the box coordinate (local_tile offset)
     ElementOut* ptr_A;
     StrideA dA;
     int M, N, K;  // M == G*Me, N == I, K == d
@@ -342,6 +378,11 @@ struct Sm100SwiGluKernel {
     if (role == kLoad && lane_predicate) {
       cute::prefetch_tma_descriptor(params.tma_load_x.get_tma_descriptor());
       cute::prefetch_tma_descriptor(params.tma_load_w1.get_tma_descriptor());
+    }
+    // Prefetch the TMA-STORE descriptor (A[M,I]) from the elected epilogue lane: the store is issued by
+    // the epilogue warps, so warm its descriptor in their warpgroup (a hint only; harmless to prefetch).
+    if (role == kEpilogue && lane_predicate && warp_idx == 4) {
+      cute::prefetch_tma_descriptor(params.tma_store_a.get_tma_descriptor());
     }
 
     // ---- pipeline construction (one stamp of role per warp; FMHA kernel hpp:284-391) ----
@@ -605,9 +646,10 @@ struct Sm100SwiGluKernel {
       cutlass::arch::warpgroup_reg_alloc<160>();
 
       // TMEM is published ONCE (before the persistent loop); wait here once.  All tile-invariant epilogue
-      // setup (MMA layout, TMEM accumulator views, coordinate tile, TMEM-load tiling, register tensors,
-      // sA/mA) is hoisted out of the loop below — only cta_row_offset/cta_col_offset and the per-tile
-      // pipeline handshake (consumer_wait/release) + the coalesced sA→global write are per-tile.
+      // setup (MMA layout, TMEM accumulator views, coordinate tile, TMEM-load tiling, register tensors, sA
+      // staging + TMA-store partition mA_tma/bSG_sA) is hoisted out of the loop below — only
+      // cta_row_offset/cta_col_offset, the per-tile pipeline handshake (consumer_wait/release), and the
+      // per-tile TMA-store box coordinate (local_tile → bSG_gA) are per-tile.
       tmem_alloc_bar.arrive_and_wait();  // wait for MMA to publish ss.tmem_base_ptr (#3)
 
       TiledMma tiled_mma;
@@ -712,31 +754,36 @@ struct Sm100SwiGluKernel {
       Tensor rGate = make_tensor<ElementAcc>(shape(tTMc));
       Tensor rUp = make_tensor<ElementAcc>(shape(tTMc));
 
-      // A in global as a row-major (M,N) tensor; write each owned element.
-      // Rank-2 layout: shape (M,N) with row-major stride (N,1). (params.dA is the rank-3 (M,N,L)
-      // TagToStrideC stride and would mismatch ranks here; A is contiguous so (N,_1) is exact.)
-      Tensor mA = make_tensor(make_gmem_ptr(params.ptr_A), make_layout(make_shape(M, N), make_stride(N, _1{})));
-
-      // ---- L1-COALESCING EPILOGUE (stage in SMEM, then write SMEM→global coalesced) -----------------
-      // The old path did a PER-ELEMENT global scatter: each thread wrote mA(row,col) at thread-specific
-      // (row,col), so CONSECUTIVE threads hit NON-contiguous global addresses → uncoalesced → L1 replay
-      // thrash (the 84% bottleneck).  We instead: (1) compute results into registers rA, (2) scatter rA
-      // into a per-CTA SMEM tile sA at the SAME LOCAL (row,col) tTMc(i) gives (SMEM scatter has no
-      // coalescing penalty), (3) cooperatively write sA → global A with CONSECUTIVE threads writing
-      // CONSECUTIVE columns → contiguous global addresses → COALESCED.  Numerics are IDENTICAL: every
-      // element lands at the same global (row,col)=(local_row+cta_row_offset, local_col+cta_col_offset)
-      // with the same silu(gate)*up value; sA is only an intermediate.
-      Tensor sA = make_tensor(make_smem_ptr(ss.tensors.smem_out.begin()),
-                              make_layout(make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
-                                          make_stride(Int<kEpiTileN>{}, _1{})));  // row-major (M_local,N)
+      // ---- TMA-STORE EPILOGUE (stage in SMEM, then async TMA bulk-tensor store SMEM→global) ----------
+      // The result tile is computed into registers rA, scattered into a per-CTA SMEM staging tile sA at
+      // the LOCAL (row,col) tTMc(i) gives, then DRAINED to global A by a SINGLE async TMA bulk-tensor
+      // store (cp.async.bulk.tensor) per CTA per tile.  TMA bypasses the L1/TEX path (the old manual
+      // 128-thread coalesced sA→global loop went through the LSU and was the 87% L1/TEX bottleneck) and
+      // frees the epilogue threads for the next tile's TMEM-load+silu while the store drains.  Numerics
+      // are IDENTICAL: every element lands at the same global (row,col)=(local_row+cta_row_offset,
+      // local_col+cta_col_offset) with the same silu(gate)*up value; sA is only an intermediate.
+      Tensor sA = make_tensor(make_smem_ptr(ss.tensors.smem_out.begin()), SmemLayoutA{});  // (kEpiTileM,kEpiTileN) row-major
       cutlass::epilogue::thread::SiLu<ElementAcc> silu{};
+
+      // TMA-STORE partition (HOISTED — buffer/coord-independent).  mA_tma is the descriptor's identity
+      // coord-tensor over the WHOLE A[M,N] (congruent with the host stride (N,1)); per-tile we local_tile
+      // it at the box coordinate.  thrblk_s2g.partition_S(sA) is the smem source (sA pointer is fixed →
+      // hoistable); thrblk_s2g.partition_D(gA) is the gmem dst (gA changes per tile → built in the loop).
+      // The TMA bulk-store is issued by ONE elected thread (the partition from get_slice(Int<0>{}) is the
+      // full box assigned to logical thread 0), exactly as the stock SM100/SM90 TMA epilogue does.
+      Tensor mA_tma = params.tma_store_a.get_tma_tensor(make_shape(M, N));   // (M,N) identity coords
+      ThrCopy thrblk_s2g = params.tma_store_a.get_slice(Int<0>{});
+      Tensor bSG_sA = thrblk_s2g.partition_S(sA);                            // (TMA,TMA_M,TMA_N)
+      // ONE issuing thread per CTA = elected lane of epi-warp 4 (lane_predicate = cute::elect_one_sync()
+      // computed once at entry, valid per-warp). All store-issuing ops (copy/arrive/wait) are gated on it.
+      const bool is_tma_store_lane = (warp_idx == 4) && (lane_predicate != 0u);
 
       // PERSISTENT grid-stride over the SAME tile sequence the Load/MMA warps walk (identical cluster_id
       // + bounds → identical tile count → all 128 epilogue threads loop the same number of times and the
       // post-loop cluster_sync is reached in lockstep).  epi_cons advances CONTINUOUSLY across tiles (NOT
       // re-init per tile).  Each tile: consumer_wait (waits for THIS tile's MMA commit) → TMEM-load →
-      // silu·mul → sA scatter → consumer_release (frees the acc slot so the NEXT tile's MMA may overwrite
-      // TMEM) → epi_smem_bar → coalesced sA→global write.
+      // silu·mul → WAR (drain PREVIOUS tile's TMA store) → sA scatter → consumer_release (frees the acc
+      // slot so the NEXT tile's MMA may overwrite TMEM) → fence+epi_smem_bar → async TMA bulk-store sA→A.
       for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters) {
         const int m_tile = tile / params.n_local_tiles;        // GLOBAL token m-tile, across ALL experts
         const int n_tile_local = tile % params.n_local_tiles;  // OUTPUT column tile, ∈ [0, nI_per_expert)
@@ -777,9 +824,23 @@ struct Sm100SwiGluKernel {
         }
 #endif
 
+        // WAR (cross-tile sA reuse): sA (ss.tensors.smem_out) is a SINGLE staging buffer reused every
+        // tile.  The PREVIOUS tile's TMA bulk-store reads sA asynchronously; before we OVERWRITE sA with
+        // THIS tile's scatter, that store MUST have drained.  tma_store_wait<0>() drains it on the issuing
+        // thread (it tracks the pending cp.async.bulk commit group); the NamedBarrier then makes ALL 128
+        // epilogue threads observe the drain before any begins the scatter.  Placed HERE (after this tile's
+        // TMEM-load+silu, before its scatter) so the PREVIOUS store overlapped this tile's TMEM-load+silu
+        // (the perf win).  On the FIRST iteration nothing is pending → tma_store_wait<0>() is a no-op.
+        // (Replaces the old epi_done_bar; same NumEpiThreads, distinct hw barrier id 1u.)
+        if (is_tma_store_lane) {
+          cute::tma_store_wait<0>();
+        }
+        cutlass::arch::NamedBarrier epi_war_bar(NumEpiThreads, /*id=*/1u);
+        epi_war_bar.arrive_and_wait();
+
         // (1) compute rA, (2) scatter into SMEM at the LOCAL (row,col).  No row<M/col<N guard here: the
         // LOCAL (row,col) is always in [0,kEpiTileM)×[0,kEpiTileN) by construction; OOB global rows/cols
-        // are dropped in the global-write loop below (uniform-Me/I assumption ⇒ in practice never OOB).
+        // are clamped by the TMA-store descriptor's box (it never writes past the (M,N) extent).
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(rGate); ++i) {
 #if defined(SWIGLU_DEBUG_RAW_GATE)
@@ -805,47 +866,46 @@ struct Sm100SwiGluKernel {
         pipeline_epi.consumer_release(epi_cons);
         ++epi_cons;
 
-        // Make all of sA visible across the 128 epilogue threads BEFORE the cooperative global write.
-        // MUST be a NamedBarrier over EXACTLY the NumEpiThreads(=128) epilogue threads, NOT __syncthreads():
-        // __syncthreads() would block on all 256 block threads, but the Load/MMA/empty warps are off in
-        // their own grid-stride loops / parked at the cluster_sync() below — they will NEVER reach a
-        // barrier inside this epilogue branch, so __syncthreads() here would DEADLOCK.  All 128 epilogue
-        // threads reach this NamedBarrier every iteration (no early/divergent exit precedes it within the
-        // loop body), and it is a distinct (user id 0 → effective id 8) barrier from tmem_alloc_bar (id 6).
-        // It is per-tile (NOT hoisted): it orders THIS tile's sA writes before THIS tile's global flush.
+        // Make all of sA visible across the 128 epilogue threads, AND make those generic (LSU) smem
+        // writes visible to the async TMA proxy, BEFORE issuing the TMA bulk-store.
+        //  - fence_view_async_shared() (== fence.proxy.async.shared::cta) is issued by EVERY epi thread so
+        //    its own sA writes become visible to the TMA (async) proxy.  This is the store-side analogue
+        //    of the load's cp.async fence; the stock SM90/SM100 TMA epilogue does exactly this before the
+        //    TMA store (sm100_epilogue_tma_warpspecialized.hpp:768).
+        //  - epi_smem_bar (NamedBarrier over EXACTLY the 128 epi threads — NOT __syncthreads(), which would
+        //    deadlock on the Load/MMA/empty warps that never enter this branch) then cross-orders ALL 128
+        //    threads' sA writes + fences before the single issuing thread reads sA via TMA.  All 128 reach
+        //    it every iteration (no divergent exit precedes it); distinct hw barrier id 0u (vs WAR id 1u).
+        cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier epi_smem_bar(NumEpiThreads, /*id=*/0u);
         epi_smem_bar.arrive_and_wait();
 
-        // (3) COALESCED SMEM→global copy: the 128 epilogue threads cooperatively flush sA[kEpiTileM×kEpiTileN]
-        // to global A.  Flat thread-strided loop over (r,c) in row-major order: consecutive flat indices idx,
-        // idx+1 map to consecutive columns c, c+1 (same row, or wrapping to the next row), so consecutive
-        // threads write CONSECUTIVE global columns gcol → CONSECUTIVE global addresses (mA stride is (N,1))
-        // ⇒ COALESCED.  Same global (grow,gcol)=(cta_row_offset+r, cta_col_offset+c) and same value as the
-        // old per-element scatter; the row<M/col<N guard is preserved verbatim.
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (int idx = thread_idx; idx < kEpiTileM * kEpiTileN; idx += NumEpiThreads) {
-          int r = idx / kEpiTileN;
-          int c = idx % kEpiTileN;
-          int grow = cta_row_offset + r;  // local row + tile M-base (+ 2-SM split) → global
-          int gcol = cta_col_offset + c;  // local col + tile N-base → global
-          if (grow < M && gcol < N) {
-            mA(grow, gcol) = sA(r, c);
-          }
+        // (3) ASYNC TMA BULK-TENSOR STORE: ONE elected thread per CTA drains sA → global A, bypassing the
+        // L1/TEX/LSU path.  The box coordinate reuses the manual loop's EXACT per-tile/per-CTA offset math:
+        //   cta_row_offset = m_tile*kTileM + block_rank*kEpiTileM  (kTileM = AtomThrID * kEpiTileM, so this
+        //   is an exact multiple of kEpiTileM) → box-row index = cta_row_offset / kEpiTileM.  Each CTA of a
+        //   2-SM cluster issues its OWN store for its kEpiTileM-row slice (NOT leader-gated; the epilogue
+        //   runs on both CTAs and block_rank already encodes which CTA).  cta_col_offset = n_tile_local*kTileN
+        //   (== n_tile_local*kEpiTileN since kTileN==kEpiTileN) → box-col index = cta_col_offset / kEpiTileN.
+        // local_tile selects gA = A[ box_m*kEpiTileM : +kEpiTileM, box_n*kEpiTileN : +kEpiTileN ]; the TMA
+        // descriptor (built over the TRUE (M,N) extent) clamps any partial tile (OOB rows/cols never written).
+        // tma_store_arrive() commits the cp.async.bulk group; the WAR tma_store_wait<0>() at the TOP of the
+        // NEXT iteration drains it before sA is overwritten — so THIS store overlaps the next tile's
+        // TMEM-load+silu compute.  (For the tested shapes M=16384%256==0, I=512%64==0 every tile is FULL.)
+        if (is_tma_store_lane) {
+          const int box_m = cta_row_offset / kEpiTileM;  // exact (kTileM = AtomThrID*kEpiTileM)
+          const int box_n = cta_col_offset / kEpiTileN;  // exact (kTileN == kEpiTileN)
+          Tensor gA = local_tile(mA_tma, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
+                                  make_coord(box_m, box_n));   // (kEpiTileM, kEpiTileN)
+          Tensor bSG_gA = thrblk_s2g.partition_D(gA);          // (TMA,TMA_M,TMA_N)
+          copy(params.tma_store_a, bSG_sA, bSG_gA);
+          cute::tma_store_arrive();
         }
-        // PERSISTENT WAR guard: sA (ss.tensors.smem_out) is a SINGLE shared staging buffer REUSED every
-        // tile.  Without this barrier a fast thread could finish THIS tile's flush, loop, pass the next
-        // tile's consumer_wait (its gating chain only requires THIS tile's consumer_release at line ~747,
-        // which precedes the flush), and start the NEXT tile's sA SCATTER (write) while a slow thread is
-        // still READING sA in THIS tile's flush above → cross-tile WAR race on sA.  This NamedBarrier
-        // (same id 0 / NumEpiThreads as epi_smem_bar) forces ALL 128 epilogue threads to finish this
-        // tile's flush reads before ANY proceeds to the next tile's scatter.  All 128 threads reach it
-        // every iteration (no divergent exit precedes it), so it is deadlock-free; the empty/Load/MMA
-        // warps never enter this branch so this barrier never involves them.
-        // DISTINCT id from epi_smem_bar (which uses id 0u → hw barrier 8): using the SAME id makes both
-        // arrive_and_wait()s hit the SAME hardware barrier, which deadlocks across the persistent tile
-        // loop (two same-barrier syncs per iteration interleave). id 1u → hw barrier 9.
-        cutlass::arch::NamedBarrier epi_done_bar(NumEpiThreads, /*id=*/1u);
-        epi_done_bar.arrive_and_wait();
+      }
+      // Drain the LAST tile's TMA store before the cluster_sync()/TMEM-free below (no further WAR wait will
+      // run for it). Only the issuing thread has a pending commit group; harmless no-op on the others.
+      if (is_tma_store_lane) {
+        cute::tma_store_wait<0>();
       }
     } else {
       cutlass::arch::warpgroup_reg_dealloc<40>();
@@ -924,9 +984,21 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
   typename CollectiveMma::Params mainloop_params =
       CollectiveMma::to_underlying_arguments(problem, mainloop_args, /*workspace=*/nullptr, hw_info);
 
+  // TMA-STORE descriptor for the fused output A[M,I] (row-major, single contiguous tensor, expert
+  // implicit in the row range — mirrors how ONE W1 load descriptor covers all experts). Built ONCE
+  // over the TRUE (M,I) extent so the descriptor's box clamping handles any partial tile (OOB) for
+  // free; per-tile/per-CTA placement is just the box coordinate (local_tile by (kEpiTileM,kEpiTileN)).
+  // Stride (I,1) = row-major; sA smem layout = Config::SmemLayoutA (kEpiTileM,kEpiTileN) row-major, the
+  // SAME layout ss.tensors.smem_out uses → make_tma_copy builds a no-swizzle box (kEpiTileM,kEpiTileN).
+  cute::Tensor mA_store =
+      cute::make_tensor(cute::make_gmem_ptr(A),
+                        cute::make_layout(cute::make_shape(M, I), cute::make_stride(I, cute::_1{})));
+  auto tma_store_a = make_tma_copy(cute::SM90_TMA_STORE{}, mA_store, typename Config::SmemLayoutA{});
+
   typename Kernel::Params params;
   params.tma_load_x = mainloop_params.tma_load_a;
   params.tma_load_w1 = mainloop_params.tma_load_b;
+  params.tma_store_a = tma_store_a;
   params.ptr_A = A;
   params.dA = dA;
   params.M = M;       // G*Me
