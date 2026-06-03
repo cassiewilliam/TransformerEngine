@@ -80,7 +80,7 @@ struct GemmGivenSchedule {
   // Core kernel configurations
   using ElementAccumulator = float;  // Element type for internal accumulation
   using ArchTag =
-      cutlass::arch::Sm90;  // Tag indicating the minimum SM that supports the intended feature
+      typename ScheduleConfig::ArchTag;  // SM90 (Hopper) or SM100 (Blackwell), from ScheduleConfig
   using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag
   using StageCountType =
       cutlass::gemm::collective::StageCountAuto;  // Stage count maximized based on the tile size
@@ -92,7 +92,7 @@ struct GemmGivenSchedule {
   using EpilogueSchedule = typename ScheduleConfig::EpilogueSchedule;  // Epilogue to launch
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
+      ArchTag, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
       ElementC, LayoutC*, AlignmentC, ElementC, LayoutC*, AlignmentC, EpilogueSchedule,
       cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>>::CollectiveOp;
@@ -110,20 +110,27 @@ struct GemmGivenSchedule {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-template <typename DataType_, bool trans_a, bool trans_b>
+// kSm100=false -> Hopper (SM90) Ptr-Array TMA warp-specialized Pingpong (original path).
+// kSm100=true  -> Blackwell (SM100) Ptr-Array TMA warp-specialized 1-SM schedule (tcgen05 UMMA).
+//                 Start with the 1-SM schedule (single-CTA, simplest constraints); a 2-SM/2-CTA
+//                 variant can be added later for higher throughput.
+template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false>
 struct ScheduleConfig {
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
-  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
-  using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
-
-  // TODO(Alan): Add tuning for different scenarios to select the optimal configuration,
-  //             as the current configuration may not be the best.
-
-  // using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-  // using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-  // using TileShape = Shape<cute::_256, cute::_128, cute::_128>;
-  // using ClusterShape = Shape<cute::_1, cute::_2, cute::_1>;
+  using ArchTag = std::conditional_t<kSm100, cutlass::arch::Sm100, cutlass::arch::Sm90>;
+  // SM100 FINAL (converged over it1 1-SM / it2 2-SM / it3 1-SM@large-N): 2-SM / 2-CTA tcgen05.
+  // Small-N: 2-SM ties 1-SM (~232 vs ~238 TFLOPS, noise). Large-N: 2-SM 1202 vs 1-SM 690 TFLOPS
+  // (1.74x). => 2-SM wins universally. cluster 2x1x1, tile M=256.
+  using KernelSchedule =
+      std::conditional_t<kSm100, cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>;
+  using EpilogueSchedule =
+      std::conditional_t<kSm100, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
+                         cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong>;
+  // it4: try N-tile 256 (vs 128) for higher large-N throughput.
+  using TileShape = std::conditional_t<kSm100, cute::Shape<cute::_256, cute::_256, cute::_64>,
+                                       cute::Shape<cute::_128, cute::_128, cute::_128>>;
+  using ClusterShape = std::conditional_t<kSm100, cute::Shape<cute::_2, cute::_1, cute::_1>,
+                                          cute::Shape<cute::_1, cute::_2, cute::_1>>;
 
   using LayoutA = GroupedGemmInputALayout<trans_a>;
   using LayoutB = GroupedGemmInputBLayout<trans_b>;
@@ -131,8 +138,9 @@ struct ScheduleConfig {
   using DataType = DataType_;
 };
 
-template <typename DataType_, bool trans_a, bool trans_b>
-using GemmGrouped = typename GemmGivenSchedule<ScheduleConfig<DataType_, trans_a, trans_b>>::Gemm;
+template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false>
+using GemmGrouped =
+    typename GemmGivenSchedule<ScheduleConfig<DataType_, trans_a, trans_b, kSm100>>::Gemm;
 
 template <typename GemmT, typename ElementA, typename ElementB, typename ElementC, typename StrideA,
           typename StrideB, typename StrideC>
@@ -221,11 +229,11 @@ static char* getHostWorkspace() {
   return workspace.get();
 }
 
-template <bool trans_a, bool trans_b, typename Element>
+template <bool trans_a, bool trans_b, typename Element, bool kSm100 = false>
 void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                         NVTETensor* workspace, float alpha, float beta, int num_gemms,
                         cudaStream_t stream, int device, int math_sm_count) {
-  using Gemm = GemmGrouped<Element, trans_a, trans_b>;
+  using Gemm = GemmGrouped<Element, trans_a, trans_b, kSm100>;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
   using LayoutC = typename Gemm::LayoutC;
@@ -340,7 +348,10 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   }
 }
 
-template <bool trans_a, bool trans_b, typename ElementD = float>
+// kBigN selects the SM100 wgrad N-tile: false=256x128x64 (best for small-K, latency-bound),
+// true=256x256x64 (best for large-K). Chosen at runtime by average K (see cutlass_grouped_gemm.cu).
+template <bool trans_a, bool trans_b, typename ElementD = float, bool kSm100 = false,
+          bool kBigN = false>
 struct GemmGivenScheduleWgrad;
 
 // Base config shared by both FP32 and BF16 output specialisations.
@@ -364,14 +375,14 @@ struct GemmGivenScheduleWgradBase {
 
 // FP32 output: Cooperative 128×128×64, ClusterShape 1×1×1.
 // Two warpgroups keep both the MMA pipeline and the FP32 epilogue busy.
-template <bool trans_a, bool trans_b>
-struct GemmGivenScheduleWgrad<trans_a, trans_b, float>
+template <bool trans_a, bool trans_b, bool kSm100, bool kBigN>
+struct GemmGivenScheduleWgrad<trans_a, trans_b, float, kSm100, kBigN>
     : GemmGivenScheduleWgradBase<trans_a, trans_b, float> {
   using Base = GemmGivenScheduleWgradBase<trans_a, trans_b, float>;
   using ElementD = float;
   using ElementC = float;
   using ElementAccumulator = float;
-  using ArchTag = cutlass::arch::Sm90;
+  using ArchTag = std::conditional_t<kSm100, cutlass::arch::Sm100, cutlass::arch::Sm90>;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using LayoutA = typename Base::LayoutA;
   using LayoutB = typename Base::LayoutB;
@@ -380,10 +391,20 @@ struct GemmGivenScheduleWgrad<trans_a, trans_b, float>
   static constexpr int AlignmentB = Base::AlignmentB;
   static constexpr int AlignmentC = Base::AlignmentC;
 
-  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_64>;
-  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  // SM90: Cooperative 128x128x64. SM100: 256x128 (small-K) or 256x256 (large-K), by kBigN.
+  using TileShape = std::conditional_t<
+      kSm100,
+      std::conditional_t<kBigN, cute::Shape<cute::_256, cute::_256, cute::_64>,
+                         cute::Shape<cute::_256, cute::_128, cute::_64>>,
+      cute::Shape<cute::_128, cute::_128, cute::_64>>;
+  using ClusterShape = std::conditional_t<kSm100, cute::Shape<cute::_2, cute::_1, cute::_1>,
+                                          cute::Shape<cute::_1, cute::_1, cute::_1>>;
+  using KernelSchedule =
+      std::conditional_t<kSm100, cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>;
+  using EpilogueSchedule =
+      std::conditional_t<kSm100, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
+                         cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, TileShape, ClusterShape,
@@ -407,14 +428,14 @@ struct GemmGivenScheduleWgrad<trans_a, trans_b, float>
 // warp-specialized Pingpong schedule (SM90). The 8-element (kWgradMinAlign) alignment on the
 // expert/hidden dims is validated before launch; any remaining tile/shape constraints are
 // enforced by the kernel's can_implement check inside CutlassGroupedGemmWgrad.
-template <bool trans_a, bool trans_b>
-struct GemmGivenScheduleWgrad<trans_a, trans_b, cutlass::bfloat16_t>
+template <bool trans_a, bool trans_b, bool kSm100, bool kBigN>
+struct GemmGivenScheduleWgrad<trans_a, trans_b, cutlass::bfloat16_t, kSm100, kBigN>
     : GemmGivenScheduleWgradBase<trans_a, trans_b, cutlass::bfloat16_t> {
   using Base = GemmGivenScheduleWgradBase<trans_a, trans_b, cutlass::bfloat16_t>;
   using ElementD = cutlass::bfloat16_t;
   using ElementC = cutlass::bfloat16_t;
   using ElementAccumulator = float;
-  using ArchTag = cutlass::arch::Sm90;
+  using ArchTag = std::conditional_t<kSm100, cutlass::arch::Sm100, cutlass::arch::Sm90>;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using LayoutA = typename Base::LayoutA;
   using LayoutB = typename Base::LayoutB;
@@ -423,10 +444,20 @@ struct GemmGivenScheduleWgrad<trans_a, trans_b, cutlass::bfloat16_t>
   static constexpr int AlignmentB = Base::AlignmentB;
   static constexpr int AlignmentC = Base::AlignmentC;
 
-  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
-  using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+  // SM90: Pingpong 128x128x128. SM100: 256x128 (small-K) or 256x256 (large-K), by kBigN.
+  using TileShape = std::conditional_t<
+      kSm100,
+      std::conditional_t<kBigN, cute::Shape<cute::_256, cute::_256, cute::_64>,
+                         cute::Shape<cute::_256, cute::_128, cute::_64>>,
+      cute::Shape<cute::_128, cute::_128, cute::_128>>;
+  using ClusterShape = std::conditional_t<kSm100, cute::Shape<cute::_2, cute::_1, cute::_1>,
+                                          cute::Shape<cute::_1, cute::_2, cute::_1>>;
+  using KernelSchedule =
+      std::conditional_t<kSm100, cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>;
+  using EpilogueSchedule =
+      std::conditional_t<kSm100, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
+                         cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, TileShape, ClusterShape,
@@ -446,15 +477,18 @@ struct GemmGivenScheduleWgrad<trans_a, trans_b, cutlass::bfloat16_t>
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-template <bool trans_a, bool trans_b, typename ElementD = float>
-using GemmGroupedWgrad = typename GemmGivenScheduleWgrad<trans_a, trans_b, ElementD>::Gemm;
+template <bool trans_a, bool trans_b, typename ElementD = float, bool kSm100 = false,
+          bool kBigN = false>
+using GemmGroupedWgrad =
+    typename GemmGivenScheduleWgrad<trans_a, trans_b, ElementD, kSm100, kBigN>::Gemm;
 
-template <bool trans_a, bool trans_b, typename ElementD = float>
+template <bool trans_a, bool trans_b, typename ElementD = float, bool kSm100 = false,
+          bool kBigN = false>
 void CutlassGroupedGemmWgrad(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                              NVTETensor* workspace, float alpha, float beta, int num_gemms,
                              cudaStream_t stream, int device, int math_sm_count) {
-  using Config = GemmGivenScheduleWgrad<trans_a, trans_b, ElementD>;
-  using Gemm = GemmGroupedWgrad<trans_a, trans_b, ElementD>;
+  using Config = GemmGivenScheduleWgrad<trans_a, trans_b, ElementD, kSm100, kBigN>;
+  using Gemm = GemmGroupedWgrad<trans_a, trans_b, ElementD, kSm100, kBigN>;
   using LayoutA = typename Config::LayoutA;
   using LayoutB = typename Config::LayoutB;
   using LayoutC = typename Config::LayoutC;
