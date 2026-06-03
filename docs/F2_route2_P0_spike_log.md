@@ -463,3 +463,21 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 **裁决：** revert 回 clean 673（patch 存 `docs/F2_storepath_refactor_WIP.patch`）。**bank-conflict bound 经 6 次尝试（TMA-store/swizzle/stmatrix×2/investigation/compose）确认：在手写 dual-accumulator kernel 内不可解，真正修复需全 collective-epilogue 重写（而 dual-acc N-halving SwiGLU 不匹配其 single-acc 模型）。**
 - 注：double-buffer(AccStages=2) 已部分 hide epilogue，673 是在 bank-conflict **存在**下达到的 → 修复的边际收益受 overlap 限制（非满 +40%）。
 - **F2 route#2 收敛：673（高方差）/608（uniform）/628-647（不均匀）TFLOPS，+109%，varlen-M 验证，CUTLASS 4.5.1。下一步建议：接入 TE GroupedLinear 端到端验证（融合省 [M,2I] 中间 HBM 往返）。**
+
+## P1 Step-17：⚠️ 前述"编译墙"= include-order BUG，非 CuTe wall —— 推翻"unsolvable"结论
+**根因（决定性诊断）：** Step-16 及 swizzle/compose 的"编译失败"**不是 CuTe layout 墙，而是一个潜伏的 include-order bug**：kernel 把 `cute/arch/copy_sm90_tma.hpp` 等放在 `cute/tensor.hpp` **之前** → 它们 transitively 拉 `cute/algorithm/copy.hpp`，而 `Copy_Atom`（在 copy_atom.hpp，由 tensor.hpp 拉）尚未定义 → copy.hpp 解析失败 + 重复声明 copy_if/copy。**之前靠运气编过；某次容器/头状态变化让它暴露**，且**连干净 kernel（曾编过 608/674）都失败**。隔离证明：`cute/tensor.hpp` 单独编 OK，4 个 cute include 把 tensor.hpp 放最后则 fail，放最前则 OK。**修复：tensor.hpp 第一**（commit `18cd4de8`），608/674 恢复，n_fail=0。
+**→ 在修好的 build 上重测 swizzle，得到真正答案：**
+**padding（确认不可用）：** stride 66（无冲突）+ stride 72（16B-aligned, 4-way）→ TMA store 运行时 **"misaligned address"**。TMA 要求 dense 或 canonical-swizzle 的 smem，任意 padded pitch 不行 → **padding 与 TMA 根本不兼容**。
+**SW128 swizzle + compose + AutoVectorizingCopy<128>（修好 build 后编译通过）：**
+| 指标 | baseline | SW128 swizzle |
+|---|---|---|
+| store bank conflicts | 10.15M | **370K（27× 更少！）** |
+| store wavefronts | 11.2M | 1.43M（8× 更少） |
+| **target 性能** | 672 | **674（持平）** |
+| uniform 性能 | 608 | 607（持平） |
+| **L1/TEX** | 95.18% | **95.11%（持平）** |
+| Compute(SM) | 62.2% | 62.9% |
+- **结论1：bank-conflict 可解**（swizzle 27× 更少冲突）——"6 次尝试 unsolvable" 是 **build bug**，非真墙。
+- **结论2：解了也不快**（性能持平 674≈672，L1/TEX 仍 95%）——**bank-conflict 是高-SOL 假象，非 wall-clock bound**：`AccStages=2` double-buffer 让 epilogue 与下一 tile MMA **重叠**，冲突的 store 并发执行、不延长关键路径。
+- （swizzle 的 `sA.compose(tTMc.layout())` 映射有正确性 bug，n_fail 高；但 store 工作量相同→timing 结论不变。已 revert 回 clean 672。）
+- **真正 bound = 2-SM occupancy 12.5% + MMA/memory throughput，非 epilogue。kernel 真正收敛在 673。** swizzle patch 价值仅"消冲突"（不提速），如需 clean 无冲突版可修 compose 正确性（低 ROI）。
