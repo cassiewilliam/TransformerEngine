@@ -14,16 +14,29 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
-// Compile-time accumulator-pipeline depth (TMEM double/triple-buffer) for autotuning sweeps.
-// Override with -DACCSTAGES=N. Default 2 (the tuned double-buffer). Kernel constraint: ACCSTAGES*2*TileN<=512.
+// Compile-time tunables for autotuning sweeps. Override with -DTILEM=.. -DTILEN=.. -DKSTAGES=.. -DACCSTAGES=..
+// Defaults = the tuned config. Kernel constraints: ACCSTAGES*2*TILEN<=512 (pow2), TILEN<=256.
+#ifndef TILEM
+#define TILEM 256
+#endif
+#ifndef TILEN
+#define TILEN 64
+#endif
+#ifndef TILEK
+#define TILEK 16
+#endif
+#ifndef KSTAGES
+#define KSTAGES 16
+#endif
 #ifndef ACCSTAGES
 #define ACCSTAGES 2
 #endif
-// Helper to override only AccStages while keeping the other tuned defaults (TileM=256,TileN=64,TileK=16,kStages=16,Cluster=2,MinBlocks=1).
+// Override the tunables while keeping ClusterM=2, MinBlocks=1.
 #define LAUNCH_GROUPED(...) \
-  transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut, 256, 64, 16, 16, 2, 1, ACCSTAGES>(__VA_ARGS__)
+  transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut, TILEM, TILEN, TILEK, KSTAGES, 2, 1, ACCSTAGES>(__VA_ARGS__)
 
 #include <cuda_runtime.h>
 
@@ -51,11 +64,43 @@ int main(int argc, char** argv) {
   const int I = (argc > 2) ? std::atoi(argv[2]) : 512;
   const int d = (argc > 3) ? std::atoi(argv[3]) : 2048;
   const int G = (argc > 4) ? std::atoi(argv[4]) : 32;
-  const int M = G * Me;                   // total tokens across all experts
-  const int Mref = (M < 512) ? M : 512;   // host fp32 ref only over first Mref rows (full ref too slow)
+  // VARLEN-M mode (env SWIGLU_VARLEN=<comma sizes>): build UNEVEN, TileM-aligned experts to exercise the
+  // per-m-tile expert table + CLC. The env value is a per-expert token-count PATTERN cycled across G
+  // experts, e.g. SWIGLU_VARLEN=1024,2048,3072 (each rounded up to a TILEM multiple). SWIGLU_VARLEN=1 =>
+  // default 256,512,768. Unset => UNIFORM (every expert = Me).
+  const char* vl = std::getenv("SWIGLU_VARLEN");
+  const bool varlen = (vl != nullptr);
+  const int kTM = TILEM;                  // experts are aligned to TileM (token-rounding, like SonicMoE)
+  std::vector<int> expert_ntok(G);
+  std::vector<int> mtile_expert_h;        // [num_m_tiles] global m-tile -> expert id
+  std::vector<int> e_of_token;            // [M] token -> expert id (host reference)
+  int M = 0;
+  if (varlen) {
+    std::vector<int> pat;
+    char buf[256];
+    std::strncpy(buf, vl, 255);
+    buf[255] = 0;
+    for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
+      int v = std::atoi(tok);
+      if (v > 0) pat.push_back(((v + kTM - 1) / kTM) * kTM);  // round up to TILEM multiple
+    }
+    if (pat.empty()) { pat = {kTM, 2 * kTM, 3 * kTM}; }       // SWIGLU_VARLEN=1 => default pattern
+    for (int e = 0; e < G; ++e) expert_ntok[e] = pat[e % pat.size()];
+  } else {
+    for (int e = 0; e < G; ++e) expert_ntok[e] = Me;
+  }
+  for (int e = 0; e < G; ++e) {
+    M += expert_ntok[e];
+    for (int t = 0; t < expert_ntok[e] / kTM; ++t) mtile_expert_h.push_back(e);
+    for (int r = 0; r < expert_ntok[e]; ++r) e_of_token.push_back(e);
+  }
+  // Host fp32 ref is O(Mref*I*d): full check for small varlen (validates ALL experts incl. high indices),
+  // else first 512 rows. (Run varlen with small I/d/G so Mref==M.)
+  const int Mref = varlen ? (M <= 8192 ? M : 2048) : ((M < 512) ? M : 512);
   const int twoI = 2 * I;
   const int W1rows = G * twoI;            // stacked per-expert weights [G*2I, d]
-  std::printf("GROUPED G=%d Me=%d (M=%d) I=%d d=%d\n", G, Me, M, I, d);
+  std::printf("GROUPED G=%d Me=%d (M=%d) I=%d d=%d  varlen=%d num_m_tiles=%zu\n", G, Me, M, I, d,
+              (int)varlen, mtile_expert_h.size());
 
   int dev = 0;
   CHECK_CUDA(cudaSetDevice(dev));
@@ -87,9 +132,19 @@ int main(int argc, char** argv) {
   CHECK_CUDA(cudaMemcpy(dW1, hW1.data(), sizeof(Element) * (size_t)W1rows * d, cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMemset(dA, 0, sizeof(ElementOut) * (size_t)M * I));
 
+  // VARLEN-M: upload the per-m-tile expert table (device); nullptr in uniform mode.
+  int* d_mte = nullptr;
+  if (varlen) {
+    CHECK_CUDA(cudaMalloc(&d_mte, sizeof(int) * mtile_expert_h.size()));
+    CHECK_CUDA(cudaMemcpy(d_mte, mtile_expert_h.data(), sizeof(int) * mtile_expert_h.size(),
+                          cudaMemcpyHostToDevice));
+  }
+  const int* mte_arg = varlen ? d_mte : nullptr;
+  const int M_arg = varlen ? M : 0;
+
   // ---- launch (grouped) ----
   cudaError_t st = LAUNCH_GROUPED(
-      dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount);
+      dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount, mte_arg, M_arg);
   if (st != cudaSuccess) {
     std::printf("Launch returned: %s\n", cudaGetErrorString(st));
   }
@@ -103,7 +158,7 @@ int main(int argc, char** argv) {
   // A is RowMajor [M,I]: A[m,n] at offset m*I + n.
   std::vector<float> ref(Mref * I);
   for (int m = 0; m < Mref; ++m) {
-    const int e = m / Me;                       // expert of token m → its weights W1[e*2I .. (e+1)*2I)
+    const int e = varlen ? e_of_token[m] : (m / Me);  // expert of token m → weights W1[e*2I .. (e+1)*2I)
     const size_t gbase = (size_t)(e * twoI) * d;       // gate rows [e*2I, e*2I+I)
     const size_t ubase = (size_t)(e * twoI + I) * d;   // up   rows [e*2I+I, e*2I+2I)
     for (int n = 0; n < I; ++n) {
@@ -185,7 +240,7 @@ int main(int argc, char** argv) {
   const int warm = 10, iters = 100;
   for (int it = 0; it < warm; ++it)
     LAUNCH_GROUPED(
-        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount);
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg);
   CHECK_CUDA(cudaDeviceSynchronize());
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0);
@@ -193,7 +248,7 @@ int main(int argc, char** argv) {
   cudaEventRecord(e0);
   for (int it = 0; it < iters; ++it)
     LAUNCH_GROUPED(
-        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount);
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg);
   cudaEventRecord(e1);
   CHECK_CUDA(cudaEventSynchronize(e1));
   float ms = 0;

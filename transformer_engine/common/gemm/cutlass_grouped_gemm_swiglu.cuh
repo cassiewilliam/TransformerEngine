@@ -356,6 +356,12 @@ struct Sm100SwiGluKernel {
     int total_tiles;    // num_m_tiles * num_n_local_tiles (logical tiles to process)
     int n_local_tiles;  // num_n_local_tiles == I/kTileN (decode stride for m_tile/n_tile)
     int num_clusters;   // number of persistent clusters launched (grid-stride step)
+    // VARLEN-M (uneven, TileM-aligned experts): device array [num_m_tiles] mapping each GLOBAL m-tile to
+    // its expert id.  nullptr => UNIFORM Me fast path (e = m_tile / mtiles_per_expert).  Because experts
+    // are TileM-aligned and packed, the X/A row offset is still global_m_tile*kTileM (unchanged); ONLY the
+    // expert→W1-slice mapping becomes non-uniform, so this is the single varlen hook.  SonicMoE handles
+    // arbitrary token counts upstream via token-rounding (pad each expert to a kTileM multiple).
+    const int* m_tile_expert;
   };
 
   // ---- device entry ----
@@ -529,7 +535,11 @@ struct Sm100SwiGluKernel {
       for (int tile = cluster_id; tile < params.total_tiles; tile += params.num_clusters) {
         const int m_tile = tile / params.n_local_tiles;        // GLOBAL token m-tile, across ALL experts
         const int n_tile_local = tile % params.n_local_tiles;  // OUTPUT column tile, ∈ [0, nI_per_expert)
-        const int e = m_tile / mtiles_per_expert;              // which expert this m-tile belongs to
+        // VARLEN-M: look up the expert from the per-m-tile table (uneven, TileM-aligned experts); else
+        // UNIFORM fast path (m_tile / mtiles_per_expert).  Only the W1 slice depends on e; X/A row =
+        // m_tile*kTileM regardless (experts are packed + TileM-aligned).  One L1-hot gmem read per tile.
+        const int e = (params.m_tile_expert != nullptr) ? params.m_tile_expert[m_tile]
+                                                        : (m_tile / mtiles_per_expert);
         // W1 row math (verified): gate_w1_ntile*kTileN = e*2I + n_tile_local*kTileN  → gate rows of e ✓
         //                         up_w1_ntile  *kTileN = e*2I + I + n_tile_local*kTileN → up rows of e ✓
         const int gate_w1_ntile = e * n2_per_expert + n_tile_local;
@@ -949,7 +959,11 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
                                 const Element* W1,  // [G*2I, d] row-major (per-expert gate||up)
                                 ElementOut* A,       // [G*Me, I] row-major
                                 int G, int Me, int I, int d, cudaStream_t stream,
-                                int device = 0, int sm_count = 0) {
+                                int device = 0, int sm_count = 0,
+                                // VARLEN-M (uneven, TileM-aligned experts): device array [M_varlen/kTileM]
+                                // mapping each global m-tile → expert id, and the total packed token count
+                                // M_varlen.  nullptr => UNIFORM (M = G*Me).  Experts must be TileM-aligned.
+                                const int* d_m_tile_expert = nullptr, int M_varlen = 0) {
   using Config =
       SwiGluConfig<Element, ElementOut, TileM_, TileN_, TileK_, kStages_, ClusterM_, MinBlocks_, AccStages_>;
   using Kernel = Sm100SwiGluKernel<Config>;
@@ -958,8 +972,9 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
   using StrideW1 = typename Config::StrideW1;
   using StrideA = typename Config::StrideA;
 
-  const int M = G * Me;          // total tokens (problem M, A-operand N-of-rows)
-  const int W1N = G * 2 * I;     // total W1 rows (problem N, B-operand)
+  // VARLEN-M: M = total packed (TileM-aligned) tokens across uneven experts; else uniform G*Me.
+  const int M = (d_m_tile_expert != nullptr) ? M_varlen : (G * Me);  // total tokens (problem M)
+  const int W1N = G * 2 * I;     // total W1 rows (problem N, B-operand) — I uniform across experts
 
   // Strides. make_cute_packed_stride wants {extent..., L}. X is RowMajor (G*Me,d) → A K-major (d,1,0).
   // W1 is K-contiguous [G*2I,d] → B K-major: LayoutW1=ColumnMajor ⇒ StrideB=Stride<int,_1,int>,
@@ -1004,8 +1019,9 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
   params.M = M;       // G*Me
   params.N = I;       // output width
   params.K = d;
-  params.Me = Me;     // tokens per expert (uniform)
+  params.Me = Me;     // tokens per expert (uniform fallback; unused when m_tile_expert != nullptr)
   params.W1N = W1N;   // G*2I
+  params.m_tile_expert = d_m_tile_expert;  // VARLEN-M expert table (nullptr => uniform fast path)
 
   // Logical tile grid: m_tile spans ALL experts' tokens (num_m_tiles = G*Me/kTileM); n_tile_local spans
   // ONE expert's output width (I/kTileN).  total_tiles = num_m_tiles * num_n_local_tiles is the LOGICAL

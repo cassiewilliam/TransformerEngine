@@ -419,4 +419,18 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 | (32,2048,128,512) M65536 | 244 | **360** | **+48%** |
 | (4,256,256,512) M1024 | 23 | 20.5 | −11%（极小问题，TMA-store setup overhead 占比大） |
 - **小-K/mem-bound（epilogue 在关键路径）大胜 +23~48%；compute-heavy 用户 shape +2%**（epilogue 已被 double-buffer overlap，非关键路径）。极小问题轻微回退（可加 size 启发式 fallback，暂不做）。
-- 用户 shape 累计 **292→609 = +109%（2.09×）**。新 stall（用户 shape）= reg→sA smem-scoreboard 40.4%（reorder staging 固有）。
+- 用户 shape 累计 **292→609 = +109%（2.09×）**。新 stall（用户 shape）= reg→sA smem-scoreboard 40.4%（reorder staging 固有）。commit `adcd6ae5`。
+
+## P1 Step-12：varlen-M（非均匀 expert，= SonicMoE varlen-M Grouped GEMM）✅
+**动机：** 真实 MoE 的 per-expert token 数不均匀；原 kernel 假设 uniform Me（`e = m_tile / mtiles_per_expert`），在非均匀 expert 上结果错误。
+**关键洞察 → 极小改动：** experts 若 **TileM-aligned**（token-rounding，SonicMoE 做法），packed 后 X/A 行偏移仍 = `global_m_tile*kTileM`（与 uniform 相同）——**只有 expert→W1-slice 映射变非均匀**。故唯一改动是 load warp 的 expert 推导（kernel 仅 1 处）：`e = m_tile_expert ? m_tile_expert[m_tile] : m_tile/mtiles_per_expert`，加一个 device 数组 `m_tile_expert[num_m_tiles]`（每 m-tile→expert id，host 前缀和构建）。X/A 偏移、W1 偏移、TMA-store epilogue 全不变。向后兼容（nullptr→uniform 快路径）。
+**验证（B200，全 PASS n_fail=0）：**
+| 测试 | 结果 |
+|---|---|
+| 小 varlen 全参考（8 expert 全覆盖, M=3840） | n_fail=0 ✓ 映射对每个 expert 正确 |
+| uniform 回归（M=16384） | 608 TFLOPS（无回退） |
+| **(32, m[1024,2048,3072], 512, 2048)** M=64512, 252 m-tiles | n_fail=0, **647.5 TFLOPS** |
+| **(32, m[512,1024,1536], 512, 2048)** M=32256, 126 m-tiles | n_fail=0, **628.5 TFLOPS** |
+- 非均匀 shape FLOPS（628~647）**高于** uniform M16384（608）：总 M 更大 → 更多 tile → 固定开销摊薄更好。
+- test：`SWIGLU_VARLEN=<逗号 per-expert 模式>`（cycle across G，round 到 TILEM 倍数）；`m[min,avg,max]` 即 cycle {min,avg,max}。
+- **下一步 CLC**：现 round-robin 已对 uniform-cost tile 均衡；CLC 预期中性（待测 dynamic vs static）。
