@@ -506,3 +506,14 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 - **裁决：route#2 fusion 不 beat baseline，只打平**。standalone kernel 无法补上 1.65× GEMM gap（2-SM occupancy 封顶；bank-conflict/occupancy 均已证非 bound）。
 - **真正的赢家方向 = TE 的 1120-TFLOPS GEMM + fused SwiGLU epilogue**（TE GEMM 效率 × fusion IO 省），同时 beat standalone kernel 和 TE+separate-SwiGLU。**继续磨手写 kernel 无意义；杠杆在把 SwiGLU 融进 TE/cuBLAS 的 GEMM。**
 - fused kernel 仍有价值：不物化 [M,2I]（activation-memory 省，对内存受限 MoE 训练）；正确/已验证参考（varlen-M, 4.5.1, n_fail=0）。
+
+## P1 Step-20：vs TE 两种 baseline（2-separate vs merged）—— 裁决依赖 baseline
+用户要求：TE 应跑 **两个独立 grouped GEMM（gate+up）+ SwiGLU**（真实 Llama-style separate proj），而非合并成 out=2I。实测（同 556 GFLOP / 67.11M params / out [M,512]）：
+| baseline | ms（3run） | TFLOPS | vs fused 0.824 |
+|---|---|---|---|
+| **TE 2-separate GEMM + SwiGLU**（真实 naive） | 1.033/1.002/1.076 | ~537 | **fused 快 ~26%** |
+| TE merged GEMM(out=2I) + SwiGLU（优化） | 0.790/0.790/0.791 | ~704 | fused ~打平（TE +4%） |
+| **fused（GEMM+SwiGLU 一趟）** | 0.824 | 673 | — |
+- **vs naive 2-GEMM 路径：fused 胜 +26%**（省 2 launch + 2 output 写 + SwiGLU 读两份）。
+- **vs merged-GEMM 路径：打平**（TE merged grouped GEMM per-FLOP 比 fused 的 GEMM 高效 ~1.65×，1120 vs 673，刚好抵消独立 SwiGLU pass）。
+- **裁决：fusion 真有价值——清楚 beat 常见 2-GEMM baseline，打平最强 merged baseline**。比"仅 merged 对比"得出的 tie/loss 更佳。要 beat merged，唯一 gap = 我的 GEMM 慢 1.65×，杠杆仍在 fused-SwiGLU-on-TE-GEMM。bench: `qa/te_grouped_linear_bench.py`。
