@@ -373,4 +373,23 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 | (32,1024,256,1024) M32768 | 222 | **259** | **+17%** |
 | (32,2048,128,512) M65536 | 174 | **223** | **+28%** |
 - **persistent 在 M 大/N&K 小 regime 大胜（+17~28%）**（per-tile TMEM alloc/free + cluster_sync + setup 被摊薄，小-K tile 计算少、overhead 占比大）；compute-heavy 用户 shape 持平（few tiles/cluster，摊薄少）。
-- 占用率检查中（看是否同时松动了 2-SM co-residency）。
+- 占用率：persistent 仍 12.5%（kStages=16→1 block smem-limited + 2-SM co-residency 硬上限）；增益来自 **overhead 摊薄**，非占用率。commit `abebe85c`。
+
+## P1 Step-9：TMEM 跨-phase 复用（double-buffered accumulator, AccStages=2）✅ **最大单点增益**
+**原理：** 原 1-stage acc pipeline 把 epilogue(tile N) 与 MMA(tile N+1) **串行化**（MMA 必须等 epilogue 读完 acc 才能复写）。改成 **2-stage acc pipeline + 双 TMEM accumulator buffer**（buffer = acc-pipeline stage index）：tile N 用 buffer N%2、tile N+1 用 buffer (N+1)%2，物理不同 TMEM 窗口 → leader MMA 可在 buffer1 跑 K-loop，同时 epilogue 读 buffer0 → **MMA(N+1) 与 epi(N) 重叠（ping-pong）**。
+**实现（Config::kAccStages 参数化，AccStages=1 退化为原行为）：**
+- `PipelineEpi = PipelineUmmaAsync<kAccStages, AtomThrShapeMNK>`（1→2 stage）。
+- `kAccBufStride = 2*kEpiTileN`；MMA 每 tile（leader）`producer_acquire` 后按 `epi_prod.index()*kAccBufStride` 设 acc_gate/up `.data()`；epilogue 每 tile `consumer_wait` 后按 `epi_cons.index()*kAccBufStride` 设 tAcc_gate/up `.data()` **并把 partition_S 移进循环**（partition_S 固化 ptr，必须按 buffer 重切）。
+- `kTmemCols = kAccStages*2*kEpiTileN`（AccStages=2→256≤512 OK；约束 AccStages*2*TileN≤512）。
+- 无死锁：2-stage 下 MMA(N) acquire stage N%2 的 empty 由 epi(N-2) 释放，依赖链 MMA(N)→epi(N)→释放给 MMA(N+2)，严格前向无环；leader-gate 不变。
+**结果（正确性全 PASS n_fail=0）：**
+| shape | AccStages=1 (persistent) | **AccStages=2** | 提升 |
+|---|---|---|---|
+| (32,512,512,2048) M16384 **用户** | 394 | **546** | **+39%** |
+| (32,1024,256,1024) M32768 | 259 | **405** | **+56%** |
+| (32,2048,128,512) M65536 | 223 | 226 | 持平（mem-bound） |
+| (4,256,256,512) M1024 | 23 | 24 | 持平（太小） |
+- **compute-heavy regime 单点最大增益**：用户 shape **394→546 TFLOPS（+39%）**，**累计 292→546（+87%）**。
+- mem-bound 小-NK 持平（epilogue 本就只占小比例，bottleneck 在 load）。
+- **AccStages sweep：2=545.6/404.3，4=546.0/404.9（持平），3 编译失败**（kTmemCols=384 非 2 的幂，static_assert）。→ **AccStages=2 为 sweet spot**：MMA 是 bottleneck，epilogue 落后从不超过 1 tile，2 buffer 已完全 hide，更深无益。default 锁定 AccStages=2。
+- **ncu（用户 shape, AccStages=2）：Compute(SM) 37%→49.76%**（MMA 不再被 epilogue 阻塞 → overlap 生效）；**新 bottleneck = L1/TEX 79.91% / Memory 75.14%**（smem 流量：load TMA + epilogue staging），DRAM 仅 15.24%（已 compute/smem-bound，非 DRAM-bound）；占用率仍 12.48%（2-SM 硬上限不变，增益纯 latency-hiding）。→ 后续若再推：降 smem 流量（DSMEM 共享 X / epilogue staging 精简）。

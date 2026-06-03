@@ -72,11 +72,12 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<ProblemShapeType>;
 //   kStages_             : load-pipeline depth (16 = the clean 398-TFLOPS config; perf ≈ the old 10).
 //   ClusterM_            : cluster X-extent (2 = 2-SM, 1 = 1-SM); selects the KernelSchedule below.
 //   MinBlocks_           : launch-bounds MinBlocksPerMultiprocessor hint (1 = current default).
-//   AccStages_           : TMEM accumulator buffering (1 = single = current; 2 = reserve double-buffer
-//                          TMEM for a FUTURE pipelined acc — alternation logic NOT implemented here).
+//   AccStages_           : TMEM accumulator pipeline depth (2 = DOUBLE-BUFFERED = current default → MMA of
+//                          tile N+1 overlaps the epilogue of tile N; 1 = single-buffer serialized handoff
+//                          = the old behavior). Tunable; the per-tile buffer alternation is implemented.
 template <typename Element_ /*bf16/fp16*/, typename ElementOut_ /*bf16/fp16*/,
           int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 1>
+          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 struct SwiGluConfig {
   static_assert(ClusterM_ == 1 || ClusterM_ == 2, "ClusterM_ must be 1 (1-SM) or 2 (2-SM)");
 
@@ -134,8 +135,9 @@ struct SwiGluConfig {
   // Launch-bounds MinBlocksPerMultiprocessor hint, read by the kernel (default 1). The warpgroup
   // reg-reconfig (wg0 dealloc<40> → wg1 alloc<160>) keeps the epilogue at 160 dynamically.
   static constexpr int kMinBlocks = MinBlocks_;
-  // TMEM accumulator buffering (default 1 = single, the only path functionally exercised). AccStages_==2
-  // RESERVES double the TMEM columns for a FUTURE double-buffered acc pipeline (alternation logic TODO).
+  // TMEM accumulator pipeline depth (default 2 = double-buffered). AccStages_==2 reserves & USES two acc
+  // TMEM buffers and runs a 2-stage PipelineEpi so MMA(tile N+1) overlaps epilogue(tile N); AccStages_==1
+  // collapses to the single-buffer serialized handoff. The per-tile buffer alternation is in operator().
   static constexpr int kAccStages = AccStages_;
 
   // CollectiveMma used purely as a type-provider (TiledMma / SmemLayout / fragments / TMA atoms /
@@ -215,7 +217,15 @@ struct Sm100SwiGluKernel {
   // 2-SM peer mask through the pipeline (sm100_mma_warpspecialized.hpp:153-156).
   using PipelineLoad = cutlass::PipelineTmaUmmaAsync<Stages, ClusterShape, AtomThrShapeMNK>;
   // MMA(warp1) -> Epilogue(wg1) : protects BOTH TMEM accumulators (single commit after K-loop).
-  using PipelineEpi = cutlass::PipelineUmmaAsync<1, AtomThrShapeMNK>;
+  // Config::kAccStages stages → double-buffered acc pipeline (AccStages=2): the MMA may produce the
+  // accumulator for tile (N+1) in buffer (N+1)%kAccStages while the epilogue still reads tile N's result
+  // from buffer N%kAccStages → MMA(tile N+1) OVERLAPS epilogue(tile N). AccStages=1 collapses to the old
+  // 1-stage serialized handoff (identical behavior). Each stage gets its OWN mbarrier pair; the per-tile
+  // acc buffer offset (= stage index * kAccBufStride) is selected from epi_prod.index()/epi_cons.index().
+  using PipelineEpi = cutlass::PipelineUmmaAsync<Config::kAccStages, AtomThrShapeMNK>;
+  // Cols per acc buffer (one stage) = gate(kEpiTileN) + up(kEpiTileN) = 2*kEpiTileN. The acc buffer for a
+  // given tile is its acc-pipeline stage index: buf_base = stage_index * kAccBufStride (defined below
+  // after kEpiTileN). gate lives at buf_base, up at buf_base + kEpiTileN within the stage's buffer.
 
   // Warp layout: 2 warpgroups (256 threads). wg0 = {Load, MMA, -, -}; wg1 = Epilogue (4 warps).
   static constexpr int NumEpiWarps = 4;
@@ -236,18 +246,26 @@ struct Sm100SwiGluKernel {
   static constexpr int kEpiTileM =
       cute::size<0>(take<0, 2>(TileShape{})) / int(cute::size(AtomThrShapeMNK{}));  // 128
   static constexpr int kEpiTileN = cute::size<1>(take<0, 2>(TileShape{}));          // 64
-  // TMEM columns actually used = gate(TileN) + up(TileN) = 2*TileN (gate at col 0, up at col TileN).
+  // Cols per acc buffer (ONE acc-pipeline stage) = gate(kEpiTileN) + up(kEpiTileN) = 2*kEpiTileN. With
+  // AccStages>1 each stage occupies its own [stage*kAccBufStride, (stage+1)*kAccBufStride) TMEM window:
+  // gate at stage*kAccBufStride, up at stage*kAccBufStride + kEpiTileN. The MMA writes the producer
+  // stage's buffer (epi_prod.index()*kAccBufStride); the epilogue reads the consumer stage's buffer
+  // (epi_cons.index()*kAccBufStride). These offsets are set PER TILE (see operator()).
+  static constexpr int kAccBufStride = 2 * kEpiTileN;                      // 128 for TileN=64
+  // TMEM columns actually used = kAccStages buffers × (gate(TileN) + up(TileN)) = kAccStages*2*TileN.
   // Allocate ONLY these (not the full 512) so MULTIPLE blocks share the SM's 512-col TMEM → unlocks
   // occupancy (ncu: full-512 alloc capped achieved occ at 1 block/SM despite 2-block theoretical).
-  // Must be a power of two in [32,512] for tcgen05.alloc: 2*64=128, 2*128=256, 2*32=64 all valid.
-  // Config::kAccStages scales the reservation: AccStages=1 (default) reserves exactly the 2*TileN used;
-  // AccStages=2 reserves TMEM for a future double-buffered accumulator pipeline — the EXTRA columns
-  // [2*TileN, 4*TileN) are UNUSED for now and the alternation logic is TODO; currently only AccStages=1
-  // is functionally exercised. The acc OFFSETS below (gate at col 0, up at col size<1>(TileShape)) are
-  // UNCHANGED by AccStages — only the reserved column count grows.
-  static constexpr int kTmemCols = Config::kAccStages * 2 * kEpiTileN;     // 128 for TileN=64, AccStages=1
+  // Must be a power of two in [32,512] for tcgen05.alloc.
+  // Config::kAccStages scales the reservation AND is now FUNCTIONALLY used (double-buffered acc pipe):
+  //   AccStages=1 → 2*TileN cols (e.g. 128 for TileN=64): single buffer, old 1-stage serialized behavior.
+  //   AccStages=2 → 4*TileN cols (e.g. 256 for TileN=64): two buffers, MMA(N+1) overlaps epilogue(N).
+  // CONSTRAINT: kAccStages*2*TileN ≤ 512. For TileN=64 → AccStages=2 gives 256 ≤ 512 ✓ (AccStages up to
+  // 4 would fit). For TileN=256 the single-buffer assert below (2*TileN=512) already forbids any double
+  // buffering (AccStages=2 → 1024 > 512); the static_assert here catches that explicitly.
+  static constexpr int kTmemCols = Config::kAccStages * 2 * kEpiTileN;     // 256 for TileN=64, AccStages=2
   static_assert(kTmemCols >= 32 && kTmemCols <= 512 && (kTmemCols & (kTmemCols - 1)) == 0,
-                "kTmemCols must be a pow2 in [32,512]");
+                "kTmemCols (= AccStages*2*TileN) must be a pow2 in [32,512]; "
+                "for AccStages=2 keep TileN<=128 (AccStages*2*TileN=256<=512)");
   enum WarpRole { kLoad = 0, kMMA = 1, kEpilogue = 2, kEmpty = 3 };
   static CUTLASS_DEVICE WarpRole warp_role(int warp_idx) {
     if (warp_idx == 0) return kLoad;
@@ -511,12 +529,13 @@ struct Sm100SwiGluKernel {
       tmem_alloc_bar.arrive();  // publish ss.tmem_base_ptr to the epilogue warps (#3)
 
       TiledMma tiled_mma;
-      // Two accumulator TMEM views at fixed column offsets (FMHA mainloop:293-304).
+      // Two accumulator TMEM views (FMHA mainloop:293-304). The FRAGMENT (layout) is buffer-INDEPENDENT
+      // and hoisted; only its .data() base pointer changes per tile (set inside the loop AFTER
+      // producer_acquire, using the ACQUIRED producer stage epi_prod.index()). With AccStages=1 this
+      // always resolves to buf=0 → identical to the old fixed-offset behavior.
       Tensor accB = partition_fragment_C(tiled_mma, take<0, 2>(TileShape{}));  // (MMA,MMA_M,MMA_N)
       Tensor acc_gate = accB;
-      acc_gate.data() = ss.tmem_base_ptr + 0u;
       Tensor acc_up = accB;
-      acc_up.data() = ss.tmem_base_ptr + uint32_t(cute::size<1>(TileShape{}));
 
       Tensor sX = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});
       Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w1_gate.begin()), SmemLayoutW1{});
@@ -538,10 +557,19 @@ struct Sm100SwiGluKernel {
         // barrier (Sm100MmaPeerBitMask), so the follower's own empty barrier never advances — a follower
         // producer_acquire would pass tile-0 (initial state) then DEADLOCK on tile-1. Gate it to leader.
         if (is_mma_leader_cta) {
-          // 1-stage PipelineEpi: this acquire WAITS for the previous tile's epilogue consumer_release —
-          // it cannot re-claim (and the K-loop cannot overwrite) the accumulator until the epilogue has
-          // read the previous tile's result. This is the per-tile serialization preventing acc clobber.
+          // Acquire the producer acc stage. With kAccStages=2 this waits for the EMPTY of stage
+          // epi_prod.index() — released by the epilogue TWO tiles ago (tile N-2 for the current tile N),
+          // NOT the immediately-preceding tile. So MMA(tile N) may run while the epilogue still reads
+          // tile (N-1)'s result from the OTHER buffer → overlap. With kAccStages=1 the producer and
+          // consumer share the single stage, so this acquire still serializes on tile (N-1)'s release
+          // (the original 1-stage behavior — no acc clobber).
           pipeline_epi.producer_acquire(epi_prod);
+          // Select THIS tile's acc buffer = the ACQUIRED producer stage's TMEM window. epi_prod.index()
+          // is valid AFTER producer_acquire (it names the stage just claimed). gate at buf, up at
+          // buf+kEpiTileN. Only .data() changes; the fragment layout is fixed. (AccStages=1 → buf=0.)
+          const uint32_t mma_buf = epi_prod.index() * uint32_t(kAccBufStride);
+          acc_gate.data() = ss.tmem_base_ptr + mma_buf;
+          acc_up.data() = ss.tmem_base_ptr + mma_buf + uint32_t(kEpiTileN);
           tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;  // first k_block zeroes both accs THIS tile
           for (int k = 0; k < k_tile_count; ++k) {
             pipeline_load.consumer_wait(load_cons);
@@ -595,10 +623,16 @@ struct Sm100SwiGluKernel {
       // sm100_tile_scheduler.hpp:800 `new_cta_coord_m += cta_in_cluster_offset_m`).
       Tensor tAcc = partition_fragment_C(tiled_mma, take<0, 2>(TileShape{})); // (MMA,MMA_M,MMA_N) tmem (per-CTA)
 
+      // Acc TMEM views: FRAGMENT layout is buffer-INDEPENDENT and hoisted; the .data() base pointer is set
+      // PER TILE to the CONSUMER stage's buffer (epi_cons.index()*kAccBufStride), AFTER consumer_wait and
+      // BEFORE partition_S/the TMEM-load (see loop). The initial .data() here (buf 0) is ONLY a placeholder
+      // so make_tmem_copy below has a well-formed tensor to read the (buffer-independent) LAYOUT from; the
+      // actual source pointer used by every copy comes from the per-tile partition_S below. (AccStages=1 →
+      // the per-tile buf is always 0, identical to the old fixed-offset path.)
       Tensor tAcc_gate = tAcc;
       tAcc_gate.data() = ss.tmem_base_ptr + 0u;
       Tensor tAcc_up = tAcc;
-      tAcc_up.data() = ss.tmem_base_ptr + uint32_t(cute::size<1>(TileShape{}));
+      tAcc_up.data() = ss.tmem_base_ptr + uint32_t(kEpiTileN);
 
       // GLOBAL (M,N) identity coordinate tensor partitioned through the IDENTICAL MMA C-path that
       // produced the data fragment tAcc, sliced at THIS CTA. Rationale (rank + offset, both load-bearing):
@@ -631,11 +665,20 @@ struct Sm100SwiGluKernel {
       using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
       int thread_idx = threadIdx.x % (NumEpiWarps * cutlass::NumThreadsPerWarp);
 
+      // make_tmem_copy / thr_tmem_load are BUFFER-INDEPENDENT (they capture only the copy LAYOUT and the
+      // per-thread slice, NOT the source pointer), so they are built ONCE here and reused for every tile,
+      // even when AccStages=2 alternates the source buffer.
       auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tAcc_gate);
       auto thr_tmem_load = tiled_tmem_load.get_slice(thread_idx);
 
-      Tensor tTMgate = thr_tmem_load.partition_S(tAcc_gate);   // (T2R,T2R_M,T2R_N) tmem source (gate)
-      Tensor tTMup = thr_tmem_load.partition_S(tAcc_up);       // (T2R,T2R_M,T2R_N) tmem source (up)
+      // NOTE: partition_S(tAcc_gate)/partition_S(tAcc_up) — which build the TMEM-source tensors tTMgate/
+      // tTMup — are deliberately NOT hoisted here. partition_S CAPTURES the tensor's ITERATOR (data ptr +
+      // layout) at call time, so a tensor partitioned with the hoisted (buf-0) .data() would keep reading
+      // buffer 0 even after the per-tile .data() update. With AccStages=2 that would make the epilogue read
+      // the WRONG buffer. Therefore partition_S is REDONE INSIDE the loop, AFTER tAcc_gate.data()/
+      // tAcc_up.data() are set to the consumer stage's buffer (epi_cons.index()*kAccBufStride). (The
+      // tiled_tmem_load copy object above carries the buffer-independent layout, so re-partitioning the
+      // source is sufficient — the copy itself is NOT rebuilt.)
       // DATA is partition_S (TMEM source ordering); the COORDINATE must be partition_D, NOT partition_S.
       // Reason (this is the STOCK pattern; deviating from it caused every prior scramble):
       //   * The T2R copy `copy(tiled_tmem_load, tTMgate, rGate)` delivers each TMEM value into the
@@ -710,6 +753,17 @@ struct Sm100SwiGluKernel {
         pipeline_epi.consumer_wait(epi_cons);
         cutlass::arch::fence_view_async_tmem_store();  // make UMMA TMEM writes visible to TMEM loads
 
+        // Point the acc views at the CONSUMER stage's buffer (the stage epi_cons just observed full), then
+        // RE-PARTITION the TMEM-source tensors. partition_S captures (.data()+layout) at call time, so it
+        // MUST be redone here AFTER updating .data() — otherwise tTMgate/tTMup would read the stale (buf-0)
+        // pointer and, with AccStages=2, the WRONG buffer. The copy layout (tiled_tmem_load) is unchanged.
+        // (AccStages=1 → epi_buf is always 0, so this reproduces the original fixed-offset reads.)
+        const uint32_t epi_buf = epi_cons.index() * uint32_t(kAccBufStride);
+        tAcc_gate.data() = ss.tmem_base_ptr + epi_buf;
+        tAcc_up.data() = ss.tmem_base_ptr + epi_buf + uint32_t(kEpiTileN);
+        Tensor tTMgate = thr_tmem_load.partition_S(tAcc_gate);  // (T2R,T2R_M,T2R_N) tmem source (gate)
+        Tensor tTMup = thr_tmem_load.partition_S(tAcc_up);      // (T2R,T2R_M,T2R_N) tmem source (up)
+
         copy(tiled_tmem_load, tTMgate, rGate);
         copy(tiled_tmem_load, tTMup, rUp);
 
@@ -741,9 +795,12 @@ struct Sm100SwiGluKernel {
         }
 
         // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
-        // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns the acc->epi
-        // slot so the MMA warp may reuse/free TMEM.  On the 1-stage PipelineEpi this release is what lets
-        // the NEXT tile's MMA producer_acquire proceed — i.e. it gates the next tile's accumulator write.
+        // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns THIS tile's
+        // acc->epi stage (epi_cons.index()) so the MMA warp may reuse/free that buffer. With kAccStages=2
+        // this release frees the stage that the MMA's producer_acquire for tile (current+2) will wait on,
+        // so MMA(tile N+1) — which uses the OTHER stage — is NOT gated by this release and runs concurrently
+        // with this epilogue. With kAccStages=1 producer and consumer share the one stage, so this release
+        // is exactly what lets the NEXT tile's MMA producer_acquire proceed (the old serialized gating).
         cutlass::arch::fence_view_async_tmem_load();
         pipeline_epi.consumer_release(epi_cons);
         ++epi_cons;
@@ -827,7 +884,7 @@ struct Sm100SwiGluKernel {
 // LaunchSwiGluGrouped<Element, ElementOut>(...) resolves to the current (default-tuned) behavior.
 template <typename Element, typename ElementOut,
           int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 1>
+          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
                                 const Element* W1,  // [G*2I, d] row-major (per-expert gate||up)
                                 ElementOut* A,       // [G*Me, I] row-major
@@ -946,7 +1003,7 @@ cudaError_t LaunchSwiGluGrouped(const Element* X,   // [G*Me, d] row-major
 // tuned identically. The default call LaunchSwiGluSingleExpert<Element, ElementOut>(...) is unchanged.
 template <typename Element, typename ElementOut,
           int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 1>
+          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchSwiGluSingleExpert(const Element* X,   // [M, d] row-major
                                      const Element* W1,  // [2I, d] row-major (concat: gate||up)
                                      ElementOut* A,       // [M, I] row-major

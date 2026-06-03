@@ -16,6 +16,15 @@
 #include <cstdlib>
 #include <vector>
 
+// Compile-time accumulator-pipeline depth (TMEM double/triple-buffer) for autotuning sweeps.
+// Override with -DACCSTAGES=N. Default 2 (the tuned double-buffer). Kernel constraint: ACCSTAGES*2*TileN<=512.
+#ifndef ACCSTAGES
+#define ACCSTAGES 2
+#endif
+// Helper to override only AccStages while keeping the other tuned defaults (TileM=256,TileN=64,TileK=16,kStages=16,Cluster=2,MinBlocks=1).
+#define LAUNCH_GROUPED(...) \
+  transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut, 256, 64, 16, 16, 2, 1, ACCSTAGES>(__VA_ARGS__)
+
 #include <cuda_runtime.h>
 
 #include "cutlass/bfloat16.h"
@@ -79,7 +88,7 @@ int main(int argc, char** argv) {
   CHECK_CUDA(cudaMemset(dA, 0, sizeof(ElementOut) * (size_t)M * I));
 
   // ---- launch (grouped) ----
-  cudaError_t st = transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut>(
+  cudaError_t st = LAUNCH_GROUPED(
       dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount);
   if (st != cudaSuccess) {
     std::printf("Launch returned: %s\n", cudaGetErrorString(st));
@@ -175,7 +184,7 @@ int main(int argc, char** argv) {
   // ---- perf timing (fused grouped kernel) ----
   const int warm = 10, iters = 100;
   for (int it = 0; it < warm; ++it)
-    transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut>(
+    LAUNCH_GROUPED(
         dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount);
   CHECK_CUDA(cudaDeviceSynchronize());
   cudaEvent_t e0, e1;
@@ -183,7 +192,7 @@ int main(int argc, char** argv) {
   cudaEventCreate(&e1);
   cudaEventRecord(e0);
   for (int it = 0; it < iters; ++it)
-    transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGrouped<Element, ElementOut>(
+    LAUNCH_GROUPED(
         dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount);
   cudaEventRecord(e1);
   CHECK_CUDA(cudaEventSynchronize(e1));
