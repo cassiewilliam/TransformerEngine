@@ -292,6 +292,31 @@ foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
   endif()
 endforeach()
 
+# SonicMoE F2 — fused up-proj + SwiGLU grouped GEMM (cutlass_grouped_gemm_swiglu.cu).
+# SM100-ONLY: a 2-SM (cta_group::2) tcgen05 warp-specialized kernel with NO pre-Blackwell path, so it
+# must be built for Blackwell-specific archs ONLY (NVTE_SPECIFIC_ARCHS, e.g. 100a/103a). It is therefore
+# NOT placed in transformer_engine_cuda_(arch_specific_)sources (those also add NVTE_STANDARD_ARCHS like
+# sm_90a, which would fail to compile the tcgen05 PTX). Guarded so a non-Blackwell toolkit simply omits
+# the source (the fused path is unreachable there anyway; the dispatcher falls back).
+if(NVTE_SPECIFIC_ARCHS)
+  list(APPEND transformer_engine_SOURCES gemm/cutlass_grouped_gemm_swiglu.cu)
+  set(sonic_swiglu_arch_options)
+  foreach(arch IN LISTS NVTE_SPECIFIC_ARCHS)
+    list(APPEND sonic_swiglu_arch_options "--generate-code=arch=compute_${arch},code=sm_${arch}")
+  endforeach()
+  set_property(
+    SOURCE gemm/cutlass_grouped_gemm_swiglu.cu
+    APPEND
+    PROPERTY
+    COMPILE_OPTIONS ${sonic_swiglu_arch_options})
+  # Match CUTLASS_KERNEL_SOURCES: -g0/-dopt=on (CUTLASS kernels can hang a debug build).
+  set_property(
+    SOURCE gemm/cutlass_grouped_gemm_swiglu.cu
+    APPEND
+    PROPERTY
+    COMPILE_OPTIONS "-g0;-dopt=on")
+endif()
+
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 # Disable CMake's automatic architecture flag injection.
 # All architectures are handled explicitly via per-source COMPILE_OPTIONS
