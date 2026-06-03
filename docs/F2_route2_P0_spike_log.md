@@ -447,4 +447,12 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 ## P1 Step-14：CUTLASS 4.2→4.5.1 升级 + 寄存器实验（用户要求）
 - **submodule 升 v4.5.1**（local + remote build dir git checkout）。working kernel（无 stmatrix）在 4.5.1 **编译通过 + n_fail=0 + 同性能**（uniform 608.0、target 674.6，与 4.2 一致）→ **4.5.1 无 API break、不回退**。⚠️ 仅本 SwiGLU kernel 验证；全 TE 库在 4.5.1 上的构建未验证（后续）。
 - **4.5.1 新 feature 调研**：`epilogue/fusion/` **无 gated/SwiGLU/GLU EVT 节点**（grep 空）→ route#2 仍需手写。example 92 = blackwell_moe_gemm（grouped/fp4，参考 kernel 非 drop-in）；4.3 simplified MoE API + MoEProblemShape(counts=varlen)；4.5 仅加 Snake activation。**无直接可用于 epilogue bound 的 feature。**
-- **Q2 寄存器实验（EPI_REGS sweep, target shape）**：160→674.6 / 168→675.0 / 200→672.7 / 240→673.9 TFLOPS（全 ±0.3% 噪声内，n_fail=0）。→ **bump 无效**：1 CTA/SM 有 ~40K idle 寄存器，但 epilogue 在 160 不 spill，bound 是 bank conflict 非寄存器压力。EPI_REGS 抽象为可调宏（default 160）。
+- **Q2 寄存器实验（EPI_REGS sweep, target shape）**：160→674.6 / 168→675.0 / 200→672.7 / 240→673.9 TFLOPS（全 ±0.3% 噪声内，n_fail=0）。→ **bump 无效**：1 CTA/SM 有 ~40K idle 寄存器，但 epilogue 在 160 不 spill，bound 是 bank conflict 非寄存器压力。EPI_REGS 抽象为可调宏（default 160）。commit `54efb668`。
+
+## P1 Step-15：collective-epilogue 可行性调研（决定性结论）
+深度 trace stock CUTLASS 4.5.1 sm100 epilogue + builder selector，对本 kernel 精确实例化（DisableSource, 2-SM, MmaTile(256,64,16)→CtaTile(128,64), ElementD=bf16, Acc=f32, N-major）：
+- **builder 对本 config 选的不是 stmatrix，而是 `AutoVectorizingCopy`**：EpilogueTile=(128,32)→WarpTile=(32,32)→`num_dp=32`→`SM100_TMEM_LOAD_32dp32b32x`（已用）+ `AutoVectorizingCopyWithAssumedAlignment<128>`。stmatrix（`SM90_U32x{2,4}_STSM_N`）只能从 `16dp*` load 到达，需 `WarpM==16`，本 N=64 tile 永远 num_dp=32 → **stmatrix 不可达**。
+- stock 的 conflict-free 靠 **vectorized copy + rank-2(EPI-tile)、带 PIPE 维的 swizzled `sD_epi`**（同时是 TMA-store 源）。
+- **本 kernel 受阻根因 = CuTe rank 不匹配**：我的 acc = `partition_fragment_C` → **rank-3** `(MMA,MMA_M,MMA_N)` → tmem-copy Tiler rank-3；而 sA rank-2 → `partition_D(sA)` 报 "Rank too small"/"Too many modes"。stock Tiler 是 rank-2，与带 PIPE 的 rank-2 sD_epi + TMA 源一致。
+- **要修 = store-path 重构**：rank-2-congruent tmem-copy + AutoVectorizingCopy R2S + SW128 swizzle + PIPE-bearing sD_epi + 配套 swizzled TMA-store descriptor。**且 dual-accumulator(gate||up) N-halving SwiGLU 不匹配 collective epilogue 的 single-accumulator-elementwise 模型**（其 fusion 是 acc→输出同形 element-wise，无 N 折半 + 双 TMEM-acc 组合）→ 全 collective epilogue 不能直接套。
+**结论：** bank-conflict bound 的真正修复 = store-path 重构（≈ collective epilogue 的 store 部分，手工适配 dual-acc），中高工作量、风险高、4 次尝试已证 CuTe layout 难点。**当前收敛 673/608 TFLOPS（+109%），已在 4.5.1 验证。**
