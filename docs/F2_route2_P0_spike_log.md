@@ -433,4 +433,18 @@ rows0..127 max_abs=125.0   rows128..255 max_abs=111.6
 | **(32, m[512,1024,1536], 512, 2048)** M=32256, 126 m-tiles | n_fail=0, **628.5 TFLOPS** |
 - 非均匀 shape FLOPS（628~647）**高于** uniform M16384（608）：总 M 更大 → 更多 tile → 固定开销摊薄更好。
 - test：`SWIGLU_VARLEN=<逗号 per-expert 模式>`（cycle across G，round 到 TILEM 倍数）；`m[min,avg,max]` 即 cycle {min,avg,max}。
-- **下一步 CLC**：现 round-robin 已对 uniform-cost tile 均衡；CLC 预期中性（待测 dynamic vs static）。
+- **下一步 CLC**：现 round-robin 已对 uniform-cost tile 均衡；CLC 预期中性（待测 dynamic vs static）。commit `07167133`。
+
+## P1 Step-13：深度优化高方差 shape (32, m[512,4096,8192], 512, 2048)
+**baseline（round-robin static, 4.2）= 673 TFLOPS**（M=132608, 518 m-tiles, n_fail=0）。ncu bound：**L1/TEX 95.18% / Memory 92.71% / Compute(SM) 62.19% / DRAM 8.16%**；stall = smem-scoreboard(reg→sA) 40.7% + CTA barrier 32.3%。→ **epilogue-smem-bound，非负载不均**（DRAM 8%，round-robin 已均衡）→ **CLC 对此 shape 确定中性**。
+**bank-conflict 诊断（决定性）：** reg→sA scalar store **~90% wavefront 冲突**（store conflicts 10.15M / 11.2M wavefronts，~42 wf/inst = 32-way）；load 冲突 3（可忽略）。根因：sA row-major stride 64 bf16 = 128B = 正好 32 banks → 每行同 bank；tcgen05.ld 的 32 lane 写同列不同行 → 32-way 冲突。
+**修复尝试（epilogue bound，3 次）：**
+1. **TMA-store（Step-11）**：修的是 sA→global（async，不过 L1），**没碰 reg→sA 冲突**。
+2. **128B swizzle (Layout_K_SW128) 单独用**：❌ scalar store + swizzle 反而 anti-align → 冲突 10.15M→**28.2M（2.8× 更糟）**，target 673→601（−11%），uniform 608→545。**revert**。（swizzle 是为 vectorized stmatrix 设计，scalar scatter 不适用。）
+3. **stmatrix R2S 重写**（SM90_U32x2_STSM_N + swizzle + TMEM_LOAD→16dp256b1x，镜像 stock sm100 epilogue）：❌ **编译失败**——make_tiled_copy_D(stmatrix, 我的双累加器 tcgen05.ld 分区) rank 不匹配（copy_atom.hpp:244 "Rank too small"、logical_divide "Too many modes"）。hand-written 双累加器 epilogue 与 stmatrix 的 layout 组合冲突。**revert 回 673**。
+→ **bank-conflict bound 在 hand-written kernel 中难修**：真正修复需 stmatrix（layout 组合受阻）；padding 能修但破坏 TMA-store layout。
+
+## P1 Step-14：CUTLASS 4.2→4.5.1 升级 + 寄存器实验（用户要求）
+- **submodule 升 v4.5.1**（local + remote build dir git checkout）。working kernel（无 stmatrix）在 4.5.1 **编译通过 + n_fail=0 + 同性能**（uniform 608.0、target 674.6，与 4.2 一致）→ **4.5.1 无 API break、不回退**。⚠️ 仅本 SwiGLU kernel 验证；全 TE 库在 4.5.1 上的构建未验证（后续）。
+- **4.5.1 新 feature 调研**：`epilogue/fusion/` **无 gated/SwiGLU/GLU EVT 节点**（grep 空）→ route#2 仍需手写。example 92 = blackwell_moe_gemm（grouped/fp4，参考 kernel 非 drop-in）；4.3 simplified MoE API + MoEProblemShape(counts=varlen)；4.5 仅加 Snake activation。**无直接可用于 epilogue bound 的 feature。**
+- **Q2 寄存器实验（EPI_REGS sweep, target shape）**：160→674.6 / 168→675.0 / 200→672.7 / 240→673.9 TFLOPS（全 ±0.3% 噪声内，n_fail=0）。→ **bump 无效**：1 CTA/SM 有 ~40K idle 寄存器，但 epilogue 在 160 不 spill，bound 是 bank conflict 非寄存器压力。EPI_REGS 抽象为可调宏（default 160）。
