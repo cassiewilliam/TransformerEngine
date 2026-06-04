@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SonicMoE F2 融合前向 · 集成与性能调研报告</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --ink:#e6e8ee; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#5b9cff; --good:#3fb950; --warn:#e3b341; --bad:#f0626c; --code:#0b0d12;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 22px 90px}
+  header.doc{border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:28px}
+  h1{font-size:27px;margin:0 0 8px;letter-spacing:.2px}
+  .sub{color:var(--muted);font-size:14px}
+  .meta{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  h2{font-size:20px;margin:40px 0 12px;padding-top:10px;border-top:1px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px;color:#cdd3df}
+  p{margin:10px 0}
+  code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font:13px/1.5 "SF Mono",Menlo,Consolas,monospace;color:#c8d2e0}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto;font:12.5px/1.6 "SF Mono",Menlo,Consolas,monospace;color:#c8d2e0}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd3df;font-weight:600}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr:nth-child(even) td{background:rgba(255,255,255,.012)}
+  .good{color:var(--good)} .warn{color:var(--warn)} .bad{color:var(--bad)} .mut{color:var(--muted)}
+  .callout{border-left:3px solid var(--accent);background:var(--panel);border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0}
+  .callout.bad{border-color:var(--bad)} .callout.good{border-color:var(--good)} .callout.warn{border-color:var(--warn)}
+  .callout .k{font-weight:700;letter-spacing:.3px;text-transform:uppercase;font-size:11.5px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card h4{margin:0 0 6px;font-size:14px}
+  ul,ol{margin:8px 0 8px 4px;padding-left:20px}
+  li{margin:5px 0}
+  .winner{color:var(--good);font-weight:700}
+  .loser{color:var(--bad);font-weight:700}
+  .chain{font:12.5px/1.7 "SF Mono",Menlo,Consolas,monospace;color:#c8d2e0;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto}
+  .chain b{color:var(--accent)}
+  footer{margin-top:50px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font-size:12.5px}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:4px;border:1px solid var(--line);color:var(--muted);margin-left:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>SonicMoE F2 融合前向 — 集成与性能调研报告</h1>
+  <div class="sub">把手写 CUTLASS「up-proj GEMM + SwiGLU」融合 kernel 接入 Transformer Engine（NVTE_USE_FUSED_MOE），在<b>生产对齐</b>环境下验证正确性并评测性能。</div>
+  <div class="meta">
+    <span class="chip">B200 · SM100</span>
+    <span class="chip">pytorch:26.05 · CUDA 13.2 · cuBLAS 13.4.1 · torch 2.12 · py3.12</span>
+    <span class="chip">bf16</span>
+    <span class="chip">真实 4K-MoE per-card shape</span>
+    <span class="chip">commits ab4ba576 → 6abf48f9</span>
+  </div>
+</header>
+
+<!-- ============================ TL;DR ============================ -->
+<h2>0 · 结论速览 (TL;DR)</h2>
+<div class="callout good">
+  <div class="k">正确性 — 通过</div>
+  融合 op 是<b>语义完全一致的 drop-in</b>：前向输出 + 全部梯度（d_input / d_fc1_w / d_fc2_w / d_prob）对高精度参考 <code>n_fail = 0</code>。输入/输出/ctx 与未融合 <code>[GroupedLinear→SwiGLU→GroupedLinear]</code> 一致。
+</div>
+<div class="callout bad">
+  <div class="k">性能 — 不及现代 grouped-GEMM 后端</div>
+  在<b>正确的生产 shape（H=2048, I=512）</b>下，融合前向 <b class="bad">0.57×</b>（比未融合慢约 2×）。原因有二，缺一不可：① 之前用错 shape（d/I 写反，用了 d=512/I=2048）；② 之前的基线是<b>旧的慢路径</b>（cuBLAS 13.1 multi-stream）。换到新的 <b>cuBLAS 13.4 graph-safe grouped GEMM</b> 或 <b>CUTLASS F0 grouped GEMM</b>，手写融合 kernel 都打不过。
+</div>
+<div class="callout">
+  <div class="k">根因</div>
+  <b>F0 的 CUTLASS grouped GEMM 本身很好</b>（529 TFLOP/s，与 cuBLAS 13.4 基本持平）。问题出在 <b>F2 的融合方式</b>：route#2 的「双 TMEM 累加器 gate/up + 重 SwiGLU epilogue」设计带来的开销 <b>大于</b>它省下的中间显存写读 —— 融合后 GEMM 反而比纯 F0 慢 ~1.8×。即 <code>F0 grouped GEMM + 单独 SwiGLU</code> &gt; 融合 kernel。
+</div>
+
+<!-- ============================ 1 config ============================ -->
+<h2>1 · 测试配置</h2>
+<h3>1.1 形状（真实 per-card 4K-MoE，来自配置表）</h3>
+<table>
+<tr><th>维度</th><th class="num">取值</th><th>说明</th></tr>
+<tr><td>Batch / 序列</td><td class="num">BS 4 / 4K</td><td>tokens = 4×4096 = 16384</td></tr>
+<tr><td>EP / 专家数 / TopK</td><td class="num">EP8 / 256E / Top-12</td><td>routed = 16384×12 = 196608</td></tr>
+<tr><td>每卡本地专家 G</td><td class="num">32</td><td>256 ÷ EP8</td></tr>
+<tr><td><b>Hidden Size H (= d, K)</b></td><td class="num"><b>2048</b></td><td>GEMM 输入/收缩维</td></tr>
+<tr><td><b>Expert Intermediate I</b></td><td class="num"><b>512</b></td><td>SwiGLU 单分支；FC1 gate‖up = 2I = 1024</td></tr>
+<tr><td>每卡 routed tokens M</td><td class="num">24576</td><td>196608 ÷ EP8 = 32×768</td></tr>
+<tr><td>平均 token / expert (Me)</td><td class="num">768</td><td>196608 ÷ 256</td></tr>
+</table>
+<div class="callout warn">
+  <div class="k">关键纠正</div>
+  早期把 <b>H 与 I 写反了</b>（用 d=512 / I=2048，来自旧的 <code>moe_bench_configs.md</code>）。正确是 <b>H=2048（大 K）、I=512（小 intermediate）</b>。两条 GEMM 因此是：<br>
+  · up-proj: <code>[M,2048] × [1024,2048]ᵀ → [M,1024]</code>（N=2I=1024, K=H=2048）<br>
+  · down-proj: <code>[M,512] × [2048,512]ᵀ → [M,2048]</code>（N=H=2048, K=I=512）
+</div>
+
+<h3>1.2 环境（生产对齐）</h3>
+<p>TE 2.17 在 SM100+bf16 上，<code>GroupedLinear</code> 默认走 graph-safe grouped GEMM，<b>编译期</b>要求 cuBLAS ≥ 13.3。可用的 NGC 镜像里 25.10=cuBLAS 13.1、26.02=13.2.1 <b>都太旧</b>（GroupedLinear 整个跑不起来）。最终拉取并重建到 <code>nvcr.io/nvidia/pytorch:26.05-py3</code>（CUDA 13.2 / cuBLAS 13.4.1 / torch 2.12 / py3.12），容器 <code>sonic-moe-2605</code>，TE editable 安装在 <code>/data1/min.yang/te_build</code>。所有性能数为该机实测，但<b>整机共享、被其它租户限频</b>，故绝对 TFLOP/s 偏低，<b>相对比值才是结论</b>。</p>
+
+<!-- ============================ 2 integration ============================ -->
+<h2>2 · 集成架构与正确性</h2>
+<p>分层接入（提交于 te_build 副本，commits <code>ab4ba576</code> → <code>78ffac83</code>）：</p>
+<div class="grid">
+  <div class="card">
+    <h4>① Kernel + C-API</h4>
+    <code>cutlass_grouped_gemm_swiglu.cuh</code>（融合 up-proj+SwiGLU，含 per-token router <code>prob</code>）→ C-API <code>cutlass_grouped_swiglu(...)</code>（<code>.h/.cu</code>，version-script 导出）→ pybind <code>tex.te_cutlass_grouped_swiglu</code>。
+  </div>
+  <div class="card">
+    <h4>② Op-fusion <span class="tag">NVTE_USE_FUSED_MOE</span></h4>
+    <code>forward_fused_moe.py</code> / <code>backward_fused_moe.py</code>，仿 cuTe-DSL FP8 参考 <code>forward_grouped_mlp.py</code>，融合 <code>[GroupedLinear→ScaledSwiGLU→GroupedLinear]</code>；反向当前是逐 op 回退（B1 融合 dH 未做）。
+  </div>
+</div>
+<div class="callout good">
+  <div class="k">Drop-in 一致性（生产环境实测）</div>
+  对高精度 torch 参考逐张比对，全部 <code>n_fail = 0</code>：
+  <table style="margin-top:8px">
+    <tr><th>张量</th><th>y(fwd)</th><th>d_input</th><th>d_fc1_w</th><th>d_fc2_w</th><th>d_prob</th></tr>
+    <tr><td>结果</td><td class="good">0</td><td class="good">0</td><td class="good">0</td><td class="good">0</td><td class="good">0</td></tr>
+  </table>
+  GLU interleave 已处理：融合侧喂<b>平铺</b> gate‖up（kernel 直读），未融合侧喂<b>预交织</b>权重（<code>ScaledSwiGLU</code> 按 32-block 反交织）；d_fc1_weight 在同一「平铺」坐标系比较。
+</div>
+
+<!-- ============================ 3 backends ============================ -->
+<h2>3 · 三种 Grouped-GEMM 后端</h2>
+<p>TE 的 <code>GroupedLinear</code> 在不同条件下走三条完全不同的 grouped-GEMM 路径，性能差别巨大，是理解结论的关键：</p>
+<table>
+<tr><th>后端</th><th>机制</th><th>CUDA Graph 可捕获</th><th>开关</th></tr>
+<tr>
+  <td>legacy cuBLAS</td>
+  <td>host 端按 expert 循环、逐个发 cuBLAS、multi-stream；<b>m_splits 读回 CPU</b></td>
+  <td class="bad">✗</td>
+  <td>默认 module 路径 / <code>NVTE_USE_CUTLASS_GROUPED_GEMM=0</code></td>
+</tr>
+<tr>
+  <td><b>CUTLASS F0</b></td>
+  <td>单个 CUTLASS SM100 Ptr-Array grouped kernel（本项目 F0 也实现的那条）</td>
+  <td class="good">✓</td>
+  <td><code>NVTE_USE_CUTLASS_GROUPED_GEMM=1</code></td>
+</tr>
+<tr>
+  <td><b>graph-safe cuBLAS 13.4</b></td>
+  <td>cuBLAS 13.3+ device-side grouped GEMM，<b>m_splits 作为 device tensor</b>，单 kernel 读 device offset</td>
+  <td class="good">✓</td>
+  <td>SM100+bf16 <b>默认</b>（ops 路径） / <code>NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1</code></td>
+</tr>
+</table>
+<p><b>「graph-safe」</b>= 把每个 expert 的 token 数（m_splits）放在 <b>device</b> 上、单 kernel 内读 device offset 完成，host 不需知道分段、不做 CPU↔GPU 同步 → 同一张捕获好的 CUDA Graph 对<b>任意 split 值</b>都成立，可被图捕获。MoE 训练里每个 step 路由出的 per-expert token 数都在变，只有 graph-safe 的 grouped GEMM 才能把整段 MoE capture 进一张图来摊薄 launch 开销 —— 这也是 TE 在新 cuBLAS 上默认走它的原因。</p>
+
+<!-- ============================ 4 perf ============================ -->
+<h2>4 · 性能结果</h2>
+
+<h3>4.1 单条 GroupedLinear（标准 <code>benchmark_grouped_linear.py</code>，fwd-only）</h3>
+<table>
+<tr><th>后端</th><th class="num">up-proj ms</th><th class="num">up TFLOP/s<br><span class="mut">(K=2048,N=1024 · 103.1G)</span></th><th class="num">down-proj ms</th><th class="num">down TFLOP/s<br><span class="mut">(K=512,N=2048 · 51.5G)</span></th></tr>
+<tr><td>legacy cuBLAS (multi-stream)</td><td class="num">0.460</td><td class="num">224</td><td class="num">0.469</td><td class="num">110</td></tr>
+<tr><td><b>CUTLASS F0 (non-fused)</b></td><td class="num">0.195</td><td class="num winner">529</td><td class="num">0.193</td><td class="num winner">267</td></tr>
+<tr><td>graph-safe cuBLAS 13.4</td><td class="num">0.188</td><td class="num winner">548</td><td class="num">0.177</td><td class="num winner">292</td></tr>
+</table>
+<p class="mut">→ non-fused CUTLASS F0 ≈ graph-safe cuBLAS 13.4（差 ~3–9%），两者都约为 legacy multi-stream 的 2.4×。</p>
+
+<h3>4.2 整段 MoE 前向（up + SwiGLU + down）</h3>
+<table>
+<tr><th>变体</th><th class="num">ms/iter</th><th class="num">TFLOP/s</th><th class="num">vs 最快</th></tr>
+<tr><td>non-fused · graph-safe cuBLAS 13.4</td><td class="num">0.385</td><td class="num winner">401</td><td class="num">1.00×</td></tr>
+<tr><td><b>non-fused · CUTLASS GroupGEMM (F0)</b> <span class="tag">本次新增对比</span></td><td class="num">0.424</td><td class="num">365</td><td class="num">0.91×</td></tr>
+<tr><td class="loser">fused（手写 kernel）</td><td class="num">0.678</td><td class="num bad">228</td><td class="num bad">0.57×</td></tr>
+<tr><td>non-fused · legacy cuBLAS</td><td class="num">0.99</td><td class="num">156</td><td class="num">0.39×</td></tr>
+</table>
+
+<h3>4.3 决定性数字 — 融合 kernel vs 纯 GEMM</h3>
+<div class="callout bad">
+  <div class="k">融合反而更慢</div>
+  手写<b>融合</b> up-proj+SwiGLU 仅 <b class="bad">294 TFLOP/s（0.350 ms）</b>，而 <b>CUTLASS F0 仅 GEMM（不含 SwiGLU）就 529 TFLOP/s（0.195 ms）</b>。即融合 kernel 比「同样 CUTLASS、却连 SwiGLU 都没融」的纯 GEMM 还慢 <b>~1.8×</b>。给 F0 再加一个独立 SwiGLU（轻量 elementwise，~0.05 ms）仍然完胜融合 kernel。
+</div>
+
+<!-- ============================ 5 root cause ============================ -->
+<h2>5 · 根因分析</h2>
+<ul>
+  <li><b>F0（CUTLASS grouped GEMM）是好 kernel。</b> 529 / 267 TFLOP/s，与 cuBLAS 13.4 持平，远超 legacy multi-stream。F0 这条线本身有价值。</li>
+  <li><b>F2（融合）才是问题所在。</b> route#2 的「双 TMEM 累加器（gate col0 / up colN）+ 重 SwiGLU epilogue（TMEM→reg→silu·mul→TMA-store）」设计，把单纯 GEMM 的 529 拖到 294 —— <b>融合 epilogue 的开销 &gt; 省下的 [M,2I] 中间显存写读</b>。这是「为融合而融合」的反例。</li>
+  <li><b>之前 2.2× 的来历是双重假象：</b> ① shape 写反（d=512/I=2048，更利于手写 kernel 的 N 大、K 小排布）；② 基线是旧的 cuBLAS 13.1 merged/2-GEMM 慢路径。两者一改，优势全部消失。</li>
+  <li><b>对反向（B1 融合 dH）的推论：</b> 若前向 GEMM 都打不过 grouped GEMM 后端，反向同样会撞 cuBLAS/CUTLASS 这堵墙 —— B1 大概率也赢不了。</li>
+</ul>
+
+<!-- ============================ 6 graph-safe call chain ============================ -->
+<h2>6 · graph-safe cuBLAS 13.4 调用链</h2>
+<div class="chain">
+<b>[Python · ops GroupedLinear]</b> transformer_engine/pytorch/ops/basic/grouped_linear.py
+  :736  _is_graph_safe_path_supported()        # 网关：SM100+bf16 → True（<b>不查 cuBLAS 版本</b>，这就是太旧时硬报错的原因）
+  :939  use_grouped_tensor_path = self._is_graph_safe_path_supported(...)
+  :946  self._fuser_forward_grouped_tensor(...)         # else → _fuser_forward_split_quantize（legacy）
+  :1150 def _fuser_forward_grouped_tensor(...)
+  :1244   general_grouped_gemm_for_grouped_tensor(...)  # 反向在 :1594
+
+<b>[Python · cpp_extensions]</b> transformer_engine/pytorch/cpp_extensions/gemm.py
+  :438  def general_grouped_gemm_for_grouped_tensor(...)
+  :421  get_grouped_gemm_setup_workspace_size() → tex.get_grouped_gemm_setup_workspace_size()  # ← 旧 cuBLAS 在此报 "requires 13.3+"
+  :45/:48  选择 binding: tex.te_general_grouped_gemm_for_discrete_in  /  ..._for_grouped_tensor
+
+<b>[C++ · pybind]</b> transformer_engine/pytorch/csrc/extensions/gemm.cpp
+  :658  te_general_grouped_gemm_for_grouped_tensor → :692 nvte_grouped_gemm(...)
+  :674  te_general_grouped_gemm_for_discrete_in    → :768 <b>nvte_grouped_gemm_with_discrete_inputA(...)</b>  # 前向实际走这条
+
+<b>[Common C-API · 真正的 cuBLAS 13.4 grouped GEMM]</b> transformer_engine/common/gemm/cublaslt_grouped_gemm.cu
+  声明 include/transformer_engine/gemm.h:388/415/312
+  :47-49  #define CUBLAS_GROUPED_GEMM_VERSION 130300   #if CUBLAS_VERSION >= 130300
+  real    :1557 setup-workspace · :1562 nvte_grouped_gemm · <b>:1644 nvte_grouped_gemm_with_discrete_inputA</b>  ← 26.05 实际运行
+  stub    :1999/:2008/:2047  → NVTE_ERROR("requires cuBLAS 13.3+, compile-time ...")  (:883)  ← 25.10/26.02 报这个
+  runtime :337-349  运行期再查一次 cuBLAS 版本
+</div>
+
+<!-- ============================ 7 conclusion ============================ -->
+<h2>7 · 结论与建议</h2>
+<div class="callout">
+  <div class="k">结论</div>
+  在真实生产 shape + cuBLAS 13.4 环境下，<b>SonicMoE 前向融合（F2）站不住</b>：集成是正确的 drop-in，但对吞吐是 ~2× 的回退。更好的积木是 <b>F0 CUTLASS grouped GEMM（或 cuBLAS 13.4）+ 一个轻量独立 SwiGLU</b>。
+</div>
+<h3>建议下一步（按性价比）</h3>
+<ol>
+  <li><b>保留并打磨 F0 CUTLASS grouped GEMM</b>（529 TFLOP/s 已与 vendor 持平），作为可被 CUDA Graph 捕获的 grouped-GEMM 后端；不再追前向融合的吞吐。</li>
+  <li>若仍要 F2，<b>用 NCU 定位融合 epilogue 为何这么贵</b>（对比 fused vs F0 的 SM/MIO/TMEM 占用），判断是否能把双累加器/epilogue 开销压到低于显存节省 —— 但 vendor 已在 529，空间小。</li>
+  <li><b>显存角度</b>：融合 kernel 唯一仍站得住的价值是<b>不物化 [M,2I] 中间激活</b>，对 activation-memory bound 的训练有意义（不是吞吐）。如要主推此点，应去测<b>激活显存下降</b>而非 TFLOP/s。</li>
+  <li>把 SonicMoE 精力转向 grouped-GEMM 后端尚未覆盖、或 vendor 较弱的环节（如特定 FP8/FP4 配方、in-kernel dispatch/combine 的 EP 路径）。</li>
+</ol>
+
+<footer>
+  生成于 2026-06-04 · 数据来自 B200 / pytorch:26.05（cuBLAS 13.4.1）/ 容器 sonic-moe-2605，整机共享限频，绝对值偏低、相对比值为准。<br>
+  相关产物：<code>qa/te_fused_moe_e2e_test.py</code>（drop-in+perf）、<code>qa/run_glin_bench.sh</code> + <code>benchmarks/linear/benchmark_grouped_linear.py</code>（后端对比）、<code>qa/grouped_gemm_backends_bench.py</code>。Commits <code>ab4ba576 → 6abf48f9</code>。
+</footer>
+
+</div>
+</body>
+</html>
