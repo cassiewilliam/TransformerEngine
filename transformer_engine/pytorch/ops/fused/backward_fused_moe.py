@@ -388,23 +388,36 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         (grouped_linear.py:791-804).
         """
         out_features, in_features = weight_shape
+
+        def _make(weight_data: torch.Tensor) -> GroupedTensor:
+            return GroupedTensor(
+                shape=(num_groups * out_features, in_features),
+                dtype=dtype,
+                num_tensors=num_groups,
+                shapes=[(out_features, in_features)] * num_groups,
+                quantizer=None,
+                data=weight_data,
+            )
+
         if fc_op.single_grouped_weight:
-            if isinstance(weight, GroupedTensor):
-                w = maybe_dequantize(weight.rowwise_data, dtype)
-            else:
-                w = maybe_dequantize(weight, dtype)
-            weight_data = w.reshape(-1)
-        else:
-            weights = [maybe_dequantize(w, dtype) for w in weight]
-            weight_data = torch.stack(weights, dim=0).contiguous().reshape(-1)
-        return GroupedTensor(
-            shape=(num_groups * out_features, in_features),
-            dtype=dtype,
-            num_tensors=num_groups,
-            shapes=[(out_features, in_features)] * num_groups,
-            quantizer=None,
-            data=weight_data,
-        )
+            # ALIGNED with the reference: reuse the packed buffer as a view (no copy).
+            w = (
+                maybe_dequantize(weight.rowwise_data, dtype)
+                if isinstance(weight, GroupedTensor)
+                else maybe_dequantize(weight, dtype)
+            )
+            return _make(w.reshape(-1))
+        # Per-expert: stack + wrap, mirroring the forward op-wrapper fix. CACHE on
+        # fc_op (distinct for FC1 vs FC2) keyed on the source weights' (id, _version)
+        # so the stack only re-runs when the optimizer updates them.
+        key = tuple((id(w), w._version) for w in weight)
+        cache = getattr(fc_op, "_fused_moe_bwd_wcache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        weights = [maybe_dequantize(w, dtype) for w in weight]
+        gt = _make(torch.stack(weights, dim=0).contiguous().reshape(-1))
+        fc_op._fused_moe_bwd_wcache = (key, gt)
+        return gt
 
     @staticmethod
     def _grouped_x_data(
