@@ -10,7 +10,8 @@
 #include <string>
 
 #include "../extensions.h"
-#include "common/gemm/cutlass_grouped_gemm_swiglu.h"  // SonicMoE F2: cutlass_grouped_swiglu C-API
+#include "common/gemm/cutlass_grouped_gemm_dswiglu.h"  // SonicMoE B1: cutlass_grouped_dswiglu C-API
+#include "common/gemm/cutlass_grouped_gemm_swiglu.h"   // SonicMoE F2: cutlass_grouped_swiglu C-API
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -610,7 +611,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   return bias;
 }
 
-// SonicMoE F2 (NVTE_USE_SONIC_MOE): fused up-proj grouped GEMM + SwiGLU. Thin marshalling — torch
+// SonicMoE F2 (NVTE_USE_FUSED_MOE): fused up-proj grouped GEMM + SwiGLU. Thin marshalling — torch
 // tensors -> raw ptrs + dtype -> the SM100 CUTLASS C-API cutlass_grouped_swiglu (common/gemm). The
 // kernel writes only the activated A[M, I] (silu(gate)*up), never the [M, 2I] gate||up intermediate.
 at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
@@ -653,6 +654,54 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
                          static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
                          at::cuda::getCurrentCUDAStream());
   return A;
+}
+
+// SonicMoE B1 (NVTE_USE_FUSED_MOE): fused SwiGLU-backward grouped GEMM. Recomputes h = X@W1^T in TMEM
+// and applies the SwiGLU backward fused with it, returning dY1[M,2I] = dgate||dup. Thin marshalling —
+// torch tensors -> raw ptrs + dtype -> the SM100 CUTLASS C-API cutlass_grouped_dswiglu (common/gemm).
+at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dgrad,
+                                      std::optional<at::Tensor> m_tile_expert,
+                                      std::optional<at::Tensor> prob, int64_t G, int64_t Me,
+                                      int64_t I, int64_t d, int64_t M_varlen,
+                                      int64_t math_sm_count) {
+  NVTE_CHECK(x.is_cuda() && w1.is_cuda() && dgrad.is_cuda(),
+             "te_cutlass_grouped_dswiglu: x, w1, dgrad must be CUDA tensors.");
+  NVTE_CHECK(x.scalar_type() == w1.scalar_type() && x.scalar_type() == dgrad.scalar_type(),
+             "te_cutlass_grouped_dswiglu: x, w1, dgrad must share dtype (bf16 or fp16).");
+  NVTE_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf,
+             "te_cutlass_grouped_dswiglu: only bf16/fp16 are supported.");
+  NVTE_CHECK(x.is_contiguous() && w1.is_contiguous() && dgrad.is_contiguous(),
+             "te_cutlass_grouped_dswiglu: x, w1, dgrad must be contiguous (row-major).");
+
+  // varlen-M (uneven, 256-aligned experts) when m_tile_expert is provided; else uniform M = G*Me.
+  const bool varlen = m_tile_expert.has_value() && m_tile_expert->numel() > 0;
+  const int M = varlen ? static_cast<int>(M_varlen) : static_cast<int>(G * Me);
+  const int* mte = nullptr;
+  if (varlen) {
+    NVTE_CHECK(m_tile_expert->scalar_type() == at::kInt && m_tile_expert->is_cuda(),
+               "te_cutlass_grouped_dswiglu: m_tile_expert must be an int32 CUDA tensor.");
+    mte = m_tile_expert->data_ptr<int>();
+  }
+  NVTE_CHECK(dgrad.dim() == 2 && dgrad.size(0) == M && dgrad.size(1) == I,
+             "te_cutlass_grouped_dswiglu: dgrad must be [M, I].");
+
+  // prob (optional): per-token router gate, fp32 [M]; epilogue forms grad = dgrad[m,:] * prob[m].
+  const float* prob_ptr = nullptr;
+  if (prob.has_value() && prob->numel() > 0) {
+    NVTE_CHECK(prob->scalar_type() == at::kFloat && prob->is_cuda() && prob->is_contiguous(),
+               "te_cutlass_grouped_dswiglu: prob must be a contiguous fp32 CUDA tensor.");
+    NVTE_CHECK(prob->numel() == M, "te_cutlass_grouped_dswiglu: prob must have M entries.");
+    prob_ptr = prob->data_ptr<float>();
+  }
+
+  auto dY1 = at::empty({M, I}, x.options());  // M1a: [M, I] dA output (M2 will widen to [M, 2I])
+  cutlass_grouped_dswiglu(x.data_ptr(), w1.data_ptr(), dgrad.data_ptr(), dY1.data_ptr(),
+                          /*dprob=*/nullptr, static_cast<int>(G), static_cast<int>(Me),
+                          static_cast<int>(I), static_cast<int>(d), mte, static_cast<int>(M_varlen),
+                          prob_ptr, GetTransformerEngineDType(x.scalar_type()),
+                          static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
+                          at::cuda::getCurrentCUDAStream());
+  return dY1;
 }
 
 py::object te_general_grouped_gemm_for_grouped_tensor(

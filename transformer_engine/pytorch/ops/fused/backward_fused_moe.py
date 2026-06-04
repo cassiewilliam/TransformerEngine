@@ -157,10 +157,11 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         else:
             fc1_weight = fc1_saved[:num_groups]
 
-        # Activation ctx layout: (None, scales) -- the [M, 2I] SwiGLU input was
-        # never materialized in forward (CUTLASS fused it away), so we recompute
-        # it below. ``scales`` is the per-token router prob.
-        _swiglu_in_unused, scales = activation_ctx.saved_tensors
+        # Activation ctx layout: (h_saved, scales). Design B: the forward SAVES the SwiGLU input
+        # h=[gate||up] [M,2I], so the backward fuses dA=dY@W2 + dswiglu reading saved h -- NO recompute.
+        # h_saved is None only on legacy/inference ctxs; then we fall back to recompute. ``scales`` is
+        # the per-token router prob.
+        swiglu_in_saved, scales = activation_ctx.saved_tensors
 
         # FC2 ctx layout: [split_sizes, base_split_offsets, split_points,
         #                  grouped_fc2_x, *fc2_weights]; grouped_fc2_x == A.
@@ -232,63 +233,56 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         )
 
         # ======================================================================
-        # Step 2: SwiGLU backward.  Recompute the up-proj [M, 2I] then dswiglu.
-        #   h        = x @ W1^T            (the gate||up the forward fused away)
-        #   dY1      = dswiglu(dA * prob, h)   -> grad wrt h, shape [M, 2I]
-        #   dprob    = <swiglu(h), dA>     (router-prob grad, if required)
-        # bf16: this recompute is the fallback for the missing fused dH kernel.
-        # TODO(sonic-moe): replace recompute+dswiglu with the fused B1 kernel.
+        # Step 2: SwiGLU backward -> dY1 = grad wrt h = [dgate || dup], shape [M, 2I].
+        #   grad      = dA * prob               (the forward applied A *= prob)
+        #   dY1       = dswiglu(grad, h)         (dgate || dup)
+        #   dprob[m]  = <silu(gate)*up, dA>[m]  (router-prob grad, if required)
+        #
+        # Design B: the forward SAVES h (swiglu_in_saved [M,2I]), so the backward READS it and runs
+        # dswiglu directly -- NO recompute (the reference design, the fastest backward; dA was already
+        # computed in Step 1). Phase 2 fuses dA=dY@W2 + dswiglu into one CUTLASS kernel. When h was NOT
+        # saved (legacy/inference ctx), fall back to recomputing h = x@W1^T via a bf16 grouped GEMM.
         # ======================================================================
-        # Recompute h = x @ W1^T using the saved FC1 input + weight.
         grouped_fc1_weight = self._wrap_weight_grouped(
             fc1_op, fc1_weight, num_groups, fc1_weight_shape, dtype, device
         )
-        x = self._grouped_x_data(grouped_fc1_x, M, d, dtype, device)
-        h = torch.empty(M, two_i, dtype=dtype, device=device)
-        grouped_x = GroupedTensor(
-            shape=(M, d),
-            dtype=dtype,
-            num_tensors=num_groups,
-            quantizer=None,
-            data=x.reshape(-1),
-            first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * d,
-        )
-        grouped_h = GroupedTensor(
-            shape=(M, two_i),
-            dtype=dtype,
-            num_tensors=num_groups,
-            quantizer=None,
-            data=h.reshape(-1),
-            first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * two_i,
-        )
-        general_grouped_gemm_for_grouped_tensor(
-            grouped_fc1_weight,
-            grouped_x,
-            grouped_h,
-            layout="TN",
-            use_split_accumulator=_2X_ACC_FPROP,
-        )
 
-        # Apply router-prob (the forward applied A *= prob inside the kernel; the
-        # grad wrt the SwiGLU output is therefore dA * prob).
-        prob = None
+        # x / grouped_x are needed for: (a) the FC1 wgrad dW1 = dY1^T @ x (only if weight_requires_grad),
+        # and (b) the recompute fallback (always). Build only when needed -- Design B with saved h and
+        # frozen weights needs NEITHER (h saved + no wgrad), which the old recompute path could not handle.
+        grouped_x: Optional[GroupedTensor] = None
+        need_recompute = swiglu_in_saved is None
+        if fc1_ctx.weight_requires_grad or need_recompute:
+            x = self._grouped_x_data(grouped_fc1_x, M, d, dtype, device)
+            grouped_x = GroupedTensor(
+                shape=(M, d), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=x.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * d,
+            )
+
+        if not need_recompute:
+            # ---- Design B: read SAVED h (no recompute) ----
+            h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i)
+        else:
+            # ---- FALLBACK: recompute h = x@W1^T (no saved h, e.g. a legacy/inference ctx) ----
+            h = torch.empty(M, two_i, dtype=dtype, device=device)
+            grouped_h = GroupedTensor(
+                shape=(M, two_i), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=h.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * two_i,
+            )
+            general_grouped_gemm_for_grouped_tensor(
+                grouped_fc1_weight, grouped_x, grouped_h,
+                layout="TN", use_split_accumulator=_2X_ACC_FPROP,
+            )
+
+        # Apply router-prob: grad wrt the SwiGLU output is dA * prob.
         grad_swiglu_out = dA
         if scales is not None:
             prob = maybe_dequantize(scales, dtype).reshape(-1)
             grad_swiglu_out = dA * prob.unsqueeze(-1)
-
-        # dY1 = dswiglu(grad_swiglu_out, h) -> [M, 2I].  tex.dswiglu matches the
-        # silu(gate)*up convention used by the CUTLASS kernel and ScaledSwiGLU
-        # (swiglu.py:568). No GLU interleaving: the forward kernel consumes the
-        # plain gate||up stacked weight, so the activation runs un-interleaved.
-        # VERIFY: confirm dswiglu gate/up halves match the CUTLASS kernel
-        # (gate = first half, up = second half) on B200.
         dY1 = tex.dswiglu(grad_swiglu_out, h, None)
         dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
 
-        # Router-prob gradient: dprob[m] = <swiglu(h)[m,:], dA[m,:]>.
+        # Router-prob gradient: dprob[m] = <swiglu(h)[m,:], dA[m,:]> (uses the saved/recomputed h).
         grad_scales = None
         if scales is not None and activation_ctx.extra_input_requires_grad:
             swiglu_out = tex.swiglu(h, None)

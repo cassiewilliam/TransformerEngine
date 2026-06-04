@@ -311,6 +311,39 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # Reshape output to the original leading dims (ref forward_grouped_mlp.py:439).
         out = fc2_out.view(M, fc2_weight_shape[0])
 
+        # --- SAVE h (Design B: backward fuses dA=dY@W2 + dswiglu reading saved h) -----------
+        # The reference (backward_grouped_mlp.py) reads the SAVED SwiGLU input h=[gate||up] in the
+        # fused backward instead of recomputing it. So the backward needs h[M,2I]. PHASE 0 recomputes
+        # it here via a bf16 grouped GEMM (X@W1^T) -- the SAME cost the backward used to pay, just moved
+        # to the forward -- to VALIDATE Design B's backward (correctness + no-recompute speed) with NO
+        # C++ build. PHASE 1 replaces this recompute with the forward kernel EMITTING h directly (the
+        # gate/up accumulators are already in TMEM), making it cheap. Gated on requires_grad.
+        # TODO(sonic-moe B1): replace this recompute with the forward kernel's h-emit (Phase 1).
+        h_saved = None
+        if requires_grad:
+            h_saved = torch.empty(M, two_i, dtype=dtype, device=device)
+            grouped_w1_for_h = GroupedTensor(
+                shape=(num_groups * two_i, d),
+                dtype=dtype,
+                num_tensors=num_groups,
+                shapes=[(two_i, d)] * num_groups,
+                quantizer=None,
+                data=w1.reshape(-1),
+            )
+            grouped_x_for_h = GroupedTensor(
+                shape=(M, d), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=x.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * d,
+            )
+            grouped_h_out = GroupedTensor(
+                shape=(M, two_i), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=h_saved.reshape(-1), first_dims=split_sizes,
+                tensor_offsets=base_split_offsets * two_i,
+            )
+            general_grouped_gemm_for_grouped_tensor(
+                grouped_w1_for_h, grouped_x_for_h, grouped_h_out,
+                layout="TN", use_split_accumulator=_2X_ACC_FPROP,
+            )
+
         # --- Save state for backward ------------------------------------------
         # bf16: there is no fused CUTLASS backward yet (see backward_fused_moe.py),
         # so we save each basic op's ctx in EXACTLY the layout that op's own
@@ -331,6 +364,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 x=x,
                 w1_input=input_,
                 A=A,
+                h_saved=h_saved,
                 scales=scales,
                 dtype=dtype,
                 device=device,
@@ -448,6 +482,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         x: torch.Tensor,
         w1_input: torch.Tensor,
         A: torch.Tensor,
+        h_saved: Optional[torch.Tensor],
         scales: Optional[torch.Tensor],
         dtype: torch.dtype,
         device: torch.device,
@@ -513,14 +548,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         # ---- SwiGLU activation ctx ----
         # _ScaledGLU.fuser_backward expects (input_, scales) where input_ is the
-        # SwiGLU input (the FC1 up-proj [M, 2I]) (swiglu.py:494). bf16: we DID
-        # NOT materialize the [M, 2I] gate||up tensor (the CUTLASS kernel fuses
-        # it away), so the standard SwiGLU backward CANNOT recompute dx from it.
-        # The backward instead recomputes the up-proj on demand; see
-        # backward_fused_moe.py. We save (None, scales) here and let the fused
-        # backward recompute the SwiGLU input.
-        # VERIFY: confirm backward recompute path against the per-op reference.
-        activation_ctx.save_for_backward(None, scales if input_requires_grad else None)
+        # SwiGLU input h = FC1 up-proj [M, 2I] (swiglu.py:494). Design B: we SAVE h
+        # (h_saved, computed above) so the fused backward fuses dA=dY@W2 + dswiglu
+        # reading saved h -- NO recompute (the reference design, the fastest backward).
+        # h_saved is None when no grad is required. See backward_fused_moe.py.
+        activation_ctx.save_for_backward(h_saved, scales if input_requires_grad else None)
         activation_ctx.extra_input_requires_grad = (
             scales is not None and scales.requires_grad
         )

@@ -20,7 +20,7 @@
 |---|---|---|---|---|---|
 | **F0** | CUTLASS Grouped GEMM @ **SM100**（替换 multi-stream，含 2CTA/CLC） | fwd+bwd | ⏳ | — | — |
 | F1 | Gather fusion（gather 进 mainloop） | fwd | 📋 待 | — | — |
-| F2 | SwiGLU epilogue 融合 | fwd | 📋 待 | — | — |
+| F2 | SwiGLU epilogue 融合 | fwd | ✅ kernel | route#2 grouped, 546 TFLOPS | n_fail=0 |
 | F3 | Combine（output-stationary / fused aggregation） | fwd | 📋 待 | — | — |
 | F4 | Router / metadata 融合 | fwd | 📋 待 | — | — |
 | B1 | dH overlap kernel（dA′/dH/dS/A′ 融合 + warp overlap） | bwd | 📋 待 | — | — |
@@ -121,7 +121,7 @@
 |---|---|---|---|---|
 | **F0-SM100** | CUTLASS Grouped GEMM SM100 前向(+dgrad) | ✅ 收敛（it1 1-SM / it2 2-SM，留 2-SM） | bf16/fp16 65/65 | **fwd 2.86×，fwd+bwd 1.79×(bf16)** |
 | B2-SM100 | varlen-K wgrad 扩到 SM100（解锁 fwd+bwd 余量） | 📋 下一步 | — | — |
-| F2 | SwiGLU epilogue 融合 | 📋 待 | — | — |
+| F2 | SwiGLU epilogue 融合 | ✅ kernel（route#2, 546 TFLOPS, n_fail=0）；待接入 GroupedLinear | docs/F2_route2_P0_spike_log.md | — |
 | F1 | Gather fusion（gather 进 mainloop） | 📋 待 | — | — |
 | B1 | dH overlap kernel | 📋 待 | — | — |
 
@@ -218,6 +218,22 @@ sub-agent 设计（docs/F2_swiglu_epilogue_design.md）：CUTLASS 4.2 无 gated/
 - **P1.0 草案 ✅**：构造决策 = (a) 两 CollectiveBuilder mainloop 自研 kernel（仿 FMHA）；TMEM 双缓冲 → **N=128 + 单级累加器**（非 P0 估的 256）；519 行骨架 + 5 最难点 + file:line 证据。
 - **P1.1 Step-1 编译 ✅（G1 编译期落锤）**：`cutlass_grouped_gemm_swiglu.cuh`（type config + TMEM 列映射）+ `qa/swiglu_step1_compile.cu`，`nvcc -arch=sm_100a` **RC=0** → CollectiveBuilder 在 N=128 实例化、`partition_fragment_C` 合法、两累加器 256 col ≤ 512。**底座可编译。**
 - **P1 剩余 = device kernel（多周专家工程）**：warp-specialized mainloop(2×`cute::gemm`→acc_gate/up)+ load/epi pipeline + silu·mul epilogue + host(双 ptr_B)。draft 是实现地图（带 `// VERIFY`）。**设计+底座=完成；device 实现=待续（草案 Step 2 单-expert 起）。**
+
+### 2026-06-03 · F2 route#2 · P1 device kernel **完成 + 优化收敛**（详见 docs/F2_route2_P0_spike_log.md）
+**✅ 端到端正确**：single-expert → multi-tile → grouped(G=2/4/32) 全部 `n_fail=0`（bf16, abs|rel 5e-2）。关键修复：**CUTLASS B-operand 布局反转 → LayoutW1=ColumnMajor**（K-contiguous weight）；6 处 2-SM bug（leader-gate MMA、epi arrival×2、TMEM alloc/free 同 warp、cluster_sync 先于 cta_group::2 free、persistent follower-acquire leader-gate、NamedBarrier id 分离）。
+**✅ 性能（用户 shape G32 M16384 I512 d2048，B200 空卡）：292 → 546 TFLOPS（+87%）**，全部经 ncu 驱动：
+| 优化 | TFLOPS | 增量 |
+|---|---|---|
+| baseline (1-SM 雏形) | 292 | — |
+| tile 调优 TileN64/TK16/kStages16 | 344 | +18% |
+| epilogue smem 合并写（消 L1 84% scatter） | 398 | +16% |
+| persistent grid-stride（摊薄 per-tile overhead） | 394(持平)/小-NK +17~28% | — |
+| **TMEM double-buffer（AccStages=2，MMA↔epi 重叠）** | **546** | **+39%** |
+- **double-buffer 是单点最大杠杆**（ncu: Compute(SM) 37→50%）。
+- **瓶颈 = 2-SM occupancy 硬上限 12.5%（cluster co-residency 硬件特性，已证不可由 smem/reg/TMEM 松动）+ smem/L1 80%（MMA operand 读，固有）**；DRAM 仅 15%。
+- 已实现 scheduling 表 7/9：multistage / async MMA+TMA+mbarrier / warp-spec / **ping-pong(=double-buffer 重叠)** / persistent+tile-sched / 2-SM UMMA / **TMEM 跨-phase 复用(=double-buffer)**；未做 **Stream-K、CLC**（均对 uniform-K grouped 边际小）。
+- 全部 tunable 抽象进 `SwiGluConfig<...TileM,TileN,TileK,kStages,ClusterM,MinBlocks,AccStages>`（autotuning/JIT ready）。commit `be840470`→`abebe85c`→`18ffde6c`。
+- **kernel 优化已近 2-SM 天花板收敛**。下一高价值 = **接入 TE GroupedLinear MoE 路径做端到端验证**（融合省 [M,2I] 中间 HBM 往返 + 独立 SwiGLU pass）。
 
 ### 下一步
 1. **F2 route#2 · P1 Step 2**：写单-expert device kernel（dual `cute::gemm` + epilogue）→ 数值对齐 torch SwiGLU。**(多周工程的核心；非「编辑→编译→测量」式快迭代)**

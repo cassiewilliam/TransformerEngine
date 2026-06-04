@@ -3,6 +3,7 @@
 		extern "C++" {
 			nvte_*;
 			cutlass_grouped_swiglu*;
+			cutlass_grouped_dswiglu*;
 			transformer_engine::cuda::sm_count*;
 			transformer_engine::cuda::sm_arch*;
 			transformer_engine::cuda::supports_multicast*;

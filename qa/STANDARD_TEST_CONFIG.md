@@ -40,7 +40,7 @@ env 覆盖（脚本里读）：`MOE_G=32 MOE_D=2048 MOE_I=512 MOE_ME=768`。
 | 3. CUTLASS F0 | `NVTE_USE_CUTLASS_GROUPED_GEMM=1`（+ ops 需 monkeypatch graph-safe→False） |
 | 4. **FUSED_MOE**（SonicMoE 融合 up+SwiGLU） | `NVTE_USE_FUSED_MOE=1`（op 层）；kernel 直调用 `tex.te_cutlass_grouped_swiglu` |
 
-`NVTE_USE_SONIC_MOE` = kernel/C++ 底座开关；`NVTE_USE_FUSED_MOE` = op-fusion 层开关（两者分开）。
+`NVTE_USE_FUSED_MOE` = op-fusion 层开关（两者分开）。
 
 ## 4. 标准脚本
 

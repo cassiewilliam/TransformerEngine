@@ -31,7 +31,7 @@ void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int M
   using namespace transformer_engine;
 
   // SM100 (Blackwell, CC 10.x) only: the kernel uses the 2-SM (cta_group::2) tcgen05 schedule. The
-  // upstream dispatcher should already gate on NVTE_USE_SONIC_MOE + is_blackwell, but assert here so a
+  // upstream dispatcher should already gate on NVTE_USE_FUSED_MOE + is_blackwell, but assert here so a
   // mis-routed call fails loudly instead of launching invalid PTX.
   int sm_major = 0;
   NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));

@@ -158,7 +158,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
-// SonicMoE F2 (NVTE_USE_SONIC_MOE): fused up-projection grouped GEMM + SwiGLU, SM100 / bf16|fp16.
+// SonicMoE F2 (NVTE_USE_FUSED_MOE): fused up-projection grouped GEMM + SwiGLU, SM100 / bf16|fp16.
 //   A[M, I] = silu(gate) * up,  [gate||up][M, 2I] = X[M, d] @ W1[G*2I, d]^T  (per-expert grouped).
 // x: [M, d] row-major; w1: [G*2I, d] row-major (gate||up stacked over experts); returns A: [M, I].
 // m_tile_expert (optional, int32 [ceil(M/256)]): varlen-M expert table (experts 256-aligned, pad
@@ -167,6 +167,15 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
                                      std::optional<at::Tensor> m_tile_expert,
                                      std::optional<at::Tensor> prob, int64_t G, int64_t Me,
                                      int64_t I, int64_t d, int64_t M_varlen, int64_t math_sm_count);
+
+// SonicMoE B1: fused SwiGLU-backward grouped GEMM (SM100). Recomputes h = X@W1^T in TMEM and applies the
+// SwiGLU backward fused with it, returning dY1: [M, 2I] = dgate||dup. x: [M, d]; w1: [G*2I, d]; dgrad
+// (= dA): [M, I] incoming grad wrt the prob-scaled SwiGLU output. m_tile_expert/prob as in the forward.
+at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dgrad,
+                                      std::optional<at::Tensor> m_tile_expert,
+                                      std::optional<at::Tensor> prob, int64_t G, int64_t Me,
+                                      int64_t I, int64_t d, int64_t M_varlen,
+                                      int64_t math_sm_count);
 
 py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,

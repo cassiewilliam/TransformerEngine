@@ -291,6 +291,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "SonicMoE fused up-proj grouped GEMM + SwiGLU (SM100, bf16/fp16)", py::arg("x"),
         py::arg("w1"), py::arg("m_tile_expert"), py::arg("prob"), py::arg("G"), py::arg("Me"),
         py::arg("I"), py::arg("d"), py::arg("M_varlen"), py::arg("math_sm_count"));
+  m.def("te_cutlass_grouped_dswiglu", &transformer_engine::pytorch::te_cutlass_grouped_dswiglu,
+        "SonicMoE fused SwiGLU-backward grouped GEMM (SM100, bf16/fp16)", py::arg("x"), py::arg("w1"),
+        py::arg("dgrad"), py::arg("m_tile_expert"), py::arg("prob"), py::arg("G"), py::arg("Me"),
+        py::arg("I"), py::arg("d"), py::arg("M_varlen"), py::arg("math_sm_count"));
   m.def("te_general_grouped_gemm_for_grouped_tensor",
         &transformer_engine::pytorch::te_general_grouped_gemm_for_grouped_tensor,
         "Grouped GEMM for GroupedTensor");

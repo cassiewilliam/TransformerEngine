@@ -299,19 +299,24 @@ endforeach()
 # sm_90a, which would fail to compile the tcgen05 PTX). Guarded so a non-Blackwell toolkit simply omits
 # the source (the fused path is unreachable there anyway; the dispatcher falls back).
 if(NVTE_SPECIFIC_ARCHS)
-  list(APPEND transformer_engine_SOURCES gemm/cutlass_grouped_gemm_swiglu.cu)
+  # F2 forward (cutlass_grouped_gemm_swiglu.cu) + B1 backward (cutlass_grouped_gemm_dswiglu.cu): both are
+  # 2-SM tcgen05 SM100-only kernels, compiled for NVTE_SPECIFIC_ARCHS only (same arch + -g0/-dopt flags).
+  set(sonic_swiglu_sources
+      gemm/cutlass_grouped_gemm_swiglu.cu
+      gemm/cutlass_grouped_gemm_dswiglu.cu)
+  list(APPEND transformer_engine_SOURCES ${sonic_swiglu_sources})
   set(sonic_swiglu_arch_options)
   foreach(arch IN LISTS NVTE_SPECIFIC_ARCHS)
     list(APPEND sonic_swiglu_arch_options "--generate-code=arch=compute_${arch},code=sm_${arch}")
   endforeach()
   set_property(
-    SOURCE gemm/cutlass_grouped_gemm_swiglu.cu
+    SOURCE ${sonic_swiglu_sources}
     APPEND
     PROPERTY
     COMPILE_OPTIONS ${sonic_swiglu_arch_options})
   # Match CUTLASS_KERNEL_SOURCES: -g0/-dopt=on (CUTLASS kernels can hang a debug build).
   set_property(
-    SOURCE gemm/cutlass_grouped_gemm_swiglu.cu
+    SOURCE ${sonic_swiglu_sources}
     APPEND
     PROPERTY
     COMPILE_OPTIONS "-g0;-dopt=on")

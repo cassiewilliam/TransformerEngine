@@ -28,7 +28,7 @@
 // The gate||up product is NEVER materialized to global memory — the SwiGLU is fused in the kernel
 // epilogue and only the activated A[M, I] is written out (the route#2 / zero-Muon design). This
 // replaces a TE up-GroupedLinear (out=2I) followed by a separate SwiGLU activation with a single
-// pass, and is gated upstream by NVTE_USE_SONIC_MOE.
+// pass, and is gated upstream by NVTE_USE_FUSED_MOE.
 //
 // Layout / dtype contract (mirrors LaunchSwiGluGrouped in the .cuh):
 //   X   : [M, d]      row-major, BF16 or FP16   (permuted/grouped tokens; M = sum of per-expert tokens)
@@ -43,7 +43,7 @@
 //                unused for token counting but still passed for the descriptor's per-expert stride.
 //
 // SM100 ONLY: the kernel is a 2-SM (cta_group::2) tcgen05 warp-specialized schedule. The caller is
-// responsible for arch gating (NVTE_USE_SONIC_MOE + is_blackwell); this entry NVTE_CHECKs SM major==10.
+// responsible for arch gating (NVTE_USE_FUSED_MOE + is_blackwell); this entry NVTE_CHECKs SM major==10.
 //
 // EXPORT: this symbol is whitelisted in transformer_engine/common/libtransformer_engine.version (the
 // linker version-script; TE marks everything else `local`). That is required so the pytorch extension
