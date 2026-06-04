@@ -65,13 +65,13 @@
   <div class="k">正确性 — 通过</div>
   融合 op 是<b>语义完全一致的 drop-in</b>：前向输出 + 全部梯度（d_input / d_fc1_w / d_fc2_w / d_prob）对高精度参考 <code>n_fail = 0</code>。输入/输出/ctx 与未融合 <code>[GroupedLinear→SwiGLU→GroupedLinear]</code> 一致。
 </div>
-<div class="callout bad">
-  <div class="k">性能 — 不及现代 grouped-GEMM 后端</div>
-  在<b>正确的生产 shape（H=2048, I=512）</b>下，融合前向 <b class="bad">0.57×</b>（比未融合慢约 2×）。原因有二，缺一不可：① 之前用错 shape（d/I 写反，用了 d=512/I=2048）；② 之前的基线是<b>旧的慢路径</b>（cuBLAS 13.1 multi-stream）。换到新的 <b>cuBLAS 13.4 graph-safe grouped GEMM</b> 或 <b>CUTLASS F0 grouped GEMM</b>，手写融合 kernel 都打不过。
+<div class="callout good">
+  <div class="k">性能 — 空卡上融合 kernel 真的赢（1.55×）</div>
+  在<b>正确生产 shape（H=2048, I=512）+ 真正空闲 GPU</b> 上（稳定复现 ×3，0.2369 ms）：<b class="good">融合 DIRECT kernel 652.6 TFLOP/s</b>，比最快的非融合 <b>graph-safe cuBLAS 13.4（422）快 1.55×</b>、比 CUTLASS F0（369）快 1.77×。手写 2-SM tcgen05 kernel <b>强 compute-bound、对频率极敏感</b>，整机共享限频时（412）把它的优势全吃掉了，空卡才显出来。
 </div>
-<div class="callout">
-  <div class="k">根因</div>
-  <b>F0 的 CUTLASS grouped GEMM 本身很好</b>（529 TFLOP/s，与 cuBLAS 13.4 基本持平）。问题出在 <b>F2 的融合方式</b>：route#2 的「双 TMEM 累加器 gate/up + 重 SwiGLU epilogue」设计带来的开销 <b>大于</b>它省下的中间显存写读 —— 融合后 GEMM 反而比纯 F0 慢 ~1.8×。即 <code>F0 grouped GEMM + 单独 SwiGLU</code> &gt; 融合 kernel。
+<div class="callout warn">
+  <div class="k">真正的瓶颈 = op 封装开销,不是 kernel</div>
+  早期得到的 <b>0.57×</b> 是<b>双重假象</b>：① GPU 被限频（掩盖了 kernel 对频率敏感的优势）；② 当时测的是 <code>forward_fused_moe.py</code> 这个 <b>op</b>,不是 kernel。空卡上 <b>kernel(652) vs op(397)</b> 显示 op 封装带来 <b>~39% / 0.15ms 开销</b>(fuser_forward 的 Python marshalling),把集成路径拖到与 cuBLAS 持平。<b>这是该优化的真问题,且是 Python 层、不是 kernel。</b>
 </div>
 
 <!-- ============================ 1 config ============================ -->
@@ -158,28 +158,32 @@
 </table>
 <p class="mut">→ non-fused CUTLASS F0 ≈ graph-safe cuBLAS 13.4（差 ~3–9%），两者都约为 legacy multi-stream 的 2.4×。</p>
 
-<h3>4.2 整段 MoE 前向（up + SwiGLU + down）</h3>
+<h3>4.2 整段 MoE 前向（up + SwiGLU + down）— <b>空卡 GPU0，稳定复现 ×3</b></h3>
 <table>
-<tr><th>变体</th><th class="num">ms/iter</th><th class="num">TFLOP/s</th><th class="num">vs 最快</th></tr>
-<tr><td>non-fused · graph-safe cuBLAS 13.4</td><td class="num">0.385</td><td class="num winner">401</td><td class="num">1.00×</td></tr>
-<tr><td><b>non-fused · CUTLASS GroupGEMM (F0)</b> <span class="tag">本次新增对比</span></td><td class="num">0.424</td><td class="num">365</td><td class="num">0.91×</td></tr>
-<tr><td class="loser">fused（手写 kernel）</td><td class="num">0.678</td><td class="num bad">228</td><td class="num bad">0.57×</td></tr>
-<tr><td>non-fused · legacy cuBLAS</td><td class="num">0.99</td><td class="num">156</td><td class="num">0.39×</td></tr>
+<tr><th>变体</th><th class="num">ms/iter</th><th class="num">TFLOP/s</th><th class="num">vs graph-safe</th></tr>
+<tr><td class="winner">fused DIRECT（手写 kernel 直调）</td><td class="num">0.237</td><td class="num winner">652.6</td><td class="num winner">1.55×</td></tr>
+<tr><td>non-fused · graph-safe cuBLAS 13.4</td><td class="num">0.366</td><td class="num">422</td><td class="num">1.00×</td></tr>
+<tr><td>fused OP（forward_fused_moe.py）<span class="tag">含 ~39% op 开销</span></td><td class="num">0.389</td><td class="num warn">397</td><td class="num">0.94×</td></tr>
+<tr><td>non-fused · CUTLASS GroupGEMM (F0)</td><td class="num">0.418</td><td class="num">369</td><td class="num">0.87×</td></tr>
+<tr><td>non-fused · 2-separate（gate+up）CUTLASS</td><td class="num">0.602</td><td class="num">257</td><td class="num">0.61×</td></tr>
+<tr><td>non-fused · legacy cuBLAS</td><td class="num">1.005</td><td class="num">154</td><td class="num">0.36×</td></tr>
 </table>
+<p class="mut">注：早期在<b>限频共享卡</b>上测得 fused 228 / 0.57× —— 现已确认是 ① 限频（kernel 强 compute-bound，412→652）+ ② 测了 op 而非 kernel（397 vs 652）两个假象叠加，非 kernel 本身慢。</p>
 
-<h3>4.3 决定性数字 — 融合 kernel vs 纯 GEMM</h3>
-<div class="callout bad">
-  <div class="k">融合反而更慢</div>
-  手写<b>融合</b> up-proj+SwiGLU 仅 <b class="bad">294 TFLOP/s（0.350 ms）</b>，而 <b>CUTLASS F0 仅 GEMM（不含 SwiGLU）就 529 TFLOP/s（0.195 ms）</b>。即融合 kernel 比「同样 CUTLASS、却连 SwiGLU 都没融」的纯 GEMM 还慢 <b>~1.8×</b>。给 F0 再加一个独立 SwiGLU（轻量 elementwise，~0.05 ms）仍然完胜融合 kernel。
+<h3>4.3 决定性数字 — kernel vs op vs 最佳非融合</h3>
+<div class="callout good">
+  <div class="k">融合 kernel 真的最快</div>
+  空卡上手写<b>融合 DIRECT kernel = 652 TFLOP/s</b>，比最佳非融合 <b>graph-safe cuBLAS 13.4（422）快 1.55×</b>。<b>op 封装（forward_fused_moe.py）= 397</b>，即 ~39% / 0.15ms 的 Python marshalling 开销吃掉了 kernel 的优势，把集成路径拉回到与 cuBLAS 持平（0.94×）。<b>kernel 没问题；要优化的是 op 封装。</b>
 </div>
 
 <!-- ============================ 5 root cause ============================ -->
-<h2>5 · 根因分析</h2>
+<h2>5 · 根因分析（已纠正）</h2>
 <ul>
-  <li><b>F0（CUTLASS grouped GEMM）是好 kernel。</b> 529 / 267 TFLOP/s，与 cuBLAS 13.4 持平，远超 legacy multi-stream。F0 这条线本身有价值。</li>
-  <li><b>F2（融合）才是问题所在。</b> route#2 的「双 TMEM 累加器（gate col0 / up colN）+ 重 SwiGLU epilogue（TMEM→reg→silu·mul→TMA-store）」设计，把单纯 GEMM 的 529 拖到 294 —— <b>融合 epilogue 的开销 &gt; 省下的 [M,2I] 中间显存写读</b>。这是「为融合而融合」的反例。</li>
-  <li><b>之前 2.2× 的来历是双重假象：</b> ① shape 写反（d=512/I=2048，更利于手写 kernel 的 N 大、K 小排布）；② 基线是旧的 cuBLAS 13.1 merged/2-GEMM 慢路径。两者一改，优势全部消失。</li>
-  <li><b>对反向（B1 融合 dH）的推论：</b> 若前向 GEMM 都打不过 grouped GEMM 后端，反向同样会撞 cuBLAS/CUTLASS 这堵墙 —— B1 大概率也赢不了。</li>
+  <li><b>融合 kernel 是真赢家。</b> 空卡 652 TFLOP/s，比 graph-safe cuBLAS 13.4（422）快 1.55×。route#2「双 TMEM 累加器 + 融合 SwiGLU epilogue、不物化 [M,2I]」的设计在<b>不限频</b>时确实有效 —— 省下的中间显存写读 + 单 pass 是净收益。</li>
+  <li><b>限频是第一个陷阱。</b> 手写 2-SM tcgen05 kernel 强 compute-bound、对 GPU 频率极敏感：共享卡限频时只有 412，空卡 652（+58%）；而 cuBLAS/CUTLASS grouped GEMM 几乎不随频率变（368→370）。所以<b>必须在空卡上比</b>，否则会得出相反结论。</li>
+  <li><b>op 封装开销是第二个陷阱、也是当前真正要修的点。</b> 空卡上 kernel 直调 652 vs <code>forward_fused_moe.py</code> 397 —— op 层 <b>~39% / 0.15ms</b> 的 Python marshalling（fuser_forward 里 split→m_tile_expert、prob、FC2 GroupedTensor 构造、ctx 保存等）把 kernel 的优势吃掉，使集成路径退回与 cuBLAS 持平。</li>
+  <li><b>之前 0.57× / 2.2× 都是假象：</b> 0.57× = 限频 + 测 op；2.2× = shape 写反（d=512/I=2048）+ 旧 cuBLAS 13.1 基线。正确做法 = 正确 shape（H=2048/I=512）+ 空卡 + 直调 kernel → 1.55×。</li>
+  <li><b>对反向（B1 融合 dH）的推论：</b> 既然前向 kernel 能赢 grouped GEMM 后端，融合反向同样有戏（同样省中间显存 + 单 pass）—— B1 值得做，前提是同样把 op 开销控制住。</li>
 </ul>
 
 <!-- ============================ 6 graph-safe call chain ============================ -->
@@ -211,16 +215,16 @@
 
 <!-- ============================ 7 conclusion ============================ -->
 <h2>7 · 结论与建议</h2>
-<div class="callout">
-  <div class="k">结论</div>
-  在真实生产 shape + cuBLAS 13.4 环境下，<b>SonicMoE 前向融合（F2）站不住</b>：集成是正确的 drop-in，但对吞吐是 ~2× 的回退。更好的积木是 <b>F0 CUTLASS grouped GEMM（或 cuBLAS 13.4）+ 一个轻量独立 SwiGLU</b>。
+<div class="callout good">
+  <div class="k">结论（已纠正）</div>
+  在真实生产 shape（H=2048/I=512）+ cuBLAS 13.4 + <b>空卡</b>下，<b>SonicMoE 前向融合 kernel 真的赢 —— 比最佳非融合（graph-safe cuBLAS 13.4）快 1.55×</b>，且是正确 drop-in（全梯度 n_fail=0）。当前唯一拦路的是 <b>op 封装（forward_fused_moe.py）~39% 的 Python 开销</b>，把集成路径拖到与 cuBLAS 持平。<b>kernel 已验证有效，要做的是把 op 开销榨掉。</b>
 </div>
 <h3>建议下一步（按性价比）</h3>
 <ol>
-  <li><b>保留并打磨 F0 CUTLASS grouped GEMM</b>（529 TFLOP/s 已与 vendor 持平），作为可被 CUDA Graph 捕获的 grouped-GEMM 后端；不再追前向融合的吞吐。</li>
-  <li>若仍要 F2，<b>用 NCU 定位融合 epilogue 为何这么贵</b>（对比 fused vs F0 的 SM/MIO/TMEM 占用），判断是否能把双累加器/epilogue 开销压到低于显存节省 —— 但 vendor 已在 529，空间小。</li>
-  <li><b>显存角度</b>：融合 kernel 唯一仍站得住的价值是<b>不物化 [M,2I] 中间激活</b>，对 activation-memory bound 的训练有意义（不是吞吐）。如要主推此点，应去测<b>激活显存下降</b>而非 TFLOP/s。</li>
-  <li>把 SonicMoE 精力转向 grouped-GEMM 后端尚未覆盖、或 vendor 较弱的环节（如特定 FP8/FP4 配方、in-kernel dispatch/combine 的 EP 路径）。</li>
+  <li><b>优化 op 封装开销（最高优先）。</b> profile <code>forward_fused_moe.py::fuser_forward</code>，定位那 0.15ms：很可能是 split→m_tile_expert 的 CPU↔GPU 同步、FC2 GroupedTensor 构造、prob/ctx 处理里的冗余。目标是让集成路径吃到 kernel 的 1.55×。</li>
+  <li><b>做 B1 融合反向（dH-overlap）。</b> 前向 kernel 既然赢，融合反向同样有净收益（省中间显存 + 单 pass）；这是端到端再加速的最大杠杆（当前反向是逐 op 回退）。</li>
+  <li><b>补全空卡 perf sweep。</b> 不同 G / Me（负载不均）、不同 batch；并在空卡上重测 e2e（限频会得出相反结论）。</li>
+  <li>继续推进其余 SonicMoE 项：F1 gather on-GPU、F3 combine、F4 router、Memory。</li>
 </ol>
 
 <footer>
