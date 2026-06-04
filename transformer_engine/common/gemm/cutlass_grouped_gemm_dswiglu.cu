@@ -35,10 +35,13 @@ void cutlass_grouped_dswiglu(const void *dY, const void *W2, const void *h, void
              "cutlass_grouped_dswiglu requires an SM100 (Blackwell) device; the kernel is a 2-SM "
              "tcgen05 schedule with no pre-Blackwell path.");
 
-  // M3 (h-prefetch via TMA) was a NET LOSS (312us vs 282 scattered) — TMA-load contends with the dY1
-  // store-TMA engine + smem round-trip; the scattered LSU read parallelizes the store-TMA + overlaps the
-  // compute. Reverted to the scattered-read baseline (default kStages=16). See b1-backward-kernel-design.
-  // M2b: dprob (router-prob grad OUTPUT [M] fp32, caller pre-zeroed) is now wired as the col-reduce output.
+  // h-PREFETCH IS A DEAD END (two negative experiments, both correct but slower than the 283us scattered
+  // baseline): M3 (TMA double-buffer) = 312us (TMA-load contends with the dY1 store-TMA engine); M4 (cp.async
+  // .cg double-buffer, LSU path, QuACK-style coalesced tiled copy) = 314us. The h-read is LSU/L1-OP-bound,
+  // not HBM-BW-bound: the scattered direct read is 1 op/element AND overlaps the unrolled compute; ANY
+  // staging adds a smem round-trip (write smem + read smem = 2× the memory ops) that outweighs the
+  // coalescing benefit. The scattered-read baseline (default kStages=16) is optimal. See b1-backward-design.
+  // M2b: dprob (router-prob grad OUTPUT [M] fp32, caller pre-zeroed) is wired as the col-reduce output.
   cudaError_t status = cudaErrorInvalidValue;
   if (dtype == DType::kBFloat16) {
     status = grouped_gemm_dswiglu::LaunchDSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t>(
