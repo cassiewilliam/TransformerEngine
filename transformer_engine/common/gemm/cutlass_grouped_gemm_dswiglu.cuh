@@ -363,9 +363,9 @@ struct Sm100DSwiGluKernel {
       // second B (smem_w1_up) is dropped (single accumulator, no gate/up split).
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutX>> smem_x;        // dY tiles  (A operand)
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW1>> smem_w1_gate;  // W2ᵀ tiles (B operand)
-      // M1a: ONE output-staging tile (kEpiTileM × kEpiTileN, row-major) for dA[M,I] — the forward's single
-      // A-store pattern. (M2 will re-add a second buffer for the dY1[:,I:] up-half.)
-      cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out;  // dA tile staging
+      // M2: TWO output-staging tiles for the dswiglu output dY1[M,2I] — dgate → dY1[:, :I], dup → dY1[:, I:].
+      cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_gate;  // dgate staging (dY1[:, :I])
+      cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_up;    // dup   staging (dY1[:, I:])
     } tensors;
     struct PipelineStorage : cute::aligned_struct<16, _0> {
       alignas(16) typename PipelineLoad::SharedStorage load;
@@ -898,16 +898,18 @@ struct Sm100DSwiGluKernel {
       // Per-tile register staging (tile-invariant SHAPE; values overwritten each tile by the TMEM copy).
       Tensor rGate = make_tensor<ElementAcc>(shape(tTMc));  // M1a: the dA values (single acc)
 
-      // ---- M1a TMA-STORE EPILOGUE (passthrough): the GEMM result dA is staged into ONE per-CTA SMEM tile
-      // sA at the LOCAL (row,col) tTMc(i) gives, then drained to global dA[M,I] by ONE async TMA bulk-store
-      // per CTA per tile — exactly the forward's single-store pattern (no silu, no dswiglu, no second store).
-      Tensor sA = make_tensor(make_smem_ptr(ss.tensors.smem_out.begin()),
-                              SmemLayoutA{});  // (kEpiTileM,kEpiTileN) row-major (dA tile staging)
-      Tensor mA_tma = params.tma_store_dy1.get_tma_tensor(make_shape(M, N));  // (M,I) identity coords
+      // ---- M2 TMA-STORE EPILOGUE (dswiglu): dA is in TMEM (the GEMM result); gate/up are read from the
+      // SAVED h[M,2I] (global). Per element: grad = dA·prob; dgate = grad·up·silu'(gate) → sGate; dup =
+      // grad·silu(gate) → sUp; then TWO TMA bulk-stores → dY1[:, :I] (gate) and dY1[:, I:2I] (up).
+      Tensor sGate = make_tensor(make_smem_ptr(ss.tensors.smem_out_gate.begin()), SmemLayoutA{});  // dgate
+      Tensor sUp = make_tensor(make_smem_ptr(ss.tensors.smem_out_up.begin()), SmemLayoutA{});      // dup
+      Tensor mDY1_tma = params.tma_store_dy1.get_tma_tensor(make_shape(M, 2 * N));  // (M,2I) coords
       ThrCopy thrblk_s2g = params.tma_store_dy1.get_slice(Int<0>{});
-      Tensor bSG_sA = thrblk_s2g.partition_S(sA);  // (TMA,TMA_M,TMA_N)
-      // ONE issuing thread per CTA = elected lane of epi-warp 4 (lane_predicate = cute::elect_one_sync()
-      // computed once at entry, valid per-warp). All store-issuing ops (copy/arrive/wait) are gated on it.
+      Tensor bSG_sGate = thrblk_s2g.partition_S(sGate);  // (TMA,TMA_M,TMA_N)
+      Tensor bSG_sUp = thrblk_s2g.partition_S(sUp);      // (TMA,TMA_M,TMA_N)
+      const int nI_local_tiles = params.n_local_tiles;   // == I/kTileN: up-half box-col offset
+      const int64_t h_row = static_cast<int64_t>(2) * params.N;  // saved h[M,2I] row stride (= 2I)
+      // ONE issuing thread per CTA = elected lane of epi-warp 4 (lane_predicate = cute::elect_one_sync()).
       const bool is_tma_store_lane = (warp_idx == 4) && (lane_predicate != 0u);
 
       // PERSISTENT grid-stride over the SAME tile sequence the Load/MMA warps walk (identical cluster_id
@@ -967,18 +969,30 @@ struct Sm100DSwiGluKernel {
         cutlass::arch::NamedBarrier epi_war_bar(NumEpiThreads, /*id=*/1u);
         epi_war_bar.arrive_and_wait();
 
-        // (1) SwiGLU BACKWARD per element, (2) scatter dgate/dup into the two SMEM staging tiles at the
-        // LOCAL (row,col).  Reads the incoming grad dGrad[grow*N+gcol] and the recomputed (gate,up) from
-        // TMEM.  No local-bound guard (LOCAL coords are in range by construction); the grow<M guard only
-        // protects the dGrad/prob global reads on a partial/OOB tile row (the TMA-store box clamps writes).
-        //   grad = dGrad · prob ;  dgate = grad · up · silu'(gate) ;  dup = grad · silu(gate)
-        // where silu(x)=x·σ(x), silu'(x)=σ(x)+silu(x)·(1-σ(x)).  dGrad/prob default to 0/1 (ungated).
-        // M1a PASSTHROUGH: scatter the dA accumulator into sA at the LOCAL (row,col). No silu/dswiglu/dGrad.
+        // M2 SwiGLU BACKWARD per element: dA = rGate(i) (from TMEM, the GEMM result); gate/up read from the
+        // SAVED h[M,2I] (params.dGrad repurposed as the h pointer): gate = h[grow,gcol], up = h[grow,I+gcol].
+        //   grad = dA·prob ;  dgate = grad·up·silu'(gate) → sGate ;  dup = grad·silu(gate) → sUp
+        // silu(x)=x·σ(x), silu'(x)=σ(x)+silu(x)·(1-σ(x)). grow<M guards the h/prob reads on OOB rows.
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(rGate); ++i) {
           int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
           int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
-          sA(lrow, lcol) = static_cast<ElementOut>(rGate(i));
+          const int grow = lrow + cta_row_offset;  // GLOBAL token row
+          const int gcol = lcol + cta_col_offset;  // GLOBAL intermediate col ∈ [0,I)
+          const ElementAcc dA = rGate(i);          // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
+          ElementAcc gate = ElementAcc(0), up = ElementAcc(0), p = ElementAcc(1);
+          if (grow < params.M) {
+            const int64_t hbase = static_cast<int64_t>(grow) * h_row + gcol;  // saved h[grow, gcol]
+            gate = static_cast<ElementAcc>(params.dGrad[hbase]);              // h gate-half
+            up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]);     // h up-half (col I+gcol)
+            if (params.prob != nullptr) p = params.prob[grow];
+          }
+          const ElementAcc grad = dA * p;
+          const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
+          const ElementAcc s = gate * sig;                                       // silu(gate)
+          const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
+          sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
+          sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
         }
 
         // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
@@ -1015,10 +1029,13 @@ struct Sm100DSwiGluKernel {
         // descriptor (built over the TRUE (M,2I) extent) clamps any partial tile (OOB never written).
         if (is_tma_store_lane) {
           const int box_m = cta_row_offset / kEpiTileM;  // exact (kTileM = AtomThrID*kEpiTileM)
-          const int box_n = cta_col_offset / kEpiTileN;  // == n_tile_local (kTileN == kEpiTileN)
-          Tensor gA = local_tile(mA_tma, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
-                                 make_coord(box_m, box_n));  // dA[M,I] output tile
-          copy(params.tma_store_dy1, bSG_sA, thrblk_s2g.partition_D(gA));
+          const int box_n = cta_col_offset / kEpiTileN;  // gate-half box col == n_tile_local
+          Tensor gGate = local_tile(mDY1_tma, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
+                                    make_coord(box_m, box_n));                 // dY1[:, :I] tile
+          Tensor gUp = local_tile(mDY1_tma, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}),
+                                  make_coord(box_m, nI_local_tiles + box_n));  // dY1[:, I:2I] tile
+          copy(params.tma_store_dy1, bSG_sGate, thrblk_s2g.partition_D(gGate));
+          copy(params.tma_store_dy1, bSG_sUp, thrblk_s2g.partition_D(gUp));
           cute::tma_store_arrive();
         }
       }
@@ -1121,11 +1138,12 @@ cudaError_t LaunchDSwiGluGrouped(
   // tile issues TWO box-stores into it (gate column n_tile_local, up column nI_per_expert + n_tile_local).
   // Stride (2I,1) = row-major; the box layout = Config::SmemLayoutA (kEpiTileM,kEpiTileN) row-major, the
   // SAME layout sGate/sUp use → make_tma_copy builds a no-swizzle box (kEpiTileM,kEpiTileN).
-  // M1a: TMA-STORE descriptor for the output dA[M, I] (row-major, single contiguous tensor). Built ONCE
-  // over the TRUE (M, I) extent; per tile ONE box-store at (box_m, n_tile_local). (M2 will widen to [M,2I].)
+  // M2: TMA-STORE descriptor for the output dY1[M, 2I] (row-major; gate-half cols [0,I), up-half [I,2I)).
+  // Built ONCE over the TRUE (M, 2I) extent; each tile issues TWO box-stores (gate col n_tile_local, up
+  // col nI_per_expert + n_tile_local). Stride (2I,1); box = Config::SmemLayoutA (kEpiTileM,kEpiTileN).
   cute::Tensor mDY1_store = cute::make_tensor(
       cute::make_gmem_ptr(dY1),
-      cute::make_layout(cute::make_shape(M, I), cute::make_stride(I, cute::_1{})));
+      cute::make_layout(cute::make_shape(M, 2 * I), cute::make_stride(2 * I, cute::_1{})));
   auto tma_store_dy1 =
       make_tma_copy(cute::SM90_TMA_STORE{}, mDY1_store, typename Config::SmemLayoutA{});
 

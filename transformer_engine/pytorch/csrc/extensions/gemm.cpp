@@ -682,8 +682,9 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
                "te_cutlass_grouped_dswiglu: m_tile_expert must be an int32 CUDA tensor.");
     mte = m_tile_expert->data_ptr<int>();
   }
-  NVTE_CHECK(dgrad.dim() == 2 && dgrad.size(0) == M && dgrad.size(1) == I,
-             "te_cutlass_grouped_dswiglu: dgrad must be [M, I].");
+  // M2: the "dgrad" arg carries the SAVED SwiGLU input h[M,2I] (the epilogue reads gate/up from it).
+  NVTE_CHECK(dgrad.dim() == 2 && dgrad.size(0) == M && dgrad.size(1) == 2 * I,
+             "te_cutlass_grouped_dswiglu: h (passed as dgrad) must be [M, 2I].");
 
   // prob (optional): per-token router gate, fp32 [M]; epilogue forms grad = dgrad[m,:] * prob[m].
   const float* prob_ptr = nullptr;
@@ -694,7 +695,7 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
     prob_ptr = prob->data_ptr<float>();
   }
 
-  auto dY1 = at::empty({M, I}, x.options());  // M1a: [M, I] dA output (M2 will widen to [M, 2I])
+  auto dY1 = at::empty({M, 2 * I}, x.options());  // M2: [M, 2I] dY1 = dgate||dup
   cutlass_grouped_dswiglu(x.data_ptr(), w1.data_ptr(), dgrad.data_ptr(), dY1.data_ptr(),
                           /*dprob=*/nullptr, static_cast<int>(G), static_cast<int>(Me),
                           static_cast<int>(I), static_cast<int>(d), mte, static_cast<int>(M_varlen),
