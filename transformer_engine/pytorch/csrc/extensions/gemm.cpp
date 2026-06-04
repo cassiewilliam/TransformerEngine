@@ -614,7 +614,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
 // tensors -> raw ptrs + dtype -> the SM100 CUTLASS C-API cutlass_grouped_swiglu (common/gemm). The
 // kernel writes only the activated A[M, I] (silu(gate)*up), never the [M, 2I] gate||up intermediate.
 at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
-                                     std::optional<at::Tensor> m_tile_expert, int64_t G, int64_t Me,
+                                     std::optional<at::Tensor> m_tile_expert,
+                                     std::optional<at::Tensor> prob, int64_t G, int64_t Me,
                                      int64_t I, int64_t d, int64_t M_varlen, int64_t math_sm_count) {
   NVTE_CHECK(x.is_cuda() && w1.is_cuda(),
              "te_cutlass_grouped_swiglu: x and w1 must be CUDA tensors.");
@@ -635,10 +636,20 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
     mte = m_tile_expert->data_ptr<int>();
   }
 
+  // prob (optional): per-token router gate, fp32 [M]; epilogue scales A[m,:] *= prob[m].
+  const float *prob_ptr = nullptr;
+  if (prob.has_value() && prob->numel() > 0) {
+    NVTE_CHECK(prob->scalar_type() == at::kFloat && prob->is_cuda() && prob->is_contiguous(),
+               "te_cutlass_grouped_swiglu: prob must be a contiguous fp32 CUDA tensor.");
+    NVTE_CHECK(prob->numel() == M, "te_cutlass_grouped_swiglu: prob must have M entries.");
+    prob_ptr = prob->data_ptr<float>();
+  }
+
   auto A = at::empty({M, I}, x.options());  // [M, I] fused SwiGLU output
   cutlass_grouped_swiglu(x.data_ptr(), w1.data_ptr(), A.data_ptr(), static_cast<int>(G),
                          static_cast<int>(Me), static_cast<int>(I), static_cast<int>(d), mte,
-                         static_cast<int>(M_varlen), GetTransformerEngineDType(x.scalar_type()),
+                         static_cast<int>(M_varlen), prob_ptr,
+                         GetTransformerEngineDType(x.scalar_type()),
                          static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
                          at::cuda::getCurrentCUDAStream());
   return A;

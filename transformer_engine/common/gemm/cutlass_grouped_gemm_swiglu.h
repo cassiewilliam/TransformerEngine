@@ -49,8 +49,10 @@
 // linker version-script; TE marks everything else `local`). That is required so the pytorch extension
 // (a separate .so) can resolve it — the F0 cutlass_grouped_gemm stays local since it is only called
 // within the common lib.
+// prob (optional, fp32 [M] grouped-row order): per-token router gate; the epilogue scales A[m,:] *=
+// prob[m] (the real MoE SwiGLU). nullptr => no gating (byte-identical to the ungated path).
 void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int Me, int I, int d,
-                            const int *m_tile_expert, int M_varlen,
+                            const int *m_tile_expert, int M_varlen, const float *prob,
                             transformer_engine::DType dtype, int device, int math_sm_count,
                             cudaStream_t stream);
 

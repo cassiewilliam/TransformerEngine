@@ -20,11 +20,6 @@ dev = "cuda"
 x = torch.randn(M, d, dtype=dtype, device=dev) * 0.1
 w1 = torch.randn(G * 2 * I, d, dtype=dtype, device=dev) * 0.02  # [G*2I, d] gate||up stacked per expert
 
-# Fused kernel: uniform packing (m_tile_expert=None, M_varlen=0). sm_count=0 => kernel auto-detects.
-A = tex.te_cutlass_grouped_swiglu(x, w1, None, G, Me, I, d, 0, 0)  # [M, I]
-assert tuple(A.shape) == (M, I), A.shape
-assert A.dtype == dtype
-
 # fp32 reference, per expert: gate = X @ W1[:I]^T, up = X @ W1[I:2I]^T, A = silu(gate) * up
 w1v = w1.view(G, 2 * I, d).float()
 ref = torch.empty(M, I, dtype=torch.float32, device=dev)
@@ -34,10 +29,28 @@ for e in range(G):
     gate, up = h[:, :I], h[:, I:]
     ref[e * Me : (e + 1) * Me] = F.silu(gate) * up
 
-diff = (A.float() - ref).abs()
-rel = diff / (ref.abs() + 1e-3)
-n_fail = int(((diff > 5e-2) & (rel > 5e-2)).sum().item())
-max_abs = diff.max().item()
 print(f"shape M={M} I={I} d={d} G={G} dtype={dtype}")
-print(f"n_fail (abs>5e-2 AND rel>5e-2): {n_fail} / {M * I}  max_abs={max_abs:.4f}")
-print("PASS" if n_fail == 0 else "FAIL")
+ok = True
+
+
+def check(name, out, expected):
+    global ok
+    diff = (out.float() - expected).abs()
+    rel = diff / (expected.abs() + 1e-3)
+    n_fail = int(((diff > 5e-2) & (rel > 5e-2)).sum().item())
+    print(f"  {name}: n_fail {n_fail} / {M * I}  max_abs={diff.max().item():.4f}  "
+          f"{'PASS' if n_fail == 0 else 'FAIL'}")
+    ok = ok and n_fail == 0
+
+
+# (1) ungated: m_tile_expert=None, prob=None, M_varlen=0. sm_count=0 => kernel auto-detects.
+A = tex.te_cutlass_grouped_swiglu(x, w1, None, None, G, Me, I, d, 0, 0)  # [M, I]
+assert tuple(A.shape) == (M, I) and A.dtype == dtype, (A.shape, A.dtype)
+check("ungated   ", A, ref)
+
+# (2) gated: per-token router prob (fp32 [M]); kernel scales A[m,:] *= prob[m] in the epilogue.
+prob = torch.rand(M, dtype=torch.float32, device=dev) + 0.25  # avoid ~0 for a meaningful rel check
+Ap = tex.te_cutlass_grouped_swiglu(x, w1, None, prob, G, Me, I, d, 0, 0)
+check("gated(prob)", Ap, ref * prob[:, None])
+
+print("PASS" if ok else "FAIL")

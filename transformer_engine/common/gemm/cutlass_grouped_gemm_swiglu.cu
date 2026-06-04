@@ -25,7 +25,7 @@
 // Exported via the version-script whitelist (see the .h / libtransformer_engine.version) so the
 // pytorch extension can resolve this symbol across the .so boundary.
 void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int Me, int I, int d,
-                            const int *m_tile_expert, int M_varlen,
+                            const int *m_tile_expert, int M_varlen, const float *prob,
                             transformer_engine::DType dtype, int device, int math_sm_count,
                             cudaStream_t stream) {
   using namespace transformer_engine;
@@ -47,12 +47,12 @@ void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int M
         reinterpret_cast<const cutlass::bfloat16_t *>(X),
         reinterpret_cast<const cutlass::bfloat16_t *>(W1),
         reinterpret_cast<cutlass::bfloat16_t *>(A), G, Me, I, d, stream, device, math_sm_count,
-        m_tile_expert, M_varlen);
+        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);
   } else if (dtype == DType::kFloat16) {
     status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::half_t, cutlass::half_t>(
         reinterpret_cast<const cutlass::half_t *>(X), reinterpret_cast<const cutlass::half_t *>(W1),
         reinterpret_cast<cutlass::half_t *>(A), G, Me, I, d, stream, device, math_sm_count,
-        m_tile_expert, M_varlen);
+        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);
   } else {
     NVTE_ERROR("cutlass_grouped_swiglu: only BF16 and FP16 are supported.");
   }

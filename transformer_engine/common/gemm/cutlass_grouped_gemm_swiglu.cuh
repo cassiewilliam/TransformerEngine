@@ -412,6 +412,12 @@ struct Sm100SwiGluKernel {
     const int* m_gather_idx = nullptr;  // [M] grouped-row -> source-row; nullptr => contiguous path
     TMA_X_GATHER tma_load_x_gather;     // gather descriptor over the unpermuted X [T_src_gather, d]
     int T_src_gather = 0;               // row extent of the unpermuted source X (== M for pure permute)
+    // ---- PROB (per-token router gate, optional) -----------------------------------------------
+    // Real MoE SwiGLU scales the activation by the token's routing probability:
+    //   A[m, :] = prob[m] * silu(gate[m]) * up[m]    (the prob_tensor of the cuTe-DSL FP8 ref).
+    // prob != nullptr => fp32 array of length M (grouped-row order, same row index as A); the epilogue
+    // multiplies each output row by prob[m]. nullptr => no gating (byte-identical to the validated path).
+    const float* prob = nullptr;
   };
 
   // ---- device entry ----
@@ -997,16 +1003,24 @@ struct Sm100SwiGluKernel {
         // are clamped by the TMA-store descriptor's box (it never writes past the (M,N) extent).
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(rGate); ++i) {
+          int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
+          int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
 #if defined(SWIGLU_DEBUG_RAW_GATE)
           ElementOut rA =
               static_cast<ElementOut>(rGate(i));  // ISOLATION: raw gate acc (= X·W1[0:I]ᵀ)
 #elif defined(SWIGLU_DEBUG_RAW_UP)
           ElementOut rA = static_cast<ElementOut>(rUp(i));  // ISOLATION: raw up acc (= X·W1[I:2I]ᵀ)
 #else
-          ElementOut rA = static_cast<ElementOut>(silu(rGate(i)) * rUp(i));
+          ElementAcc act = silu(rGate(i)) * rUp(i);
+          // PROB: per-token router gate. The grouped-row m (== A's global row) = lrow + cta_row_offset.
+          // Guard grow<M so a partial/OOB tile row (clamped away by the TMA-store box) never reads prob
+          // out of bounds. prob==nullptr => no scaling (byte-identical to the validated kernel).
+          if (params.prob != nullptr) {
+            const int grow = lrow + cta_row_offset;
+            if (grow < params.M) act *= params.prob[grow];
+          }
+          ElementOut rA = static_cast<ElementOut>(act);
 #endif
-          int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
-          int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
           sA(lrow, lcol) = rA;
         }
 
@@ -1112,7 +1126,10 @@ cudaError_t LaunchSwiGluGrouped(
     // row in the UNPERMUTED X[T_src,d]; the LOAD warp then gathers X rows directly via TMA gather4 (no
     // moe_permute).  nullptr => the CURRENT contiguous X path is used (byte-identical to the validated
     // kernel).  T_src = the row extent of the unpermuted source X (defaults to M, i.e. a pure permute).
-    const int* d_m_gather_idx = nullptr, int T_src = 0) {
+    const int* d_m_gather_idx = nullptr, int T_src = 0,
+    // PROB (optional): per-token router gate, fp32 [M] in grouped-row order; the epilogue scales
+    // A[m,:] *= prob[m]. nullptr => no gating (byte-identical to the validated kernel).
+    const float* d_prob = nullptr) {
   using Config = SwiGluConfig<Element, ElementOut, TileM_, TileN_, TileK_, kStages_, ClusterM_,
                               MinBlocks_, AccStages_>;
   using Kernel = Sm100SwiGluKernel<Config>;
@@ -1198,6 +1215,7 @@ cudaError_t LaunchSwiGluGrouped(
   params.m_gather_idx = d_m_gather_idx;    // F1 gather index (nullptr => contiguous X path, unchanged)
   params.tma_load_x_gather = tma_load_x_gather;  // gather descriptor over the unpermuted X [T_src,d]
   params.T_src_gather = T_src_eff;               // unpermuted source row extent
+  params.prob = d_prob;                          // per-token router gate (nullptr => no gating)
 
   // Logical tile grid: m_tile spans ALL experts' tokens (num_m_tiles = G*Me/kTileM); n_tile_local spans
   // ONE expert's output width (I/kTileN).  total_tiles = num_m_tiles * num_n_local_tiles is the LOGICAL
