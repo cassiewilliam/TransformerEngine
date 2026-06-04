@@ -223,45 +223,26 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # multiple of 256 before this kernel + FC2, then unpad (slice) the FC2
         # output back to the original token layout. Until then the dispatcher
         # must hand us already-padded (mod-256) per-expert counts.
-        split_sizes_int = [int(s) for s in split_sizes.tolist()]
-        for e, n_tok in enumerate(split_sizes_int):
-            if n_tok % _CUTLASS_TILE_M != 0:
-                raise ValueError(
-                    f"{self.__class__.__name__}: expert {e} has {n_tok} tokens, which is "
-                    f"not a multiple of TileM={_CUTLASS_TILE_M}. The CUTLASS fused-SwiGLU "
-                    "kernel requires each expert's token count to be 256-aligned. Pad "
-                    "tokens upstream (SonicMoE token-rounding) before the fused MoE op."
-                )
-
-        # --- Build m_tile_expert / M_varlen for the CUTLASS kernel ------------
-        # Uniform-M fast path: when every expert has exactly Me = M/G tokens we
-        # pass m_tile_expert=None and M_varlen=0 (kernel derives the layout from
-        # G, Me). This matches the validated binding's ungated/gated calls
-        # (qa/te_cutlass_swiglu_test.py:47,53).
-        uniform = M % G == 0 and all(n == split_sizes_int[0] for n in split_sizes_int)
-        if uniform and split_sizes_int[0] > 0:
-            Me = split_sizes_int[0]
-            m_tile_expert = None
-            M_varlen = 0
-        else:
-            # Varlen-M path: map each 256-row m-tile to its expert id (int32
-            # CUDA [ceil(M/256)]). Because every expert count is a multiple of
-            # 256 (asserted above), expert boundaries fall on tile boundaries.
-            Me = M // G if (M % G == 0) else 0  # unused by kernel when m_tile_expert!=None
-            num_tiles = (M + _CUTLASS_TILE_M - 1) // _CUTLASS_TILE_M
-            tile_expert = torch.empty(num_tiles, dtype=torch.int32, device=device)
-            tile = 0
-            for e, n_tok in enumerate(split_sizes_int):
-                e_tiles = n_tok // _CUTLASS_TILE_M
-                if e_tiles > 0:
-                    tile_expert[tile : tile + e_tiles] = e
-                    tile += e_tiles
-            # Any trailing tiles (should not happen given the mod-256 assert)
-            # default to the last expert.
-            if tile < num_tiles:
-                tile_expert[tile:num_tiles] = max(num_groups - 1, 0)
-            m_tile_expert = tile_expert
-            M_varlen = M
+        # --- Build m_tile_expert ON-DEVICE (no host sync) --------------------
+        # ALIGNED with forward_grouped_mlp.py, which keeps the per-expert offsets
+        # on-device (split_points, ~:203) and never reads them to host. Each
+        # expert e contributes split_e//256 m-tiles, all tagged expert id e
+        # (varlen-M). repeat_interleave with output_size=ceil(M/256) does NOT
+        # sync, and it enforces 256-alignment loudly: if any split is not a
+        # multiple of 256, sum(split//256) != ceil(M/256) and it raises (no
+        # silent mis-handling). The previous version read split_sizes.tolist()
+        # (a ~21us CPU<->GPU sync) + looped on the host -- removed.
+        # TODO(sonic-moe): a Ptr-Array W1 kernel could take the per-expert
+        # offsets directly (like the reference's padded_offsets) and skip this.
+        num_tiles = (M + _CUTLASS_TILE_M - 1) // _CUTLASS_TILE_M
+        tiles_per_expert = torch.div(split_sizes, _CUTLASS_TILE_M, rounding_mode="floor")
+        m_tile_expert = torch.repeat_interleave(
+            torch.arange(num_groups, device=device, dtype=torch.int32),
+            tiles_per_expert,
+            output_size=num_tiles,
+        )
+        M_varlen = M
+        Me = 0  # unused by the kernel in varlen-M mode (m_tile_expert != None)
 
         # --- FC1 (up-proj) + SwiGLU via the CUTLASS kernel --------------------
         # w1: bf16 [G*2I, d] per-expert gate||up stacked. The GroupedLinear
@@ -366,8 +347,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     # ----------------------------------------------------------------------
     # Helpers (bf16-only; the reference inlines these with fp8 packing).
     # ----------------------------------------------------------------------
-    @staticmethod
     def _get_fc1_weight_2d(
+        self,
         fc1_op: GroupedLinear,
         num_groups: int,
         fc1_weight_shape: tuple[int, int],
@@ -380,22 +361,32 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         """
         out_features, in_features = fc1_weight_shape
         if fc1_op.single_grouped_weight:
-            # Single GroupedTensor param: rowwise_data is the packed
-            # [G, 2I, d] (== [G*2I, d]) bf16 buffer.
+            # ALIGNED with the reference (forward_grouped_mlp.py:365-368): the packed
+            # [G, 2I, d] buffer is reused as a VIEW -> [G*2I, d]. No copy (the buffer is
+            # already contiguous so .view() suffices; the old .contiguous() was a no-op).
             if not isinstance(fc1_op.weight, GroupedTensor):
                 raise RuntimeError(
                     "FC1 expected GroupedTensor weight with single_grouped_weight=True."
                 )
             w = maybe_dequantize(fc1_op.weight.rowwise_data, dtype)
-            return w.view(num_groups * out_features, in_features).contiguous()
-        # Per-expert params: stack [G, 2I, d] -> [G*2I, d].
-        weights = [
-            maybe_dequantize(getattr(fc1_op, f"weight{idx}"), dtype) for idx in range(num_groups)
-        ]
-        return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
+            return w.view(num_groups * out_features, in_features)
+        # Per-expert params: the kernel needs ONE contiguous [G*2I, d] buffer, so we
+        # stack. The reference avoids this with a device pointer array, but our kernel
+        # uses a single W1 TMA descriptor. CACHE the stack keyed on the source weights'
+        # (id, _version): weights are constant across micro-batches, so the 134MB copy
+        # only re-runs when the optimizer updates them in-place (bumps _version).
+        weight_params = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
+        key = tuple((id(w), w._version) for w in weight_params)
+        cache = getattr(self, "_fc1_w_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        stacked = torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
+        self._fc1_w_cache = (key, stacked)
+        return stacked
 
-    @staticmethod
     def _get_fc2_weight(
+        self,
         fc2_op: GroupedLinear,
         num_groups: int,
         fc2_weight_shape: tuple[int, int],
@@ -409,27 +400,38 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         (grouped_linear.py:791-804), producing a [G*out, in] packed buffer.
         """
         out_features, in_features = fc2_weight_shape
+
+        def _make_grouped(weight_data: torch.Tensor) -> GroupedTensor:
+            return GroupedTensor(
+                shape=(num_groups * out_features, in_features),
+                dtype=dtype,
+                num_tensors=num_groups,
+                shapes=[(out_features, in_features)] * num_groups,
+                quantizer=None,
+                data=weight_data,
+            )
+
         if fc2_op.single_grouped_weight:
+            # ALIGNED with the reference: reuse the packed buffer as a view (no copy).
             if not isinstance(fc2_op.weight, GroupedTensor):
                 raise RuntimeError(
                     "FC2 expected GroupedTensor weight with single_grouped_weight=True."
                 )
             w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
-            weight_data = w.reshape(-1)
-        else:
-            weights = [
-                maybe_dequantize(getattr(fc2_op, f"weight{idx}"), dtype)
-                for idx in range(num_groups)
-            ]
-            weight_data = torch.stack(weights, dim=0).contiguous().reshape(-1)
-        return GroupedTensor(
-            shape=(num_groups * out_features, in_features),
-            dtype=dtype,
-            num_tensors=num_groups,
-            shapes=[(out_features, in_features)] * num_groups,
-            quantizer=None,
-            data=weight_data,
-        )
+            return _make_grouped(w.reshape(-1))
+        # Per-expert: stack + wrap. CACHE the GroupedTensor keyed on the source weights'
+        # (id, _version) -- the FC2 weight GroupedTensor depends only on the weights (not
+        # the splits), so it rebuilds only when the optimizer updates them.
+        weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+        key = tuple((id(w), w._version) for w in weight_params)
+        cache = getattr(self, "_fc2_w_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        weight_data = torch.stack(weights, dim=0).contiguous().reshape(-1)
+        gt = _make_grouped(weight_data)
+        self._fc2_w_cache = (key, gt)
+        return gt
 
     @staticmethod
     def _save_backward_ctx(
