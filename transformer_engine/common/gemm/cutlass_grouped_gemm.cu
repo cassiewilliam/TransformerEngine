@@ -142,6 +142,56 @@ void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* 
   }
 }
 
+// SonicMoE: CUTLASS grouped GEMM driven by the grouped-tensor path's on-device per-expert arrays.
+// Mirrors cutlass_grouped_gemm's dtype/arch/transpose dispatch (incl. the CUTLASS-A=B operand swap),
+// but forwards device pointer/dim arrays to CutlassGroupedGemmDevice (no host pointer loop / memcpy).
+void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptrs, const int *m_arr,
+                                      const int *n_arr, const int *k_arr, int avg_k, int num_gemms,
+                                      bool transa, bool transb, transformer_engine::DType dtype,
+                                      void *workspace_ptr, size_t workspace_bytes, float alpha,
+                                      float beta, int avg_m, int avg_n, int device, int math_sm_count,
+                                      cudaStream_t stream) {
+  using namespace transformer_engine;
+  int sm_major = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+  const bool sm100 = (sm_major == 10);
+
+  auto run = [&](auto tag, auto sm100_tag) {
+    using T = decltype(tag);
+    constexpr bool S = decltype(sm100_tag)::value;
+    // CUTLASS-A = B operand, CUTLASS-B = A operand (matches cutlass_grouped_gemm's swap above).
+    if (!transa && !transb) {
+      grouped_gemm::CutlassGroupedGemmDevice<false, false, T, S>(
+          B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
+          workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
+    } else if (!transb && transa) {
+      grouped_gemm::CutlassGroupedGemmDevice<false, true, T, S>(
+          B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
+          workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
+    } else if (transb && !transa) {
+      grouped_gemm::CutlassGroupedGemmDevice<true, false, T, S>(
+          B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
+          workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
+    } else {
+      NVTE_ERROR("Layout 'TT' is not supported by cutlass_grouped_gemm_device_ptrs.");
+    }
+  };
+  auto dispatch = [&](auto tag) {
+    if (sm100) {
+      run(tag, std::true_type{});
+    } else {
+      run(tag, std::false_type{});
+    }
+  };
+  if (dtype == DType::kBFloat16) {
+    dispatch(cutlass::bfloat16_t{});
+  } else if (dtype == DType::kFloat16) {
+    dispatch(cutlass::half_t{});
+  } else {
+    NVTE_ERROR("cutlass_grouped_gemm_device_ptrs: only BF16/FP16 are supported.");
+  }
+}
+
 namespace {
 
 // Zero-initialize empty (K=0) groups (when not accumulating) and forward the non-empty groups to

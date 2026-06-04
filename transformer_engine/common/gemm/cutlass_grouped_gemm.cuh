@@ -216,14 +216,17 @@ static char* getHostWorkspace() {
   static std::shared_ptr<char> workspace;
 
   std::call_once(flag, [&]() {
-    workspace =
-        std::shared_ptr<char>(reinterpret_cast<char*>(std::malloc(kCPUWorkSpaceSize)), [](char* p) {
-          if (p) std::free(p);
-        });
-
-    if (!workspace) {
+    // PINNED (page-locked) host memory. The per-expert pointer/problem-size arrays staged here are
+    // copied to device via cudaMemcpyAsync; from PAGEABLE memory that copy implicitly SYNCHRONIZES
+    // (it stages through an internal pinned bounce buffer), blocking the host ~29us/call. Pinning
+    // makes the H2D copy truly asynchronous, removing that per-call CPU stall.
+    char* raw = nullptr;
+    if (cudaMallocHost(reinterpret_cast<void**>(&raw), kCPUWorkSpaceSize) != cudaSuccess || !raw) {
       throw std::bad_alloc();
     }
+    workspace = std::shared_ptr<char>(raw, [](char* p) {
+      if (p) cudaFreeHost(p);
+    });
   });
 
   return workspace.get();
@@ -345,6 +348,110 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   // Execute the kernel in the current stream.
   if (gemm.run(stream) != cutlass::Status::kSuccess) {
     NVTE_ERROR("Failed to run CUTLASS Grouped GEMM with ", num_gemms, " GEMMs");
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// SonicMoE: CUTLASS grouped GEMM driven by the GROUPED-TENSOR path's ON-DEVICE per-expert arrays
+// (A_ptrs/B_ptrs/D_ptrs + d_rows/d_cols from setup_grouped_gemm_kernel). Unlike CutlassGroupedGemm,
+// this builds NO host-side pointer/problem arrays and issues NO cudaMemcpyAsync of them -- that host
+// loop + pageable H2D copy is exactly the ~115us/call CPU stall on the discrete path. Here the per-
+// expert pointers are already on device, and the per-expert problem sizes + strides are packed on
+// device by the small cutlass_pack_device_args kernel. problem_sizes_host is filled with the AVERAGE
+// (avg_m, avg_n, K): the GroupProblemShape *host* pointer only sizes the launch/scheduler estimate
+// (whose TOTAL is correct = num*avg), while the per-tile work reads the exact *device* problem sizes
+// -> no D2H sync. M = d_rows (output rows), N = d_cols (output cols), K = uniform contraction.
+template <typename ProblemShapeT, typename LayoutA, typename LayoutB, typename LayoutC>
+__global__ void cutlass_pack_device_args(int num, const int* m_arr, const int* n_arr,
+                                         const int* k_arr, ProblemShapeT* problems, int64_t* lda,
+                                         int64_t* ldb, int64_t* ldc) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num) return;
+  const int m = m_arr[i];
+  const int n = n_arr[i];
+  const int k = k_arr[i];  // exact per-expert contraction (NOT config.avg_k, which is the cuBLAS hint).
+  problems[i] = ProblemShapeT(m, n, k);
+  // Mirror CutlassGroupedGemm's host stride computation (int64 leading dim, reinterpreted as Stride*).
+  lda[i] = LayoutA::packed({m, k}).stride(0);
+  ldb[i] = LayoutB::packed({k, n}).stride(0);
+  ldc[i] = LayoutC::packed({m, n}).stride(0);
+}
+
+template <bool trans_a, bool trans_b, typename Element, bool kSm100 = false>
+void CutlassGroupedGemmDevice(void** A_ptrs, void** B_ptrs, void** D_ptrs, const int* m_arr,
+                              const int* n_arr, const int* k_arr, int avg_k, int num_gemms,
+                              void* workspace_ptr_raw, size_t workspace_bytes, float alpha, float beta,
+                              int avg_m, int avg_n, cudaStream_t stream, int device,
+                              int math_sm_count) {
+  using Gemm = GemmGrouped<Element, trans_a, trans_b, kSm100>;
+  using LayoutA = typename Gemm::LayoutA;
+  using LayoutB = typename Gemm::LayoutB;
+  using LayoutC = typename Gemm::LayoutC;
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementC = typename Gemm::ElementC;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+
+  typename Gemm::Arguments arguments;
+  size_t kernel_workspace_size = Gemm::get_workspace_size(arguments);
+  auto gemm_coord_size = getGemmCoordSize(num_gemms);
+  auto ldd_size = getLddSize(num_gemms);
+  // Device param workspace: problem_sizes + 3 stride arrays. NO pointer arrays (the on-device A/B/D
+  // pointer arrays from the grouped setup are passed straight through to CUTLASS).
+  auto param_workspace_size = gemm_coord_size + 3 * ldd_size;
+  auto total_workspace_size = param_workspace_size + kernel_workspace_size;
+
+  NVTE_CHECK(total_workspace_size < workspace_bytes,
+             "Insufficient workspace for CUTLASS device grouped GEMM: required=",
+             static_cast<int64_t>(total_workspace_size),
+             ", available=", static_cast<int64_t>(workspace_bytes));
+  char* workspace_ptr = reinterpret_cast<char*>(workspace_ptr_raw);
+
+  // problem_sizes_host = AVERAGE estimate (no per-expert host build, no D2H sync).
+  char* host_workspace = getHostWorkspace();
+  ProblemShapeType* problem_sizes_host = reinterpret_cast<ProblemShapeType*>(host_workspace);
+  for (int i = 0; i < num_gemms; i++) {
+    // K does not affect the grouped scheduler's tile count (= M/tileM * N/tileN), so the avg-K host
+    // estimate is harmless; the exact per-expert K drives the mainloop via problem_sizes_device.
+    problem_sizes_host[i] = ProblemShapeType(avg_m, avg_n, avg_k);
+  }
+
+  // Device param arrays (packed on device below).
+  ProblemShapeType* problem_sizes_device = reinterpret_cast<ProblemShapeType*>(workspace_ptr);
+  int64_t* lda64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 0 * ldd_size);
+  int64_t* ldb64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 1 * ldd_size);
+  int64_t* ldc64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 2 * ldd_size);
+
+  constexpr int kBlock = 128;
+  int grid = (num_gemms + kBlock - 1) / kBlock;
+  cutlass_pack_device_args<ProblemShapeType, LayoutA, LayoutB, LayoutC>
+      <<<grid, kBlock, 0, stream>>>(num_gemms, m_arr, n_arr, k_arr, problem_sizes_device, lda64,
+                                    ldb64, ldc64);
+
+  StrideA* lda = reinterpret_cast<StrideA*>(lda64);
+  StrideB* ldb = reinterpret_cast<StrideB*>(ldb64);
+  StrideC* ldc = reinterpret_cast<StrideC*>(ldc64);
+  const ElementA** ptr_A = const_cast<const ElementA**>(reinterpret_cast<ElementA**>(A_ptrs));
+  const ElementB** ptr_B = const_cast<const ElementB**>(reinterpret_cast<ElementB**>(B_ptrs));
+  ElementC** ptr_C = reinterpret_cast<ElementC**>(D_ptrs);
+
+  char* kernel_workspace_ptr = workspace_ptr + param_workspace_size;
+
+  arguments = MakeArguments<Gemm, ElementA, ElementB, ElementC, StrideA, StrideB, StrideC>(
+      num_gemms, problem_sizes_host, problem_sizes_device, ptr_A, lda, ptr_B, ldb, ptr_C, ldc, alpha,
+      beta, device, math_sm_count);
+
+  Gemm gemm;
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device grouped GEMM: can_implement failed (", num_gemms, " groups)");
+  }
+  if (gemm.initialize(arguments, kernel_workspace_ptr) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device grouped GEMM: initialize failed (", num_gemms, " groups)");
+  }
+  if (gemm.run(stream) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device grouped GEMM: run failed (", num_gemms, " groups)");
   }
 }
 
@@ -594,3 +701,13 @@ void cutlass_grouped_gemm_varlen_k(const NVTETensor* A, const NVTETensor* B, NVT
                                    int num_gemms, bool transa, bool transb, bool grad,
                                    NVTETensor* workspace, bool accumulate, int device,
                                    int math_sm_count, cudaStream_t stream);
+
+// SonicMoE: CUTLASS grouped GEMM from the grouped-tensor path's ON-DEVICE per-expert arrays (no host
+// pointer loop, no cudaMemcpyAsync). A_ptrs/B_ptrs/D_ptrs and m_arr(=d_rows)/n_arr(=d_cols) are device
+// pointers from setup_grouped_gemm_kernel; K/avg_m/avg_n are host scalars (uniform contraction / averages).
+void cutlass_grouped_gemm_device_ptrs(void** A_ptrs, void** B_ptrs, void** D_ptrs, const int* m_arr,
+                                      const int* n_arr, const int* k_arr, int avg_k, int num_gemms,
+                                      bool transa, bool transb, transformer_engine::DType dtype,
+                                      void* workspace_ptr, size_t workspace_bytes, float alpha,
+                                      float beta, int avg_m, int avg_n, int device, int math_sm_count,
+                                      cudaStream_t stream);
