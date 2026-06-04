@@ -22,6 +22,8 @@
 #include "cutlass_grouped_gemm_swiglu.cuh"  // LaunchSwiGluGrouped<Element, ElementOut> (templated)
 #include "cutlass_grouped_gemm_swiglu.h"    // the clean C-API declaration (signature match)
 
+// Exported via the version-script whitelist (see the .h / libtransformer_engine.version) so the
+// pytorch extension can resolve this symbol across the .so boundary.
 void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int Me, int I, int d,
                             const int *m_tile_expert, int M_varlen,
                             transformer_engine::DType dtype, int device, int math_sm_count,
@@ -41,13 +43,13 @@ void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int M
   // = M_varlen. nullptr => uniform M = G*Me (M_varlen unused). The .cuh launcher reads this identically.
   cudaError_t status = cudaErrorInvalidValue;
   if (dtype == DType::kBFloat16) {
-    status = LaunchSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t>(
+    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t>(
         reinterpret_cast<const cutlass::bfloat16_t *>(X),
         reinterpret_cast<const cutlass::bfloat16_t *>(W1),
         reinterpret_cast<cutlass::bfloat16_t *>(A), G, Me, I, d, stream, device, math_sm_count,
         m_tile_expert, M_varlen);
   } else if (dtype == DType::kFloat16) {
-    status = LaunchSwiGluGrouped<cutlass::half_t, cutlass::half_t>(
+    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::half_t, cutlass::half_t>(
         reinterpret_cast<const cutlass::half_t *>(X), reinterpret_cast<const cutlass::half_t *>(W1),
         reinterpret_cast<cutlass::half_t *>(A), G, Me, I, d, stream, device, math_sm_count,
         m_tile_expert, M_varlen);

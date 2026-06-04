@@ -8,6 +8,7 @@ Run inside the built TE container on a clean GPU:
 
 import torch
 import torch.nn.functional as F
+import transformer_engine  # noqa: F401 — loads libtransformer_engine.so (RTLD_GLOBAL) so tex resolves
 import transformer_engine_torch as tex
 
 torch.manual_seed(0)

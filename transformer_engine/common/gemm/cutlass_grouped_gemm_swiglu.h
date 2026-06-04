@@ -44,6 +44,11 @@
 //
 // SM100 ONLY: the kernel is a 2-SM (cta_group::2) tcgen05 warp-specialized schedule. The caller is
 // responsible for arch gating (NVTE_USE_SONIC_MOE + is_blackwell); this entry NVTE_CHECKs SM major==10.
+//
+// EXPORT: this symbol is whitelisted in transformer_engine/common/libtransformer_engine.version (the
+// linker version-script; TE marks everything else `local`). That is required so the pytorch extension
+// (a separate .so) can resolve it — the F0 cutlass_grouped_gemm stays local since it is only called
+// within the common lib.
 void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int Me, int I, int d,
                             const int *m_tile_expert, int M_varlen,
                             transformer_engine::DType dtype, int device, int math_sm_count,
