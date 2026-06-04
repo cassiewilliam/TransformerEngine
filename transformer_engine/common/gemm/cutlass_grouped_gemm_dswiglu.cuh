@@ -1,25 +1,27 @@
 /***************************************************************************************************
- * B1 dH-overlap — SwiGLU-fused MoE up-proj BACKWARD grouped GEMM (SM100 tcgen05, dual TMEM acc).
- *   Recomputes h = X·W1ᵀ = [gate || up] in TMEM (exactly the forward route#2 mainloop) and, in the
- *   epilogue, applies the SwiGLU BACKWARD fused with the recompute — h is NEVER materialized to HBM:
+ * B2 — SwiGLU-fused MoE DOWN-proj BACKWARD grouped GEMM (SM100 tcgen05, SINGLE TMEM acc).
+ *   Computes dA = dY · W2ᵀ in TMEM (the FC2 dgrad) and, in the epilogue, reads the SAVED SwiGLU input
+ *   h = [gate || up] and applies the SwiGLU BACKWARD — h is READ from HBM (NOT recomputed):
  *     grad[m,i] = dA[m,i] · prob[m]                         (grad wrt the (pre-prob) SwiGLU output)
- *     dY1[m, i]      = grad · up · silu'(gate)              (gate-half of dh, cols [0, I))
- *     dY1[m, I + i]  = grad · silu(gate)                    (up-half  of dh, cols [I, 2I))
- *   Backward counterpart of cutlass_grouped_gemm_swiglu.cuh. It REPLACES the per-op fallback (a
- *   separate recompute grouped-GEMM h=X·W1ᵀ → HBM, then a dswiglu kernel, then a swiglu recompute for
- *   dprob): the recompute now runs at the fast fused rate and h stays in TMEM. The router-prob
- *   gradient dprob = <dA, silu(gate)·up> is computed CHEAPLY OUTSIDE this kernel from the saved
- *   forward output A (= prob·silu(gate)·up): dprob = <dA, A>/prob (prob>0 for routed tokens).
+ *     dY1[m, i]      = grad · up · silu'(gate)              (dgate-half of dh, cols [0, I))
+ *     dY1[m, I + i]  = grad · silu(gate)                    (dup-half  of dh, cols [I, 2I))
+ *   APPROACH A: W2 is fed TRANSPOSED (W2ᵀ [G·I,d], expert-in-N) so the GEMM is STRUCTURALLY IDENTICAL
+ *   to the forward up-proj (X·W1ᵀ): A=dY[M,d] RowMajor, B=W2ᵀ[G·I,d] K-contiguous (LayoutB=ColumnMajor).
+ *   This REUSES the forward's proven >graph-safe structure and avoids the expert-in-K B-operand crux.
+ *   The W2ᵀ transpose is cached on the FC2 weight (id,version) — amortized over grad-accum. The router-
+ *   prob gradient dprob = <dA, silu(gate)·up> is computed OUTSIDE this kernel for now (M2b will fuse it
+ *   as an in-epilogue colvec-reduce).
  *
- * STATUS: B1 v1 — single-launch GROUPED (multi-expert) device kernel (this file).
- *   §2.3 Sm100DSwiGluKernel  : Load + MMA are BYTE-IDENTICAL to the forward (recompute h into the two
- *           gate/up TMEM accumulators); ONLY the epilogue differs (dswiglu + dA-read + 2-wide dY1 store).
- *           GROUPED: the expert is DERIVED FROM THE M-TILE (tokens contiguous by expert), so ONE X
- *           TMA desc over [G*Me,d] + ONE W1 TMA desc over [G*2I,d] suffice (no ptr arrays / tensormap
- *           swaps); gate/up are the two per-expert N-tile slices of the SAME W1 descriptor.
+ * STATUS: B2 — single-launch GROUPED (multi-expert) device kernel (this file).
+ *   §2.3 Sm100DSwiGluKernel  : Load + MMA mirror the forward — ONE A=dY + ONE B=W2ᵀ into ONE dA TMEM
+ *           accumulator (SINGLE GEMM, no gate/up split); ONLY the epilogue differs (read saved h →
+ *           dswiglu-bwd → 2-wide dY1 store). GROUPED: the expert is DERIVED FROM THE M-TILE (tokens
+ *           contiguous by expert), so ONE X TMA desc over [G*Me,d] + ONE W2ᵀ TMA desc over [G·I,d]
+ *           suffice (no ptr arrays / tensormap swaps); expert e = the N-rows [e·I, (e+1)·I) of W2ᵀ.
  *   §2.4  LaunchDSwiGluGrouped      : grouped host launcher (2 TMA load descs + 1 TMA store desc over
- *           dY1[M,2I], single cluster-launch).  Extra input vs the forward: dA[M,I]; wider [M,2I] output.
- *   SCOPE: contiguous stacked MoE; X:[G*Me,d], W1:[G*2I,d], dA:[G*Me,I], dY1:[G*Me,2I]; N=I,K=d.
+ *           dY1[M,2I], single cluster-launch).  Inputs: dY[M,d], W2ᵀ[G·I,d], SAVED h[M,2I]; wider
+ *           [M,2I] output dY1 = dgate||dup.
+ *   SCOPE: contiguous stacked MoE; dY:[G*Me,d], W2ᵀ:[G·I,d], h:[G*Me,2I], dY1:[G*Me,2I]; N=I,K=d.
  *          Assumes Me % kTileM == 0 and I % kTileN == 0 (non-uniform Me ⇒ per-expert prefix-sum arrays).
  *
  * Patterned on (all file:line are this repo's bundled CUTLASS 4.2.0):
@@ -71,9 +73,9 @@ using ProblemShapeType = cute::Shape<int, int, int>;  // (M=tokens, N=I, K=d)
 using ProblemShape = cutlass::gemm::GroupProblemShape<ProblemShapeType>;
 
 // ============================================================================================
-// §2.1 · Type config — reuse the FINAL SM100 2-SM schedule of cutlass_grouped_gemm.cuh, but with
-//        N-tile = 128 (NOT 256): two fp32 accumulators must share the 512-col TMEM. We instantiate
-//        ONE CollectiveMma type-provider and use its TiledMma twice (gate, up) at two TMEM offsets.
+// §2.1 · Type config — reuse the FINAL SM100 2-SM schedule of cutlass_grouped_gemm.cuh. We instantiate
+//        ONE CollectiveMma type-provider and use its TiledMma ONCE into a SINGLE dA TMEM accumulator
+//        (the GEMM dA = dY·W2ᵀ); the gate/up split is an EPILOGUE concern (output dY1), not the GEMM.
 //
 // BUILDER CHOICE (P1 Step-2): for SINGLE-EXPERT we use the NON-ptr-array schedule
 // KernelTmaWarpSpecialized2SmSm100 (not KernelPtrArrayTmaWarpSpecialized2SmSm100).  Rationale:
@@ -96,7 +98,7 @@ template <typename Element_ /*bf16/fp16*/, typename ElementOut_ /*bf16/fp16*/, i
 struct DSwiGluConfig {
   static_assert(ClusterM_ == 1 || ClusterM_ == 2, "ClusterM_ must be 1 (1-SM) or 2 (2-SM)");
 
-  using Element = Element_;  // X and W1 element
+  using Element = Element_;  // X(=dY) and W2ᵀ element (bf16/fp16)
   using ElementAcc = float;  // fp32 accumulate (required)
   using ElementOut = ElementOut_;
 
@@ -110,14 +112,14 @@ struct DSwiGluConfig {
   // W2ᵀ transpose is done in Python and cached on the FC2 weight (id,version) — amortized over grad-accum.
   using LayoutX =
       cutlass::layout::RowMajor;  // A operand = dY (M,K)=(tokens,d): RowMajor ⇒ K-contiguous ✓
-  using LayoutW1 = cutlass::layout::ColumnMajor;  // B operand = W2ᵀ (N,K)=(I,d): K-contiguous (like W1)
+  using LayoutW2t = cutlass::layout::ColumnMajor;  // B operand = W2ᵀ (N,K)=(I,d): K-contiguous (like W1)
   using LayoutA = cutlass::layout::RowMajor;      // output dA[M,I] (M1a passthrough) / dY1[M,2I] (M2)
 
   static constexpr int AlignX = 128 / cutlass::sizeof_bits<Element>::value;     // 8 (bf16)
-  static constexpr int AlignW1 = 128 / cutlass::sizeof_bits<Element>::value;    // 8
+  static constexpr int AlignW2t = 128 / cutlass::sizeof_bits<Element>::value;    // 8
   static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementOut>::value;  // 8
 
-  // N=128 (vs base 256) so two acc fit 512-col TMEM (see P1 draft §3 #1). Single-stage acc.
+  // Single dA accumulator (TileN cols); the old dual gate+up rationale (2 acc in 512-col TMEM) is gone.
   // P1 Step-2 CORRECTNESS SPIKE uses 1-SM (ClusterShape (1,1,1), TileShape M=128 = single CTA tile):
   // the 1-SM accumulator is the standard layout the FMHA TMEM-read pattern (this kernel's template) is
   // PROVEN correct on. The 2-SM accumulator's V-mode layout scrambled the read (spike rounds 1-9). 2-SM
@@ -130,7 +132,7 @@ struct DSwiGluConfig {
   // 2-SM (all cycling bugs fixed). Small TileN/TileK + large TileM (capped at 256 for 2-SM = 128 TMEM
   // datapaths × 2 CTAs). Small N/K tiles shrink per-stage smem → many more pipeline stages (the lever
   // that works: kStages 2→3 gave +11%; TileN=256 was WORSE for losing stages). TileN=64,TileK=16 →
-  // per-stage = X(256×16=8KB)+2×W1(64×16=2KB)=12KB → kStages=8 → 96KB « 228KB (room for even more).
+  // per-stage = X(256×16=8KB)+1×W2ᵀ(64×16=2KB)=10KB → kStages=8 → 80KB « 228KB (room for even more).
   // TUNED OPTIMUM: TileM=256 (2-SM max), TileN=64 (sweet spot — 128 loses pipeline stages, 32 collapses
   // MMA efficiency), TileK=16. With kStages=16 → 344 TFLOPS at the user shape (M=16384,I=512,K=2048),
   // +18% vs the untuned 292; +15-31% on M-large/N-K-small shapes.
@@ -144,7 +146,8 @@ struct DSwiGluConfig {
       std::conditional_t<ClusterM_ == 2, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
                          cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>;
   static_assert(2 * cute::size<1>(TileShape{}) <= 512,
-                "gate+up accumulators must fit 512-col TMEM");
+                "TileN<=256: the single dA accumulator (kAccStages*TileN cols) must leave room for "
+                "2-stage double-buffering in 512-col TMEM");
 
   // Pipeline depth (tunable via kStages_; default 16 = the clean 398-TFLOPS config). TileN=64,TileK=16
   // → ~8KB/stage; the smem static_assert below guards against exceeding the 228KB SM100 capacity.
@@ -153,38 +156,39 @@ struct DSwiGluConfig {
   // Launch-bounds MinBlocksPerMultiprocessor hint, read by the kernel (default 1). The warpgroup
   // reg-reconfig (wg0 dealloc<40> → wg1 alloc<160>) keeps the epilogue at 160 dynamically.
   static constexpr int kMinBlocks = MinBlocks_;
-  // TMEM accumulator pipeline depth (default 2 = double-buffered). AccStages_==2 reserves & USES two acc
-  // TMEM buffers and runs a 2-stage PipelineEpi so MMA(tile N+1) overlaps epilogue(tile N); AccStages_==1
+  // TMEM accumulator pipeline depth (default 2 = double-buffered). AccStages_==2 reserves & USES two
+  // TMEM buffers (two PIPELINE STAGES of the single dA acc, NOT gate+up) and runs a 2-stage PipelineEpi
+  // so MMA(tile N+1) overlaps epilogue(tile N); AccStages_==1
   // collapses to the single-buffer serialized handoff. The per-tile buffer alternation is in operator().
   static constexpr int kAccStages = AccStages_;
 
   // CollectiveMma used purely as a type-provider (TiledMma / SmemLayout / fragments / TMA atoms /
   // TransactionBytes), exactly like FMHA reuses CollectiveBuilder for CollectiveMmaQK/PV.
   using CollectiveMma = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OpClass, Element, LayoutX, AlignX, Element, LayoutW1, AlignW1, ElementAcc, TileShape,
+      ArchTag, OpClass, Element, LayoutX, AlignX, Element, LayoutW2t, AlignW2t, ElementAcc, TileShape,
       ClusterShape, cutlass::gemm::collective::StageCount<kStages>, KernelSchedule>::CollectiveOp;
 
   using TiledMma = typename CollectiveMma::TiledMma;
   using AtomThrShapeMNK = typename CollectiveMma::AtomThrShapeMNK;  // (2,1,1) under 2-SM
   using SmemLayoutX = typename CollectiveMma::SmemLayoutA;          // (MMA,M,K,PIPE)
-  using SmemLayoutW1 = typename CollectiveMma::SmemLayoutB;         // (MMA,N,K,PIPE)
+  using SmemLayoutW2t = typename CollectiveMma::SmemLayoutB;         // (MMA,N,K,PIPE)
   static constexpr int Stages = CollectiveMma::DispatchPolicy::Stages;
 
   // CTA-local tile (after dividing by the 2-SM atom): MMA M is split across 2 CTAs.
   using CtaShapeMNK = typename CollectiveMma::CtaShape_MNK;  // (128,128,64) for 256/2-SM
 
   // Stride aliases used by the host launcher (single expert, single pointer).
-  // X/W1 strides come from the collective itself (guaranteed compatible with its Arguments/TMA);
+  // X/W2ᵀ strides come from the collective itself (guaranteed compatible with its Arguments/TMA);
   // A (output) stride is just RowMajor (M,N,L) and is only used for the direct global store.
   using StrideX = typename CollectiveMma::StrideA;
-  using StrideW1 = typename CollectiveMma::StrideB;
+  using StrideW2t = typename CollectiveMma::StrideB;
   using StrideA = cutlass::detail::TagToStrideC_t<LayoutA>;
 
   // The single-tensor collective's TMA atom + Params types (built by to_underlying_arguments).
   using MainloopArguments = typename CollectiveMma::Arguments;  // {ptr_A,dA, ptr_B,dB, ...}
   using MainloopParams = typename CollectiveMma::Params;        // {tma_load_a, tma_load_b, ...}
   using TMA_X = typename MainloopParams::TMA_A;
-  using TMA_W1 = typename MainloopParams::TMA_B;
+  using TMA_W2t = typename MainloopParams::TMA_B;
 
   // ---- F1 GATHER FUSION descriptor type (optional path) --------------------------------------
   // Gather TMA descriptor over the FULL UNPERMUTED X as a 2D [T_src, d] tensor (RowMajor, K=d
@@ -243,22 +247,12 @@ struct DSwiGluConfig {
 };
 
 // ============================================================================================
-// §2.2 · TMEM column map for the two accumulators (mirrors FMHA TmemAllocation:121-134).
-//        512 cols total; with N=128 one fp32 acc = 128 cols. ACC_GATE | ACC_UP = 256 ≤ 512.
-// ============================================================================================
-enum class SwiGluTmem : uint32_t {
-  kAccCols = 128,  // == TileShape N
-  ACC_GATE = 0,
-  ACC_UP = ACC_GATE + kAccCols,  // 128
-  kEnd = ACC_UP + kAccCols,      // 256  (≤ 512)
-};
-
-// ============================================================================================
-// §2.3 · Custom single-expert warp-specialized kernel.
+// §2.3 · Custom grouped warp-specialized kernel (SINGLE GEMM dA = dY · W2ᵀ).
 //        Warp roles:  warp 0 = Load (TMA producer), warp 1 = MMA (UMMA + TMEM owner),
-//                      warps 4..7 (warpgroup 1) = Epilogue (TMEM→reg→silu·mul→global store).
-//        We mirror the single-tensor collective's load/mma partitioning verbatim, but issue
-//        a SECOND B-TMA (up) and a SECOND cute::gemm into a second TMEM accumulator.
+//                      warps 4..7 (warpgroup 1) = Epilogue (TMEM→reg→dswiglu-bwd→global store).
+//        We mirror the single-tensor collective's load/mma partitioning verbatim: ONE B-TMA (W2ᵀ)
+//        and ONE cute::gemm into ONE TMEM accumulator (dA). The dswiglu split into dgate‖dup happens
+//        only in the EPILOGUE (output side), not in the GEMM — there is no second B / second accumulator.
 // ============================================================================================
 template <typename Config>
 struct Sm100DSwiGluKernel {
@@ -270,13 +264,13 @@ struct Sm100DSwiGluKernel {
   using TiledMma = typename Config::TiledMma;
   using AtomThrShapeMNK = typename Config::AtomThrShapeMNK;
   using SmemLayoutX = typename Config::SmemLayoutX;
-  using SmemLayoutW1 = typename Config::SmemLayoutW1;
+  using SmemLayoutW2t = typename Config::SmemLayoutW2t;
   using StrideX = typename Config::StrideX;
-  using StrideW1 = typename Config::StrideW1;
+  using StrideW2t = typename Config::StrideW2t;
   using StrideA = typename Config::StrideA;
   using TMA_X = typename Config::TMA_X;
   using TMA_X_GATHER = typename Config::TMA_X_GATHER;  // F1 gather descriptor (unpermuted X [T_src,d])
-  using TMA_W1 = typename Config::TMA_W1;
+  using TMA_W2t = typename Config::TMA_W2t;
   using TMA_A = typename Config::TMA_A;  // TMA-STORE descriptor type over A[M,I] (row-major)
   using SmemLayoutA =
       typename Config::SmemLayoutA;  // sA staging-tile smem layout (kEpiTileM,kEpiTileN)
@@ -288,19 +282,19 @@ struct Sm100DSwiGluKernel {
   using TmemAllocator =
       std::conditional_t<kIs2Sm, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
 
-  // Load(warp0) -> MMA(warp1) : protects X + gate-B + up-B in smem. AtomThrShapeMNK threads the
+  // Load(warp0) -> MMA(warp1) : protects X + W2ᵀ-B in smem. AtomThrShapeMNK threads the
   // 2-SM peer mask through the pipeline (sm100_mma_warpspecialized.hpp:153-156).
   using PipelineLoad = cutlass::PipelineTmaUmmaAsync<Stages, ClusterShape, AtomThrShapeMNK>;
-  // MMA(warp1) -> Epilogue(wg1) : protects BOTH TMEM accumulators (single commit after K-loop).
+  // MMA(warp1) -> Epilogue(wg1) : protects the single dA TMEM accumulator (single commit after K-loop).
   // Config::kAccStages stages → double-buffered acc pipeline (AccStages=2): the MMA may produce the
   // accumulator for tile (N+1) in buffer (N+1)%kAccStages while the epilogue still reads tile N's result
   // from buffer N%kAccStages → MMA(tile N+1) OVERLAPS epilogue(tile N). AccStages=1 collapses to the old
   // 1-stage serialized handoff (identical behavior). Each stage gets its OWN mbarrier pair; the per-tile
   // acc buffer offset (= stage index * kAccBufStride) is selected from epi_prod.index()/epi_cons.index().
   using PipelineEpi = cutlass::PipelineUmmaAsync<Config::kAccStages, AtomThrShapeMNK>;
-  // Cols per acc buffer (one stage) = gate(kEpiTileN) + up(kEpiTileN) = 2*kEpiTileN. The acc buffer for a
-  // given tile is its acc-pipeline stage index: buf_base = stage_index * kAccBufStride (defined below
-  // after kEpiTileN). gate lives at buf_base, up at buf_base + kEpiTileN within the stage's buffer.
+  // Cols per acc buffer (one stage) = kEpiTileN (the SINGLE dA accumulator; no gate/up split — that was
+  // the forward). The acc buffer for a tile is its acc-pipeline stage index: buf_base = stage_index *
+  // kAccBufStride (= stage_index * kEpiTileN; kAccBufStride defined below after kEpiTileN).
 
   // Warp layout: 2 warpgroups (256 threads). wg0 = {Load, MMA, -, -}; wg1 = Epilogue (4 warps).
   static constexpr int NumEpiWarps = 4;
@@ -327,28 +321,27 @@ struct Sm100DSwiGluKernel {
   // sA tile, the descriptor box, and the per-tile local_tile box-coordinate math all agree.
   static_assert(kEpiTileM == Config::kEpiTileM_cfg && kEpiTileN == Config::kEpiTileN_cfg,
                 "Config TMA-store tile extents must match Kernel kEpiTileM/kEpiTileN");
-  // Cols per acc buffer (ONE acc-pipeline stage) = gate(kEpiTileN) + up(kEpiTileN) = 2*kEpiTileN. With
-  // AccStages>1 each stage occupies its own [stage*kAccBufStride, (stage+1)*kAccBufStride) TMEM window:
-  // gate at stage*kAccBufStride, up at stage*kAccBufStride + kEpiTileN. The MMA writes the producer
-  // stage's buffer (epi_prod.index()*kAccBufStride); the epilogue reads the consumer stage's buffer
-  // (epi_cons.index()*kAccBufStride). These offsets are set PER TILE (see operator()).
+  // Cols per acc buffer (ONE acc-pipeline stage) = kEpiTileN (the SINGLE dA accumulator; no gate/up).
+  // With AccStages>1 each stage occupies its own [stage*kAccBufStride, (stage+1)*kAccBufStride) TMEM
+  // window. The MMA writes the producer stage's buffer (epi_prod.index()*kAccBufStride); the epilogue
+  // reads the consumer stage's buffer (epi_cons.index()*kAccBufStride). Offsets set PER TILE (operator()).
   // M1a SINGLE accumulator (dA): one stage's buffer = kEpiTileN cols (no up). (was 2*kEpiTileN dual.)
   static constexpr int kAccBufStride = kEpiTileN;  // 64 for TileN=64
-  // TMEM columns actually used = kAccStages buffers × (gate(TileN) + up(TileN)) = kAccStages*2*TileN.
+  // TMEM columns actually used = kAccStages buffers × kEpiTileN (the single dA acc) = kAccStages*TileN.
   // Allocate ONLY these (not the full 512) so MULTIPLE blocks share the SM's 512-col TMEM → unlocks
   // occupancy (ncu: full-512 alloc capped achieved occ at 1 block/SM despite 2-block theoretical).
   // Must be a power of two in [32,512] for tcgen05.alloc.
-  // Config::kAccStages scales the reservation AND is now FUNCTIONALLY used (double-buffered acc pipe):
-  //   AccStages=1 → 2*TileN cols (e.g. 128 for TileN=64): single buffer, old 1-stage serialized behavior.
-  //   AccStages=2 → 4*TileN cols (e.g. 256 for TileN=64): two buffers, MMA(N+1) overlaps epilogue(N).
-  // CONSTRAINT: kAccStages*2*TileN ≤ 512. For TileN=64 → AccStages=2 gives 256 ≤ 512 ✓ (AccStages up to
-  // 4 would fit). For TileN=256 the single-buffer assert below (2*TileN=512) already forbids any double
-  // buffering (AccStages=2 → 1024 > 512); the static_assert here catches that explicitly.
+  // Config::kAccStages scales the reservation AND is now FUNCTIONALLY used (double-buffered acc pipe).
+  // SINGLE dA accumulator → one stage = kEpiTileN(=TileN) cols (the forward's dual gate+up was 2*TileN):
+  //   AccStages=1 → TileN cols (e.g. 64 for TileN=64): single buffer, 1-stage serialized handoff.
+  //   AccStages=2 → 2*TileN cols (e.g. 128 for TileN=64): two buffers, MMA(N+1) overlaps epilogue(N).
+  // CONSTRAINT: kAccStages*TileN ≤ 512. For TileN=64 → AccStages=2 gives 128 ≤ 512 ✓ (AccStages up to 8
+  // would fit). kTmemCols must also be a pow2 for tcgen05.alloc (TileN=64 pow2 → AccStages pow2 keeps it).
   static constexpr int kTmemCols =
-      Config::kAccStages * kEpiTileN;  // M1a single acc: 128 for TileN=64, AccStages=2 (pow2 ✓)
+      Config::kAccStages * kEpiTileN;  // single dA acc: 128 for TileN=64, AccStages=2 (pow2 ✓)
   static_assert(kTmemCols >= 32 && kTmemCols <= 512 && (kTmemCols & (kTmemCols - 1)) == 0,
-                "kTmemCols (= AccStages*2*TileN) must be a pow2 in [32,512]; "
-                "for AccStages=2 keep TileN<=128 (AccStages*2*TileN=256<=512)");
+                "kTmemCols (= AccStages*TileN) must be a pow2 in [32,512]; "
+                "for AccStages=2 keep TileN<=256 (AccStages*TileN=512<=512)");
   enum WarpRole { kLoad = 0, kMMA = 1, kEpilogue = 2, kEmpty = 3 };
   static CUTLASS_DEVICE WarpRole warp_role(int warp_idx) {
     if (warp_idx == 0) return kLoad;
@@ -360,12 +353,17 @@ struct Sm100DSwiGluKernel {
   struct SharedStorage {
     struct TensorStorage : cute::aligned_struct<128, _0> {
       // M1a single-GEMM dA = dY · W2ᵀ: ONE A buffer (dY tiles) + ONE B buffer (W2ᵀ tiles) — the forward's
-      // second B (smem_w1_up) is dropped (single accumulator, no gate/up split).
+      // second B (the forward's up-weight) is dropped (single accumulator, no gate/up split).
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutX>> smem_x;        // dY tiles  (A operand)
-      cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW1>> smem_w1_gate;  // W2ᵀ tiles (B operand)
+      cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW2t>> smem_w2t;  // W2ᵀ tiles (B operand)
       // M2: TWO output-staging tiles for the dswiglu output dY1[M,2I] — dgate → dY1[:, :I], dup → dY1[:, I:].
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_gate;  // dgate staging (dY1[:, :I])
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_up;    // dup   staging (dY1[:, I:])
+      // M2b: per-tile column-reduction accumulator for dprob — ONE float per LOCAL row. The compute loop
+      // atomicAdds dA·silu(gate)·up into dprob_smem[lrow] (sum over this tile's I-slice cols); after the
+      // epi_smem barrier each row's partial is atomicAdded to the GLOBAL dprob[grow] (cross-CTA, since an
+      // m_tile's I/kTileN n-tiles land on different CTAs). 128 floats = 512B (negligible smem).
+      float dprob_smem[kEpiTileM];
     } tensors;
     struct PipelineStorage : cute::aligned_struct<16, _0> {
       alignas(16) typename PipelineLoad::SharedStorage load;
@@ -377,32 +375,32 @@ struct Sm100DSwiGluKernel {
   // SM100 has 228 KB smem/CTA; the dynamic-smem attribute below requests SharedStorageSize.
   static_assert(
       SharedStorageSize <= (228 * 1024),
-      "SwiGLU smem (X + gate-B + up-B + pipelines) exceeds SM100 capacity; reduce kStages.");
+      "SwiGLU smem (X + W2ᵀ-B + pipelines) exceeds SM100 capacity; reduce kStages.");
 
   // -------------------------------------------------------------------------------------------
   // Device params.  GROUPED (contiguous, uniform Mₑ): plain single pointers and ONE X TMA
-  // descriptor over [G*Me, d] + ONE W1 TMA descriptor over [G*2I, d].  The gate/up slices and the
-  // per-expert selection are derived IN-KERNEL from the m-tile (tokens are contiguous by expert),
+  // descriptor over [G*Me, d] + ONE W2ᵀ TMA descriptor over [G·I, d].  The per-expert N-slice
+  // selection is derived IN-KERNEL from the m-tile (tokens are contiguous by expert),
   // so NO pointer arrays / tensormap swaps are needed.  Single-expert is just the G=1 special case.
   //   M  = G*Me  (total tokens across all experts)   N  = I  (output width)   K = d
-  //   Me = tokens per expert (uniform)                W1N = G*2I (rows of the W1 descriptor)
+  //   Me = tokens per expert (uniform)                W2tN = G·I (rows of the W2ᵀ descriptor)
   // -------------------------------------------------------------------------------------------
   struct Params {
     TMA_X tma_load_x;
-    TMA_W1 tma_load_w1;     // ONE descriptor over [G*2I, d]; gate/up are per-expert N-tile slices
+    TMA_W2t tma_load_w2t;     // ONE descriptor over [G·I, d]; expert e = the N-rows [e·I, (e+1)·I)
     TMA_A tma_store_dy1;    // ONE TMA-STORE descriptor over the whole output dY1[M,2I] (row-major); each
-    // tile issues TWO box-stores into it — gate-half at box col n_tile_local, up-half at nI_per_expert
-    // + n_tile_local (the [M,2I] gate||up layout).  Per-tile placement is just the box coordinate.
+    // tile issues TWO box-stores into it — dgate-half at box col n_tile_local, dup-half at nI_per_expert
+    // + n_tile_local (the [M,2I] dgate||dup layout).  Per-tile placement is just the box coordinate.
     ElementOut* ptr_dY1;    // [M, 2I] output (dgate || dup), row-major
     StrideA dA;             // (kept for API symmetry; the dY1 store uses the TMA descriptor)
-    // ---- B1 BACKWARD-SPECIFIC INPUT --------------------------------------------------------------
-    // dGrad = the incoming SwiGLU-output gradient dA[M,I] (the FC2 dgrad), row-major.  The epilogue
-    // reads dGrad[grow*N + gcol] per element (grow = global token row, gcol ∈ [0,I) = intermediate col),
-    // multiplies by prob[grow], and applies the SwiGLU backward against the recomputed (gate,up) in TMEM.
-    const ElementOut* dGrad = nullptr;  // [M, I] incoming grad wrt the (prob-scaled) SwiGLU output
+    // ---- B2 BACKWARD-SPECIFIC INPUT --------------------------------------------------------------
+    // dGrad is REPURPOSED as the SAVED SwiGLU input h[M,2I] pointer (NOT a gradient).  dA = dY·W2ᵀ is
+    // computed in TMEM by the GEMM; the epilogue then reads h per element — gate = dGrad[grow*2I + gcol],
+    // up = dGrad[grow*2I + I + gcol] — scales dA by prob[grow], and applies the SwiGLU backward.
+    const ElementOut* dGrad = nullptr;  // [M, 2I] SAVED SwiGLU input h = gate‖up (read in the epilogue)
     int M, N, K;  // M == G*Me, N == I, K == d
     int Me;       // tokens per expert (uniform)
-    int W1N;      // == G*2I, the N-extent of the single W1 TMA descriptor
+    int W2tN;      // == G·I, the N-extent of the single W2ᵀ TMA descriptor
     // PERSISTENT (software grid-stride) scheduling fields.  The grid launches a FIXED, smaller set of
     // persistent clusters; each cluster grid-strides over a subset of the logical (m_tile,n_tile) tiles,
     // processing each fully before the next.  total_tiles = num_m_tiles * n_local_tiles is the LOGICAL
@@ -414,7 +412,7 @@ struct Sm100DSwiGluKernel {
     // VARLEN-M (uneven, TileM-aligned experts): device array [num_m_tiles] mapping each GLOBAL m-tile to
     // its expert id.  nullptr => UNIFORM Me fast path (e = m_tile / mtiles_per_expert).  Because experts
     // are TileM-aligned and packed, the X/A row offset is still global_m_tile*kTileM (unchanged); ONLY the
-    // expert→W1-slice mapping becomes non-uniform, so this is the single varlen hook.  SonicMoE handles
+    // expert→W2ᵀ-slice mapping becomes non-uniform, so this is the single varlen hook.  SonicMoE handles
     // arbitrary token counts upstream via token-rounding (pad each expert to a kTileM multiple).
     const int* m_tile_expert;
     // ---- F1 GATHER FUSION (optional, strictly backward-compatible) ----------------------------
@@ -433,6 +431,10 @@ struct Sm100DSwiGluKernel {
     // prob != nullptr => fp32 array of length M (grouped-row order, same row index as A); the epilogue
     // multiplies each output row by prob[m]. nullptr => no gating (byte-identical to the validated path).
     const float* prob = nullptr;
+    // M2b: router-prob gradient OUTPUT [M] fp32. dprob[m] += Σ_i dA[m,i]·silu(gate[m,i])·up[m,i] (col-reduce
+    // over i, atomicAdd-accumulated since an m_tile's n-tiles are spread across CTAs). CALLER PRE-ZEROES it;
+    // nullptr => dprob not computed (M2a behavior).
+    float* dprob = nullptr;
   };
 
   // ---- device entry ----
@@ -451,7 +453,7 @@ struct Sm100DSwiGluKernel {
     uint32_t lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
 
-    // Prefetch TMA descriptors from the Load warp (X over [G*Me,d] + ONE W1 over [G*2I,d]).  On the F1
+    // Prefetch TMA descriptors from the Load warp (X over [G*Me,d] + ONE W2ᵀ over [G·I,d]).  On the F1
     // gather path the X descriptor is the gather one over the UNPERMUTED X; otherwise the contiguous one.
     if (role == kLoad && lane_predicate) {
       if (params.m_gather_idx != nullptr) {
@@ -459,7 +461,7 @@ struct Sm100DSwiGluKernel {
       } else {
         cute::prefetch_tma_descriptor(params.tma_load_x.get_tma_descriptor());
       }
-      cute::prefetch_tma_descriptor(params.tma_load_w1.get_tma_descriptor());
+      cute::prefetch_tma_descriptor(params.tma_load_w2t.get_tma_descriptor());
     }
     // Prefetch the TMA-STORE descriptor (A[M,I]) from the elected epilogue lane: the store is issued by
     // the epilogue warps, so warm its descriptor in their warpgroup (a hint only; harmless to prefetch).
@@ -572,9 +574,9 @@ struct Sm100DSwiGluKernel {
       // byte-identical to the validated kernel.
       const bool kGather = (params.m_gather_idx != nullptr);
 
-      // Defer-sliced TMA tensors. X is over (M=G*Me, K); W1 is over (W1N=G*2I, K) — ONE descriptor.
+      // Defer-sliced TMA tensors. X is over (M=G*Me, K); W2ᵀ is over (W2tN=G·I, K) — ONE descriptor.
       Tensor mX = params.tma_load_x.get_tma_tensor(make_shape(M, K, 1));
-      Tensor mW = params.tma_load_w1.get_tma_tensor(make_shape(params.W1N, K, 1));
+      Tensor mW = params.tma_load_w2t.get_tma_tensor(make_shape(params.W2tN, K, 1));
 
       Tensor gX =
           local_tile(mX, TileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});  // (BM,BK,m,k,l)
@@ -587,7 +589,7 @@ struct Sm100DSwiGluKernel {
       Tensor tCgW = cta_mma.partition_B(gW);  // (MMA,MMA_N,MMA_K,n,k,l)
 
       Tensor sX = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});        // dY
-      Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w1_gate.begin()), SmemLayoutW1{});  // W2ᵀ
+      Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w2t.begin()), SmemLayoutW2t{});  // W2ᵀ
 
       // CTA-in-cluster layout for tma_partition (sm100_mma_warpspecialized.hpp:521-538).
       Layout cta_layout_mnk = make_layout(ClusterShape{});
@@ -599,7 +601,7 @@ struct Sm100DSwiGluKernel {
                                         make_layout(size<2>(cta_layout_vmnk)),
                                         group_modes<0, 3>(sX), group_modes<0, 3>(tCgX));
       // M1a: ONE W2ᵀ descriptor, ONE smem B buffer (sWg). The expert's N-tile is sliced below.
-      auto [tWggW, tWgsWg] = tma_partition(params.tma_load_w1, get<1>(cta_coord_vmnk),
+      auto [tWggW, tWgsWg] = tma_partition(params.tma_load_w2t, get<1>(cta_coord_vmnk),
                                            make_layout(size<1>(cta_layout_vmnk)),
                                            group_modes<0, 3>(sWg), group_modes<0, 3>(tCgW));
 
@@ -631,7 +633,7 @@ struct Sm100DSwiGluKernel {
         const int n_tile_local =
             tile % params.n_local_tiles;  // OUTPUT column tile, ∈ [0, nI_per_expert)
         // VARLEN-M: look up the expert from the per-m-tile table (uneven, TileM-aligned experts); else
-        // UNIFORM fast path (m_tile / mtiles_per_expert).  Only the W1 slice depends on e; X/A row =
+        // UNIFORM fast path (m_tile / mtiles_per_expert).  Only the W2ᵀ slice depends on e; X/A row =
         // m_tile*kTileM regardless (experts are packed + TileM-aligned).  One L1-hot gmem read per tile.
         const int e = (params.m_tile_expert != nullptr) ? params.m_tile_expert[m_tile]
                                                         : (m_tile / mtiles_per_expert);
@@ -664,7 +666,7 @@ struct Sm100DSwiGluKernel {
               // cp.async.bulk.tensor.2d...tile::gather4 into the matching 4-row sub-slice.  mcast_mask_x
               // preserves the 2-SM multicast semantics of the contiguous path; the transaction barrier's
               // expect_tx is UNCHANGED (lp.transaction_bytes already counts the full X tile; the 32
-              // gather4 ops + 2 W1 copies deliver exactly those bytes to the same *bar).
+              // gather4 ops + 1 W2ᵀ copy deliver exactly those bytes to the same *bar).
               //
               // WARNING: the zip-tensor coordinate construction and the swizzled-smem 4-row destination
               // partition below are the UNRESOLVED risk points (no gather4 mainloop reference exists in
@@ -695,7 +697,7 @@ struct Sm100DSwiGluKernel {
             } else {
               copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
             }
-            copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWggWg_k(_, k), tWgsWg(_, wr));
+            copy(params.tma_load_w2t.with(*bar, mcast_mask_b), tWggWg_k(_, k), tWgsWg(_, wr));
           }
           ++load_prod;
         }
@@ -705,8 +707,8 @@ struct Sm100DSwiGluKernel {
     }
 
     // =========================================================================================
-    // MMA warp — allocate full TMEM once; two acc views at fixed col offsets; K-loop = 2 cute::gemm.
-    // Mirrors sm100_mma_warpspecialized.hpp mma_init:548-576 + mma:648-708, doubled for gate/up.
+    // MMA warp — allocate TMEM once; ONE dA acc view (per acc-stage buffer); K-loop = 1 cute::gemm.
+    // Mirrors sm100_mma_warpspecialized.hpp mma_init:548-576 + mma:648-708 (single GEMM, not doubled).
     // =========================================================================================
     else if (role == kMMA) {
       cutlass::arch::warpgroup_reg_dealloc<40>();
@@ -721,10 +723,10 @@ struct Sm100DSwiGluKernel {
       // producer_acquire, using the ACQUIRED producer stage epi_prod.index()). With AccStages=1 this
       // always resolves to buf=0 → identical to the old fixed-offset behavior.
       Tensor accB = partition_fragment_C(tiled_mma, take<0, 2>(TileShape{}));  // (MMA,MMA_M,MMA_N)
-      Tensor acc_gate = accB;  // M1a: SINGLE accumulator (dA = dY · W2ᵀ). (the up accumulator is dropped)
+      Tensor acc_dA = accB;  // M1a: SINGLE accumulator (dA = dY · W2ᵀ). (the up accumulator is dropped)
 
       Tensor sX = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});       // dY
-      Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w1_gate.begin()), SmemLayoutW1{});  // W2ᵀ
+      Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w2t.begin()), SmemLayoutW2t{});  // W2ᵀ
       Tensor tCrX = TiledMma::make_fragment_A(sX);    // (MMA,MMA_M,MMA_K,PIPE)
       Tensor tCrWg = TiledMma::make_fragment_B(sWg);  // (MMA,MMA_N,MMA_K,PIPE)
 
@@ -752,7 +754,7 @@ struct Sm100DSwiGluKernel {
           // is valid AFTER producer_acquire (it names the stage just claimed). gate at buf, up at
           // buf+kEpiTileN. Only .data() changes; the fragment layout is fixed. (AccStages=1 → buf=0.)
           const uint32_t mma_buf = epi_prod.index() * uint32_t(kAccBufStride);
-          acc_gate.data() = ss.tmem_base_ptr + mma_buf;  // single acc at the stage's buffer base
+          acc_dA.data() = ss.tmem_base_ptr + mma_buf;  // single acc at the stage's buffer base
           tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;   // first k_block zeroes the acc THIS tile
           for (int k = 0; k < k_tile_count; ++k) {
             pipeline_load.consumer_wait(load_cons);
@@ -760,7 +762,7 @@ struct Sm100DSwiGluKernel {
             CUTLASS_PRAGMA_UNROLL
             for (int kb = 0; kb < size<2>(tCrX); ++kb) {
               // M1a: ONE MMA into the single dA accumulator. Zero on the first k_block, One thereafter.
-              cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWg(_, _, kb, rs), acc_gate);
+              cute::gemm(tiled_mma, tCrX(_, _, kb, rs), tCrWg(_, _, kb, rs), acc_dA);
               tiled_mma.accumulate_ = UMMA::ScaleOut::One;
             }
             pipeline_load.consumer_release(load_cons);
@@ -815,8 +817,8 @@ struct Sm100DSwiGluKernel {
       // so make_tmem_copy below has a well-formed tensor to read the (buffer-independent) LAYOUT from; the
       // actual source pointer used by every copy comes from the per-tile partition_S below. (AccStages=1 →
       // the per-tile buf is always 0, identical to the old fixed-offset path.)
-      Tensor tAcc_gate = tAcc;
-      tAcc_gate.data() = ss.tmem_base_ptr + 0u;  // M1a: single dA accumulator (no up)
+      Tensor tAcc_dA = tAcc;
+      tAcc_dA.data() = ss.tmem_base_ptr + 0u;  // M1a: single dA accumulator (no up)
 
       // GLOBAL (M,N) identity coordinate tensor partitioned through the IDENTICAL MMA C-path that
       // produced the data fragment tAcc, sliced at THIS CTA. Rationale (rank + offset, both load-bearing):
@@ -827,7 +829,7 @@ struct Sm100DSwiGluKernel {
       //     cAcc_cta violated this → "Rank of tensor to be partitioned too small."
       //   * cta_mma.partition_C(identity) returns rank-3 (MMA,MMA_M,MMA_N) with the SAME extents as tAcc
       //     (make_fragment_C:142 == shape(partition_C)), so partition_D is rank-legal AND tTMc ends up
-      //     element-for-element congruent with partition_S(tAcc_gate) (same Tiler_MN, same thread slice).
+      //     element-for-element congruent with partition_S(tAcc_dA) (same Tiler_MN, same thread slice).
       //   * The +128 follower offset enters AUTOMATICALLY: the 2-SM C-layout
       //     CLayout = (_2, (M/2, N)) (mma_traits_sm100.hpp:1700, ThrID=_2) puts the M-half in the V-mode,
       //     and we slice partition_C at this CTA's V = block_rank_in_cluster % AtomThrID = the same slice
@@ -854,25 +856,25 @@ struct Sm100DSwiGluKernel {
       // make_tmem_copy / thr_tmem_load are BUFFER-INDEPENDENT (they capture only the copy LAYOUT and the
       // per-thread slice, NOT the source pointer), so they are built ONCE here and reused for every tile,
       // even when AccStages=2 alternates the source buffer.
-      auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tAcc_gate);
+      auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tAcc_dA);
       auto thr_tmem_load = tiled_tmem_load.get_slice(thread_idx);
 
-      // NOTE: partition_S(tAcc_gate)/partition_S(tAcc_up) — which build the TMEM-source tensors tTMgate/
-      // tTMup — are deliberately NOT hoisted here. partition_S CAPTURES the tensor's ITERATOR (data ptr +
+      // NOTE: partition_S(tAcc_dA) — which builds the TMEM-source tensor tTM_dA — is deliberately NOT
+      // hoisted here. partition_S CAPTURES the tensor's ITERATOR (data ptr +
       // layout) at call time, so a tensor partitioned with the hoisted (buf-0) .data() would keep reading
       // buffer 0 even after the per-tile .data() update. With AccStages=2 that would make the epilogue read
-      // the WRONG buffer. Therefore partition_S is REDONE INSIDE the loop, AFTER tAcc_gate.data()/
-      // tAcc_up.data() are set to the consumer stage's buffer (epi_cons.index()*kAccBufStride). (The
+      // the WRONG buffer. Therefore partition_S is REDONE INSIDE the loop, AFTER tAcc_dA.data()
+      // is set to the consumer stage's buffer (epi_cons.index()*kAccBufStride). (The
       // tiled_tmem_load copy object above carries the buffer-independent layout, so re-partitioning the
       // source is sufficient — the copy itself is NOT rebuilt.)
       // DATA is partition_S (TMEM source ordering); the COORDINATE must be partition_D, NOT partition_S.
       // Reason (this is the STOCK pattern; deviating from it caused every prior scramble):
-      //   * The T2R copy `copy(tiled_tmem_load, tTMgate, rGate)` delivers each TMEM value into the
+      //   * The T2R copy `copy(tiled_tmem_load, tTM_dA, r_dA)` delivers each TMEM value into the
       //     register tensor in the copy atom's DST value ordering. For SM100_TMEM_LOAD_32dp32b32x the
       //     Src and Dst value layouts DIFFER (copy_traits_sm100.hpp:1633-1636 SrcLayout (32,32768):(0,1)
       //     vs DstLayout (32,1024):(1024,1)); RefLayout==SrcLayout, so tidfrg_S yields the Src ordering
-      //     and tidfrg_D yields the Dst ordering (copy_atom.hpp:226,247). rGate is built from
-      //     shape(tTMc) and read by linear index i in the loop, so element i of rGate sits in the DST
+      //     and tidfrg_D yields the Dst ordering (copy_atom.hpp:226,247). r_dA is built from
+      //     shape(tTMc) and read by linear index i in the loop, so element i of r_dA sits in the DST
       //     ordering — hence tTMc(i) must ALSO be in the DST ordering, i.e. partition_D(coord).
       //   * This is exactly the proven FMHA mainloop pattern this kernel mirrors:
       //     tTMEM_LOADtS = partition_S(tStS) (DATA), tTMEM_LOADcS = partition_D(tScS) (COORD),
@@ -884,9 +886,9 @@ struct Sm100DSwiGluKernel {
       //   * Rank-legal: cAcc_cta is rank-3 (MMA,MMA_M,MMA_N) >= rank-2 Tiler_MN, so tidfrg_D's
       //     `rank(dtensor) >= rank(Tiler_MN)` assert passes (copy_atom.hpp:244).
       //   * partition_S of the coord (the previous attempt) compiles for the coord itself but forces
-      //     rGate into the Src value count/ordering, which then fails the register-vectorize assert
+      //     r_dA into the Src value count/ordering, which then fails the register-vectorize assert
       //     `size(rD)==RegNumDst` in the DATA copy_unpack (copy_traits_sm100.hpp:396) — that is the
-      //     reported compile error; partition_D sizes rGate to exactly NumValDst=1024 so it vectorizes.
+      //     reported compile error; partition_D sizes r_dA to exactly NumValDst=1024 so it vectorizes.
       //   * The +128 follower offset still enters via the V-slice baked into cAcc_cta: the 2-SM
       //     CLayout (_2,(M/2,N)):(M/2,(1,M)) (mma_traits_sm100.hpp:1700) puts the M-half in V with
       //     stride M/2=128; partition_C sliced at this CTA's V (line 461) selects V=0→rows[0,128) /
@@ -896,7 +898,7 @@ struct Sm100DSwiGluKernel {
           thr_tmem_load.partition_D(cAcc_cta);  // (T2R,T2R_M,T2R_N) global (row,col), DST order
 
       // Per-tile register staging (tile-invariant SHAPE; values overwritten each tile by the TMEM copy).
-      Tensor rGate = make_tensor<ElementAcc>(shape(tTMc));  // M1a: the dA values (single acc)
+      Tensor r_dA = make_tensor<ElementAcc>(shape(tTMc));  // M1a: the dA values (single acc)
 
       // ---- M2 TMA-STORE EPILOGUE (dswiglu): dA is in TMEM (the GEMM result); gate/up are read from the
       // SAVED h[M,2I] (global). Per element: grad = dA·prob; dgate = grad·up·silu'(gate) → sGate; dup =
@@ -938,20 +940,20 @@ struct Sm100DSwiGluKernel {
 
         // Point the acc views at the CONSUMER stage's buffer (the stage epi_cons just observed full), then
         // RE-PARTITION the TMEM-source tensors. partition_S captures (.data()+layout) at call time, so it
-        // MUST be redone here AFTER updating .data() — otherwise tTMgate/tTMup would read the stale (buf-0)
+        // MUST be redone here AFTER updating .data() — otherwise tTM_dA would read the stale (buf-0)
         // pointer and, with AccStages=2, the WRONG buffer. The copy layout (tiled_tmem_load) is unchanged.
         // (AccStages=1 → epi_buf is always 0, so this reproduces the original fixed-offset reads.)
         const uint32_t epi_buf = epi_cons.index() * uint32_t(kAccBufStride);
-        tAcc_gate.data() = ss.tmem_base_ptr + epi_buf;
-        Tensor tTMgate = thr_tmem_load.partition_S(tAcc_gate);  // (T2R,T2R_M,T2R_N) tmem source (dA)
-        copy(tiled_tmem_load, tTMgate, rGate);
+        tAcc_dA.data() = ss.tmem_base_ptr + epi_buf;
+        Tensor tTM_dA = thr_tmem_load.partition_S(tAcc_dA);  // (T2R,T2R_M,T2R_N) tmem source (dA)
+        copy(tiled_tmem_load, tTM_dA, r_dA);
 
 #ifdef SWIGLU_DEBUG_PRINT
         // Guard to the FIRST tile only (tile == cluster_id) so the persistent loop doesn't spam.
         if (tile == cluster_id && thread_idx == 0 && block_rank_in_cluster == 0) {
-          for (int i = 0; i < size(rGate) && i < 24; ++i) {
+          for (int i = 0; i < size(r_dA) && i < 24; ++i) {
             printf("T0 i=%2d row=%3d col=%3d gate=% .4f\n", i, get<0>(tTMc(i)) + cta_row_offset,
-                   get<1>(tTMc(i)), float(rGate(i)));
+                   get<1>(tTMc(i)), float(r_dA(i)));
           }
         }
 #endif
@@ -966,20 +968,26 @@ struct Sm100DSwiGluKernel {
         if (is_tma_store_lane) {
           cute::tma_store_wait<0>();
         }
+        // M2b: zero this tile's dprob column-accumulator (one float per epi thread == per LOCAL row) BEFORE
+        // the WAR barrier, so the barrier doubles as the "all rows zeroed" fence before the compute loop's
+        // atomicAdds. thread_idx ∈ [0,128) == kEpiTileM, so all rows are covered.
+        if (params.dprob != nullptr) ss.tensors.dprob_smem[thread_idx] = 0.0f;
         cutlass::arch::NamedBarrier epi_war_bar(NumEpiThreads, /*id=*/1u);
         epi_war_bar.arrive_and_wait();
 
-        // M2 SwiGLU BACKWARD per element: dA = rGate(i) (from TMEM, the GEMM result); gate/up read from the
+        // M2 SwiGLU BACKWARD per element: dA = r_dA(i) (from TMEM, the GEMM result); gate/up read from the
         // SAVED h[M,2I] (params.dGrad repurposed as the h pointer): gate = h[grow,gcol], up = h[grow,I+gcol].
+        // These SCATTERED LSU reads (the M3 TMA-prefetch experiment was a net loss — TMA contends with the
+        // store-TMA; see the .cu note) overlap the unrolled compute and run parallel to the store-TMA engine.
         //   grad = dA·prob ;  dgate = grad·up·silu'(gate) → sGate ;  dup = grad·silu(gate) → sUp
         // silu(x)=x·σ(x), silu'(x)=σ(x)+silu(x)·(1-σ(x)). grow<M guards the h/prob reads on OOB rows.
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(rGate); ++i) {
+        for (int i = 0; i < size(r_dA); ++i) {
           int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
           int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
           const int grow = lrow + cta_row_offset;  // GLOBAL token row
           const int gcol = lcol + cta_col_offset;  // GLOBAL intermediate col ∈ [0,I)
-          const ElementAcc dA = rGate(i);          // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
+          const ElementAcc dA = r_dA(i);          // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
           ElementAcc gate = ElementAcc(0), up = ElementAcc(0), p = ElementAcc(1);
           if (grow < params.M) {
             const int64_t hbase = static_cast<int64_t>(grow) * h_row + gcol;  // saved h[grow, gcol]
@@ -993,9 +1001,15 @@ struct Sm100DSwiGluKernel {
           const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
           sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
           sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
+          // M2b: dprob col-reduce partial — dprob[grow] += dA · A', A' = silu(gate)·up = s·up (the forward
+          // SwiGLU output, NOT prob-scaled; QuACK's postact). A' is a FREE byproduct (s, up already in regs).
+          // Accumulated into smem per LOCAL row; flushed to global dprob below. OOB rows have up=0 → adds 0.
+          if (params.dprob != nullptr) {
+            atomicAdd(&ss.tensors.dprob_smem[lrow], static_cast<float>(dA * s * up));
+          }
         }
 
-        // TMEM read is done (rGate/rUp already in registers; sA staging touches no TMEM).
+        // TMEM read is done (r_dA already in registers — single accumulator, no rUp; sA touches no TMEM).
         // fence_view_async_tmem_load orders these last TMEM loads; consumer_release returns THIS tile's
         // acc->epi stage (epi_cons.index()) so the MMA warp may reuse/free that buffer. With kAccStages=2
         // this release frees the stage that the MMA's producer_acquire for tile (current+2) will wait on,
@@ -1018,6 +1032,16 @@ struct Sm100DSwiGluKernel {
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier epi_smem_bar(NumEpiThreads, /*id=*/0u);
         epi_smem_bar.arrive_and_wait();
+
+        // M2b: flush THIS tile's dprob column-partials to GLOBAL dprob — one row per epi thread (thread_idx
+        // ∈ [0,128) == LOCAL row; global row = thread_idx + cta_row_offset). atomicAdd because an m_tile's
+        // I/kTileN n-tiles land on DIFFERENT CTAs that all contribute to the same dprob[m]. The epi_smem_bar
+        // above made every thread's compute-loop atomicAdds into dprob_smem visible. Each thread reads only
+        // its OWN dprob_smem[thread_idx], so the next tile's zero/accumulate of that slot is hazard-free.
+        if (params.dprob != nullptr) {
+          const int grow_p = thread_idx + cta_row_offset;
+          if (grow_p < params.M) atomicAdd(&params.dprob[grow_p], ss.tensors.dprob_smem[thread_idx]);
+        }
 
         // (3) TWO ASYNC TMA BULK-TENSOR STORES: ONE elected thread per CTA drains sGate → dY1[:, :I] and
         // sUp → dY1[:, I:2I], bypassing the L1/TEX/LSU path.  box_m = cta_row_offset/kEpiTileM (exact).
@@ -1065,16 +1089,19 @@ struct Sm100DSwiGluKernel {
 
 // ============================================================================================
 // §2.4 · GROUPED (contiguous, uniform Mₑ) host launcher — SINGLE LAUNCH for G experts.
-//        Standard stacked MoE layout, all tensors contiguous:
-//          X  : [G*Me, d]   (expert e owns rows [e*Me, (e+1)*Me))
-//          W1 : [G*2I, d]   (expert e: gate rows [e*2I, e*2I+I), up rows [e*2I+I, e*2I+2I))
-//          A  : [G*Me, I]   (expert e owns rows [e*Me, (e+1)*Me))
-//        The GEMM is BLOCK-DIAGONAL; the expert is DERIVED FROM THE M-TILE in-kernel, so we build
-//        just TWO TMA descriptors via ONE to_underlying_arguments call:
-//          A-operand (X) over (G*Me, d)   and   B-operand (W1) over (G*2I, d).
-//        There is NO separate up descriptor — up is the (gate_w1_ntile + nI_per_expert) N-tile slice
-//        of the same W1 descriptor (the grouped generalization of the single-expert "up = W1+I*d").
-//        CONSTRAINT: uniform Me only (assumes Me % kTileM == 0 and I % kTileN == 0; no boundary
+//        M2 SwiGLU-BACKWARD. The operand slots are REPURPOSED from the forward launcher; the generic
+//        names X / W1 / dGrad are kept (the whole body uses them), but their M2 MEANING is:
+//          X     ← dY    : [G*Me, d]   incoming grad wrt the FC2 output Y          (A operand)
+//          W1    ← W2ᵀ   : [G*I,  d]   the TRANSPOSED FC2 weight, expert-in-N      (B operand)
+//          dGrad ← h     : [G*Me, 2I]  the SAVED SwiGLU input h = gate‖up (read scattered in epilogue)
+//          dY1           : [G*Me, 2I]  OUTPUT dgate‖dup = grad wrt h
+//        This is ONE GEMM dA = dY · W2ᵀ (single accumulator) followed by the dswiglu-backward epilogue.
+//        There is NO gate/up WEIGHT split here — that was the forward (W1=[gate‖up]). W2ᵀ carries the
+//        expert in the N-dim exactly like the forward's W1ᵀ, so the GEMM is BLOCK-DIAGONAL with the
+//        expert DERIVED FROM THE M-TILE in-kernel, and we build just TWO TMA descriptors via ONE
+//        to_underlying_arguments call: A-operand (dY) over (G*Me, d), B-operand (W2ᵀ) over (G*I, d).
+//        The gate‖up that DOES appear below is the epilogue OUTPUT dY1[:, :I]‖dY1[:, I:] (dgate‖dup),
+//        not a weight. CONSTRAINT: uniform Me only (Me % kTileM == 0 and I % kTileN == 0; no boundary
 //        predication).  Non-uniform Me would need per-expert cumulative-offset (prefix-sum) arrays.
 // ============================================================================================
 // The tuning params default to the DSwiGluConfig defaults, so the existing call
@@ -1082,10 +1109,10 @@ struct Sm100DSwiGluKernel {
 template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
           int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchDSwiGluGrouped(
-    const Element* X,      // [G*Me, d]  row-major  (FC1 input; recomputes h = X·W1ᵀ)
-    const Element* W1,     // [G*2I, d]  row-major  (per-expert gate||up weights)
-    const ElementOut* dGrad,  // [G*Me, I] row-major  (incoming grad wrt the prob-scaled SwiGLU output)
-    ElementOut* dY1,       // [G*Me, 2I] row-major  (OUTPUT: dgate||dup = grad wrt h)
+    const Element* X,      // [G*Me, d]  row-major  M2: dY  — incoming grad wrt FC2 output Y (A operand)
+    const Element* W1,     // [G*I,  d]  row-major  M2: W2ᵀ — transposed FC2 weight, expert-in-N (B operand)
+    const ElementOut* dGrad,  // [G*Me, 2I] row-major  M2: SAVED h = gate‖up (read scattered in epilogue)
+    ElementOut* dY1,       // [G*Me, 2I] row-major  (OUTPUT: dgate‖dup = grad wrt h)
     int G, int Me, int I, int d, cudaStream_t stream, int device = 0, int sm_count = 0,
     // VARLEN-M (uneven, TileM-aligned experts): device array [M_varlen/kTileM]
     // mapping each global m-tile → expert id, and the total packed token count
@@ -1095,40 +1122,42 @@ cudaError_t LaunchDSwiGluGrouped(
     // nullptr — X is the already-grouped activation).  nullptr => contiguous X path.
     const int* d_m_gather_idx = nullptr, int T_src = 0,
     // PROB (optional): per-token router gate, fp32 [M] in grouped-row order; the epilogue forms
-    // grad = dGrad · prob[m] before the SwiGLU backward. nullptr => ungated (grad = dGrad).
-    const float* d_prob = nullptr) {
+    // grad = dA · prob[m] before the SwiGLU backward. nullptr => no prob-scaling (grad = dA).
+    const float* d_prob = nullptr,
+    // M2b: router-prob gradient OUTPUT [M] fp32 (CALLER PRE-ZEROES; atomicAdd-accumulated). nullptr => skip.
+    float* d_dprob = nullptr) {
   using Config = DSwiGluConfig<Element, ElementOut, TileM_, TileN_, TileK_, kStages_, ClusterM_,
                               MinBlocks_, AccStages_>;
   using Kernel = Sm100DSwiGluKernel<Config>;
   using CollectiveMma = typename Config::CollectiveMma;
   using StrideX = typename Config::StrideX;
-  using StrideW1 = typename Config::StrideW1;
+  using StrideW2t = typename Config::StrideW2t;
   using StrideA = typename Config::StrideA;
 
   // VARLEN-M: M = total packed (TileM-aligned) tokens across uneven experts; else uniform G*Me.
   const int M = (d_m_tile_expert != nullptr) ? M_varlen : (G * Me);  // total tokens (problem M)
-  const int W1N = G * I;  // M1a: total W2ᵀ rows (problem N, B-operand) = G·I (expert e → N-rows [e·I,+I))
+  const int W2tN = G * I;  // M1a: total W2ᵀ rows (problem N, B-operand) = G·I (expert e → N-rows [e·I,+I))
 
   // Strides. make_cute_packed_stride wants {extent..., L}. X is RowMajor (G*Me,d) → A K-major (d,1,0).
-  // W1 is K-contiguous [G*2I,d] → B K-major: LayoutW1=ColumnMajor ⇒ StrideB=Stride<int,_1,int>,
-  // make_cute_packed_stride sets N-stride=d ⇒ dW1=(d,1,0), i.e. W1[n,k] at n*d+k (the physical layout).
+  // W2ᵀ is K-contiguous [G·I,d] → B K-major: LayoutW2t=ColumnMajor ⇒ StrideB=Stride<int,_1,int>,
+  // make_cute_packed_stride sets N-stride=d ⇒ dW2t=(d,1,0), i.e. W2ᵀ[n,k] at n*d+k (the physical layout).
   StrideX dX = cutlass::make_cute_packed_stride(StrideX{}, cute::make_shape(M, d, 1));
-  StrideW1 dW1 = cutlass::make_cute_packed_stride(StrideW1{}, cute::make_shape(W1N, d, 1));
+  StrideW2t dW2t = cutlass::make_cute_packed_stride(StrideW2t{}, cute::make_shape(W2tN, d, 1));
   StrideA dA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, I, 1));
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = device;
   hw_info.sm_count = sm_count;
 
-  // Problem shape (M=G*Me, N=G*2I, K=d): one to_underlying_arguments builds BOTH the A-TMA over the
-  // full token stack (M=G*Me) AND the B-TMA over the full W1 stack (N=G*2I) — no up descriptor.
-  auto problem = cute::make_shape(M, W1N, d);
+  // Problem shape (M=G*Me, N=G·I, K=d): one to_underlying_arguments builds BOTH the A-TMA over the
+  // full token stack (M=G*Me) AND the B-TMA over the full W2ᵀ stack (N=G·I).
+  auto problem = cute::make_shape(M, W2tN, d);
 
   typename CollectiveMma::Arguments mainloop_args{};
   mainloop_args.ptr_A = X;
   mainloop_args.dA = dX;
   mainloop_args.ptr_B = W1;
-  mainloop_args.dB = dW1;
+  mainloop_args.dB = dW2t;
   typename CollectiveMma::Params mainloop_params = CollectiveMma::to_underlying_arguments(
       problem, mainloop_args, /*workspace=*/nullptr, hw_info);
 
@@ -1172,7 +1201,7 @@ cudaError_t LaunchDSwiGluGrouped(
 
   typename Kernel::Params params;
   params.tma_load_x = mainloop_params.tma_load_a;
-  params.tma_load_w1 = mainloop_params.tma_load_b;
+  params.tma_load_w2t = mainloop_params.tma_load_b;
   params.tma_store_dy1 = tma_store_dy1;
   params.ptr_dY1 = dY1;
   params.dGrad = dGrad;  // [M, I] incoming grad wrt the prob-scaled SwiGLU output
@@ -1181,12 +1210,13 @@ cudaError_t LaunchDSwiGluGrouped(
   params.N = I;  // intermediate width I (dGrad stride; dY1 is [M,2I])
   params.K = d;
   params.Me = Me;    // tokens per expert (uniform fallback; unused when m_tile_expert != nullptr)
-  params.W1N = W1N;  // G*2I
+  params.W2tN = W2tN;  // G·I
   params.m_tile_expert = d_m_tile_expert;  // VARLEN-M expert table (nullptr => uniform fast path)
   params.m_gather_idx = d_m_gather_idx;    // F1 gather index (nullptr => contiguous X path, unchanged)
   params.tma_load_x_gather = tma_load_x_gather;  // gather descriptor over the unpermuted X [T_src,d]
   params.T_src_gather = T_src_eff;               // unpermuted source row extent
   params.prob = d_prob;                          // per-token router gate (nullptr => no gating)
+  params.dprob = d_dprob;                        // M2b router-prob grad OUTPUT (nullptr => skip)
 
   // Logical tile grid: m_tile spans ALL experts' tokens (num_m_tiles = G*Me/kTileM); n_tile_local spans
   // ONE expert's output width (I/kTileN).  total_tiles = num_m_tiles * num_n_local_tiles is the LOGICAL

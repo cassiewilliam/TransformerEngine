@@ -35,7 +35,10 @@ void cutlass_grouped_dswiglu(const void *dY, const void *W2, const void *h, void
              "cutlass_grouped_dswiglu requires an SM100 (Blackwell) device; the kernel is a 2-SM "
              "tcgen05 schedule with no pre-Blackwell path.");
 
-  (void)dprob;  // M2b: in-kernel colvec-reduce of dprob (not yet wired).
+  // M3 (h-prefetch via TMA) was a NET LOSS (312us vs 282 scattered) — TMA-load contends with the dY1
+  // store-TMA engine + smem round-trip; the scattered LSU read parallelizes the store-TMA + overlaps the
+  // compute. Reverted to the scattered-read baseline (default kStages=16). See b1-backward-kernel-design.
+  // M2b: dprob (router-prob grad OUTPUT [M] fp32, caller pre-zeroed) is now wired as the col-reduce output.
   cudaError_t status = cudaErrorInvalidValue;
   if (dtype == DType::kBFloat16) {
     status = grouped_gemm_dswiglu::LaunchDSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t>(
@@ -43,13 +46,15 @@ void cutlass_grouped_dswiglu(const void *dY, const void *W2, const void *h, void
         reinterpret_cast<const cutlass::bfloat16_t *>(W2),
         /*dGrad=saved h*/ reinterpret_cast<const cutlass::bfloat16_t *>(h),
         reinterpret_cast<cutlass::bfloat16_t *>(dY1), G, Me, I, d, stream, device, math_sm_count,
-        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);
+        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob,
+        /*d_dprob=*/dprob);
   } else if (dtype == DType::kFloat16) {
     status = grouped_gemm_dswiglu::LaunchDSwiGluGrouped<cutlass::half_t, cutlass::half_t>(
         reinterpret_cast<const cutlass::half_t *>(dY), reinterpret_cast<const cutlass::half_t *>(W2),
         /*dGrad=saved h*/ reinterpret_cast<const cutlass::half_t *>(h),
         reinterpret_cast<cutlass::half_t *>(dY1), G, Me, I, d, stream, device, math_sm_count,
-        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);
+        m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob,
+        /*d_dprob=*/dprob);
   } else {
     NVTE_ERROR("cutlass_grouped_dswiglu: only BF16 and FP16 are supported.");
   }

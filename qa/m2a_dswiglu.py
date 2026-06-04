@@ -28,12 +28,16 @@ prob = (torch.rand(M, device=dev, dtype=torch.float32) + 0.25)
 print(f"M={M} G={G} d={D} I={I}  {torch.cuda.get_device_name(0)}")
 
 
+dprob = torch.zeros(M, dtype=torch.float32, device=dev)  # M2b OUTPUT [M]; caller pre-zeroes (kernel atomicAdds)
+
+
 def call():
     # te_cutlass_grouped_dswiglu(x=dY, w1=W2ᵀ, dgrad=h, m_tile_expert=None, prob, G, Me, I, d,
-    #                            M_varlen=0, math_sm_count=0) -> dY1[M, 2I]
-    return tex.te_cutlass_grouped_dswiglu(dY, W2t, h, None, prob, G, ME, I, D, 0, 0)
+    #                            M_varlen=0, math_sm_count=0, dprob=dprob) -> dY1[M, 2I]; dprob filled in-place
+    return tex.te_cutlass_grouped_dswiglu(dY, W2t, h, None, prob, G, ME, I, D, 0, 0, dprob)
 
 
+dprob.zero_()                 # fresh accumulator for the validation call
 dY1 = call().view(M, 2 * I)
 
 # ---- torch reference ----
@@ -55,6 +59,16 @@ tol = 0.25 + 0.125 * dY1_ref.abs()
 n_fail = int((diff > tol).sum().item())
 print(f"M2A_VALIDATE n_fail={n_fail}/{dY1.numel()} max_abs={diff.max().item():.5f} "
       f"{'PASS' if n_fail == 0 else 'FAIL'}")
+
+# ---- M2b dprob reference + validation ---- dprob[m] = Σ_i dA[m,i]·silu(gate)·up = Σ_i dA·A' (un-prob A')
+A_prime = s * up                            # silu(gate)·up = forward SwiGLU output (NOT prob-scaled)
+dprob_ref = (dA * A_prime).sum(dim=1)       # [M]
+dprob_diff = (dprob.float() - dprob_ref).abs()
+dprob_tol = 0.5 + 0.05 * dprob_ref.abs()    # bf16 GEMM dA summed over I=512 → ~few% rel
+dprob_nfail = int((dprob_diff > dprob_tol).sum().item())
+dprob_rel = (dprob_diff / (dprob_ref.abs() + 1e-6)).max().item()
+print(f"M2B_DPROB n_fail={dprob_nfail}/{M} max_abs={dprob_diff.max().item():.5f} max_rel={dprob_rel:.4f} "
+      f"ref|mean|={dprob_ref.abs().mean().item():.3f} {'PASS' if dprob_nfail == 0 else 'FAIL'}")
 
 
 def bench(fn, n=80, w=20):

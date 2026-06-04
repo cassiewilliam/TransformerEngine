@@ -663,7 +663,8 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
                                       std::optional<at::Tensor> m_tile_expert,
                                       std::optional<at::Tensor> prob, int64_t G, int64_t Me,
                                       int64_t I, int64_t d, int64_t M_varlen,
-                                      int64_t math_sm_count) {
+                                      int64_t math_sm_count,
+                                      std::optional<at::Tensor> dprob) {
   NVTE_CHECK(x.is_cuda() && w1.is_cuda() && dgrad.is_cuda(),
              "te_cutlass_grouped_dswiglu: x, w1, dgrad must be CUDA tensors.");
   NVTE_CHECK(x.scalar_type() == w1.scalar_type() && x.scalar_type() == dgrad.scalar_type(),
@@ -695,9 +696,18 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
     prob_ptr = prob->data_ptr<float>();
   }
 
+  // M2b dprob (optional OUTPUT): router-prob grad [M] fp32. CALLER PRE-ZEROES it (the kernel atomicAdds).
+  float* dprob_ptr = nullptr;
+  if (dprob.has_value() && dprob->numel() > 0) {
+    NVTE_CHECK(dprob->scalar_type() == at::kFloat && dprob->is_cuda() && dprob->is_contiguous(),
+               "te_cutlass_grouped_dswiglu: dprob must be a contiguous fp32 CUDA tensor.");
+    NVTE_CHECK(dprob->numel() == M, "te_cutlass_grouped_dswiglu: dprob must have M entries.");
+    dprob_ptr = dprob->data_ptr<float>();
+  }
+
   auto dY1 = at::empty({M, 2 * I}, x.options());  // M2: [M, 2I] dY1 = dgate||dup
   cutlass_grouped_dswiglu(x.data_ptr(), w1.data_ptr(), dgrad.data_ptr(), dY1.data_ptr(),
-                          /*dprob=*/nullptr, static_cast<int>(G), static_cast<int>(Me),
+                          /*dprob=*/dprob_ptr, static_cast<int>(G), static_cast<int>(Me),
                           static_cast<int>(I), static_cast<int>(d), mte, static_cast<int>(M_varlen),
                           prob_ptr, GetTransformerEngineDType(x.scalar_type()),
                           static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),

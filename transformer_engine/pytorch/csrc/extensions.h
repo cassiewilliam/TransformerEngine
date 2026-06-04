@@ -175,7 +175,8 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
                                       std::optional<at::Tensor> m_tile_expert,
                                       std::optional<at::Tensor> prob, int64_t G, int64_t Me,
                                       int64_t I, int64_t d, int64_t M_varlen,
-                                      int64_t math_sm_count);
+                                      int64_t math_sm_count,
+                                      std::optional<at::Tensor> dprob = std::nullopt);
 
 py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,
