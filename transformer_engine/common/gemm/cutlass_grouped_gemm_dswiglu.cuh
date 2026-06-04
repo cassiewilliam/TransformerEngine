@@ -359,11 +359,6 @@ struct Sm100DSwiGluKernel {
       // M2: TWO output-staging tiles for the dswiglu output dY1[M,2I] — dgate → dY1[:, :I], dup → dY1[:, I:].
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_gate;  // dgate staging (dY1[:, :I])
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_up;    // dup   staging (dY1[:, I:])
-      // M2b: per-tile column-reduction accumulator for dprob — ONE float per LOCAL row. The compute loop
-      // atomicAdds dA·silu(gate)·up into dprob_smem[lrow] (sum over this tile's I-slice cols); after the
-      // epi_smem barrier each row's partial is atomicAdded to the GLOBAL dprob[grow] (cross-CTA, since an
-      // m_tile's I/kTileN n-tiles land on different CTAs). 128 floats = 512B (negligible smem).
-      float dprob_smem[kEpiTileM];
     } tensors;
     struct PipelineStorage : cute::aligned_struct<16, _0> {
       alignas(16) typename PipelineLoad::SharedStorage load;
@@ -968,10 +963,6 @@ struct Sm100DSwiGluKernel {
         if (is_tma_store_lane) {
           cute::tma_store_wait<0>();
         }
-        // M2b: zero this tile's dprob column-accumulator (one float per epi thread == per LOCAL row) BEFORE
-        // the WAR barrier, so the barrier doubles as the "all rows zeroed" fence before the compute loop's
-        // atomicAdds. thread_idx ∈ [0,128) == kEpiTileM, so all rows are covered.
-        if (params.dprob != nullptr) ss.tensors.dprob_smem[thread_idx] = 0.0f;
         cutlass::arch::NamedBarrier epi_war_bar(NumEpiThreads, /*id=*/1u);
         epi_war_bar.arrive_and_wait();
 
@@ -981,6 +972,10 @@ struct Sm100DSwiGluKernel {
         // store-TMA; see the .cu note) overlap the unrolled compute and run parallel to the store-TMA engine.
         //   grad = dA·prob ;  dgate = grad·up·silu'(gate) → sGate ;  dup = grad·silu(gate) → sUp
         // silu(x)=x·σ(x), silu'(x)=σ(x)+silu(x)·(1-σ(x)). grow<M guards the h/prob reads on OOB rows.
+        // M2b: per-thread dprob accumulator. The 2-SM tcgen05 T2R maps each epi thread to ONE TMEM row (all
+        // kEpiTileN cols), so a thread's elements share ONE local row → sum dA·A' in a REGISTER and do ONE
+        // global atomicAdd after the loop (vs the old per-element smem atomic). Validated by M2B_DPROB n_fail.
+        ElementAcc dprob_acc = ElementAcc(0);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(r_dA); ++i) {
           int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
@@ -1001,12 +996,15 @@ struct Sm100DSwiGluKernel {
           const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
           sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
           sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
-          // M2b: dprob col-reduce partial — dprob[grow] += dA · A', A' = silu(gate)·up = s·up (the forward
-          // SwiGLU output, NOT prob-scaled; QuACK's postact). A' is a FREE byproduct (s, up already in regs).
-          // Accumulated into smem per LOCAL row; flushed to global dprob below. OOB rows have up=0 → adds 0.
-          if (params.dprob != nullptr) {
-            atomicAdd(&ss.tensors.dprob_smem[lrow], static_cast<float>(dA * s * up));
-          }
+          // M2b: dprob col-reduce — accumulate dA·A' (A' = silu(gate)·up = s·up, the forward SwiGLU output,
+          // NOT prob-scaled; QuACK's postact, a FREE byproduct). OOB rows have up=0 → adds 0.
+          if (params.dprob != nullptr) dprob_acc += dA * s * up;
+        }
+        // M2b: ONE global atomicAdd per thread — this thread's row partial → dprob[row] (cross-CTA, since an
+        // m_tile's I-slices land on different CTAs). The thread's LOCAL row is constant = get<0>(tTMc(0)).
+        if (params.dprob != nullptr) {
+          const int dprob_row = get<0>(tTMc(0)) + cta_row_offset;
+          if (dprob_row < params.M) atomicAdd(&params.dprob[dprob_row], static_cast<float>(dprob_acc));
         }
 
         // TMEM read is done (r_dA already in registers — single accumulator, no rUp; sA touches no TMEM).
@@ -1032,16 +1030,6 @@ struct Sm100DSwiGluKernel {
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier epi_smem_bar(NumEpiThreads, /*id=*/0u);
         epi_smem_bar.arrive_and_wait();
-
-        // M2b: flush THIS tile's dprob column-partials to GLOBAL dprob — one row per epi thread (thread_idx
-        // ∈ [0,128) == LOCAL row; global row = thread_idx + cta_row_offset). atomicAdd because an m_tile's
-        // I/kTileN n-tiles land on DIFFERENT CTAs that all contribute to the same dprob[m]. The epi_smem_bar
-        // above made every thread's compute-loop atomicAdds into dprob_smem visible. Each thread reads only
-        // its OWN dprob_smem[thread_idx], so the next tile's zero/accumulate of that slot is hazard-free.
-        if (params.dprob != nullptr) {
-          const int grow_p = thread_idx + cta_row_offset;
-          if (grow_p < params.M) atomicAdd(&params.dprob[grow_p], ss.tensors.dprob_smem[thread_idx]);
-        }
 
         // (3) TWO ASYNC TMA BULK-TENSOR STORES: ONE elected thread per CTA drains sGate → dY1[:, :I] and
         // sUp → dY1[:, I:2I], bypassing the L1/TEX/LSU path.  box_m = cta_row_offset/kEpiTileM (exact).
