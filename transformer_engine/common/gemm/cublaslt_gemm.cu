@@ -1058,7 +1058,12 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
   const int current_device = transformer_engine::cuda::current_device();
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
-  const bool is_blackwell = (transformer_engine::cuda::sm_arch(current_device) == 100);
+  // B300 (Blackwell Ultra) reports CC 10.3 (sm_arch 103), not 100 — accept the whole Blackwell
+  // CC 10.x family so NVTE_USE_CUTLASS_GROUPED_GEMM actually dispatches CUTLASS on B300. The
+  // sm_103a cubin is built and the inner launchers gate on sm_major==10; an exact `== 100` here
+  // silently fell back to cuBLAS on B300.
+  const int blackwell_sm = transformer_engine::cuda::sm_arch(current_device);
+  const bool is_blackwell = (blackwell_sm >= 100 && blackwell_sm < 110);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
   const bool use_sonic_moe = transformer_engine::getenv<bool>("NVTE_USE_FUSED_MOE", false);
   const bool use_cutlass_base = use_cutlass || use_sonic_moe;

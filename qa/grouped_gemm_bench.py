@@ -27,10 +27,18 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--ragged", action="store_true",
                     help="uneven tokens/expert -> exercises the varlen-K wgrad (ragged) path")
+    ap.add_argument("--mink", type=int, default=0,
+                    help="heavy-tail: min tokens/expert; with --maxk builds a 128-aligned ramp mink..maxk")
+    ap.add_argument("--maxk", type=int, default=0, help="heavy-tail: max tokens/expert (see --mink)")
     a = ap.parse_args()
     dt = torch.bfloat16 if a.dtype=="bf16" else torch.float16
     E, K, N, mper = a.experts, a.K, a.N, a.mper
-    if a.ragged:
+    if a.mink and a.maxk:
+        # heavy-tail: 128-aligned ramp mink..maxk across experts (matches wgrad_ragged_bench ramp_k)
+        mult = 128
+        splits = [max(mult, round((a.mink + (a.maxk - a.mink) * i / max(1, E - 1)) / mult) * mult)
+                  for i in range(E)]
+    elif a.ragged:
         # vary tokens/expert around mper (multiples of 128, never 0) -> ragged K for wgrad
         splits = [max(128, mper + 128 * ((i % 7) - 3)) for i in range(E)]
     else:
