@@ -200,27 +200,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             tensor_offsets=base_split_offsets * fc2_weight_shape[0],
         )
 
-        # dA = dY2 @ W2  -> [M, I]
-        dA = torch.empty(M, I, dtype=dtype, device=device)
-        grouped_dA = GroupedTensor(
-            shape=(M, I),
-            dtype=dtype,
-            num_tensors=num_groups,
-            quantizer=None,
-            data=dA.reshape(-1),
-            first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * I,
-        )
-        if fc2_ctx.input_requires_grad or fc1_ctx.input_requires_grad or fc1_ctx.weight_requires_grad:
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc2_weight,
-                grouped_dy2,
-                grouped_dA,
-                layout="NN",
-                use_split_accumulator=_2X_ACC_DGRAD,
-            )
-
-        # dW2 = dY2^T @ A   (NT, per expert), using saved activation output A.
+        # dW2 = dY2^T @ A   (NT, per expert), using saved activation output A. Independent of dA
+        # (uses A + dY2), so it runs the same in the B2-fused and fallback paths below.
         fc2_grad_params = self._compute_grouped_wgrad(
             fc_op=fc2_op,
             ctx=fc2_ctx,
@@ -233,23 +214,26 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         )
 
         # ======================================================================
-        # Step 2: SwiGLU backward -> dY1 = grad wrt h = [dgate || dup], shape [M, 2I].
-        #   grad      = dA * prob               (the forward applied A *= prob)
-        #   dY1       = dswiglu(grad, h)         (dgate || dup)
-        #   dprob[m]  = <silu(gate)*up, dA>[m]  (router-prob grad, if required)
+        # Step 2: FC2 dgrad + SwiGLU backward -> dY1 [M, 2I] = dgate||dup, and dprob (router-prob grad).
+        #   dA[m,:]  = dY2[m,:] @ W2[e]                          (FC2 dgrad, K=d)
+        #   grad     = dA * prob                                 (forward applied A *= prob)
+        #   dY1      = dswiglu(grad, h)                          (dgate || dup)
+        #   dprob[m] = <silu(gate)*up, dA>[m] = <swiglu(h), dA>  (router-prob grad, if required)
         #
-        # Design B: the forward SAVES h (swiglu_in_saved [M,2I]), so the backward READS it and runs
-        # dswiglu directly -- NO recompute (the reference design, the fastest backward; dA was already
-        # computed in Step 1). Phase 2 fuses dA=dY@W2 + dswiglu into one CUTLASS kernel. When h was NOT
-        # saved (legacy/inference ctx), fall back to recomputing h = x@W1^T via a bf16 grouped GEMM.
+        # B2 FUSED (h saved + binding present): te_cutlass_grouped_dswiglu does the FC2-dgrad GEMM in
+        #   TMEM (dA never reaches HBM) and the SwiGLU-backward epilogue reads the SAVED h, writing dY1
+        #   and column-reducing dprob -- ONE SM100 CUTLASS kernel replacing (separate dA grouped GEMM +
+        #   dA*prob + dswiglu kernel + swiglu-for-dprob).
+        # FALLBACK (h not saved, or binding absent): materialize dA via a grouped GEMM, use the saved h
+        #   or recompute h = x@W1^T, then the per-op dswiglu + (optional) swiglu-for-dprob.
         # ======================================================================
         grouped_fc1_weight = self._wrap_weight_grouped(
             fc1_op, fc1_weight, num_groups, fc1_weight_shape, dtype, device
         )
 
         # x / grouped_x are needed for: (a) the FC1 wgrad dW1 = dY1^T @ x (only if weight_requires_grad),
-        # and (b) the recompute fallback (always). Build only when needed -- Design B with saved h and
-        # frozen weights needs NEITHER (h saved + no wgrad), which the old recompute path could not handle.
+        # and (b) the recompute fallback. Build only when needed -- Design B with saved h and frozen
+        # weights needs NEITHER (h saved + no wgrad).
         grouped_x: Optional[GroupedTensor] = None
         need_recompute = swiglu_in_saved is None
         if fc1_ctx.weight_requires_grad or need_recompute:
@@ -259,35 +243,79 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 data=x.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * d,
             )
 
-        if not need_recompute:
-            # ---- Design B: read SAVED h (no recompute) ----
-            h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i)
-        else:
-            # ---- FALLBACK: recompute h = x@W1^T (no saved h, e.g. a legacy/inference ctx) ----
-            h = torch.empty(M, two_i, dtype=dtype, device=device)
-            grouped_h = GroupedTensor(
-                shape=(M, two_i), dtype=dtype, num_tensors=num_groups, quantizer=None,
-                data=h.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * two_i,
-            )
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc1_weight, grouped_x, grouped_h,
-                layout="TN", use_split_accumulator=_2X_ACC_FPROP,
-            )
-
-        # Apply router-prob: grad wrt the SwiGLU output is dA * prob.
-        grad_swiglu_out = dA
-        if scales is not None:
-            prob = maybe_dequantize(scales, dtype).reshape(-1)
-            grad_swiglu_out = dA * prob.unsqueeze(-1)
-        dY1 = tex.dswiglu(grad_swiglu_out, h, None)
-        dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-
-        # Router-prob gradient: dprob[m] = <swiglu(h)[m,:], dA[m,:]> (uses the saved/recomputed h).
+        need_dprob = scales is not None and activation_ctx.extra_input_requires_grad
         grad_scales = None
-        if scales is not None and activation_ctx.extra_input_requires_grad:
-            swiglu_out = tex.swiglu(h, None)
-            swiglu_out = maybe_dequantize(swiglu_out, dtype).reshape(M, I)
-            grad_scales = torch.linalg.vecdot(swiglu_out, dA).to(dtype=dtype)
+
+        if (not need_recompute) and hasattr(tex, "te_cutlass_grouped_dswiglu"):
+            # ---- B2: fused FC2-dgrad + dswiglu + dprob, reading the SAVED h (no materialized dA) ----
+            h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
+            # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
+            # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
+            tile_m = 256
+            num_tiles = (M + tile_m - 1) // tile_m
+            m_tile_expert = torch.repeat_interleave(
+                torch.arange(num_groups, device=device, dtype=torch.int32),
+                torch.div(split_sizes, tile_m, rounding_mode="floor"),
+                output_size=num_tiles,
+            )
+            w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
+            prob_f32 = (
+                maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
+                if scales is not None
+                else None
+            )
+            # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
+            dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
+            dY1 = tex.te_cutlass_grouped_dswiglu(
+                grad_output.contiguous(),  # dY2 [M, d]
+                w2_2d,                     # W2  [G*d, I]
+                h,                         # saved SwiGLU input [M, 2I]
+                m_tile_expert,
+                prob_f32,
+                num_groups,  # G
+                0,           # Me (unused in varlen-M mode)
+                I,
+                d,
+                M,           # M_varlen
+                0,           # math_sm_count (auto)
+                dprob,
+            )
+            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
+            if dprob is not None:
+                grad_scales = dprob.to(dtype=dtype)
+        else:
+            # ---- FALLBACK: materialize dA, use saved-or-recomputed h, per-op dswiglu + dprob ----
+            dA = torch.empty(M, I, dtype=dtype, device=device)
+            grouped_dA = GroupedTensor(
+                shape=(M, I), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=dA.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * I,
+            )
+            if fc2_ctx.input_requires_grad or fc1_ctx.input_requires_grad or fc1_ctx.weight_requires_grad:
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc2_weight, grouped_dy2, grouped_dA,
+                    layout="NN", use_split_accumulator=_2X_ACC_DGRAD,
+                )
+            if not need_recompute:
+                h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i)
+            else:
+                h = torch.empty(M, two_i, dtype=dtype, device=device)
+                grouped_h = GroupedTensor(
+                    shape=(M, two_i), dtype=dtype, num_tensors=num_groups, quantizer=None,
+                    data=h.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * two_i,
+                )
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc1_weight, grouped_x, grouped_h,
+                    layout="TN", use_split_accumulator=_2X_ACC_FPROP,
+                )
+            grad_swiglu_out = dA
+            if scales is not None:
+                prob = maybe_dequantize(scales, dtype).reshape(-1)
+                grad_swiglu_out = dA * prob.unsqueeze(-1)
+            dY1 = tex.dswiglu(grad_swiglu_out, h, None)
+            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
+            if need_dprob:
+                swiglu_out = maybe_dequantize(tex.swiglu(h, None), dtype).reshape(M, I)
+                grad_scales = torch.linalg.vecdot(swiglu_out, dA).to(dtype=dtype)
 
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
@@ -412,6 +440,41 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         gt = _make(torch.stack(weights, dim=0).contiguous().reshape(-1))
         fc_op._fused_moe_bwd_wcache = (key, gt)
         return gt
+
+    def _get_fc2_weight_2d(
+        self,
+        fc2_op: GroupedLinear,
+        num_groups: int,
+        fc2_weight_shape: tuple[int, int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the FC2 weight as a contiguous bf16 [G*d, I] tensor (per-expert [d, I] stacked).
+
+        This is the W2 B-operand layout ``te_cutlass_grouped_dswiglu`` expects (the SM100 dswiglu
+        kernel computes dA = dY2 @ W2 with K=d, N=I). Mirrors the forward's ``_get_fc1_weight_2d``
+        ([G*2I, d]).
+        """
+        out_features, in_features = fc2_weight_shape  # (d, I)
+        if fc2_op.single_grouped_weight:
+            if not isinstance(fc2_op.weight, GroupedTensor):
+                raise RuntimeError(
+                    "FC2 expected GroupedTensor weight with single_grouped_weight=True."
+                )
+            w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
+            return w.view(num_groups * out_features, in_features)
+        # Per-expert params: stack into one contiguous [G*d, I]; CACHE keyed on (id, _version) so the
+        # copy only re-runs when the optimizer updates the weights in-place.
+        weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+        key = tuple((id(w), w._version) for w in weight_params)
+        cache = getattr(self, "_fc2_w2d_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        stacked = (
+            torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
+        )
+        self._fc2_w2d_cache = (key, stacked)
+        return stacked
 
     @staticmethod
     def _grouped_x_data(
