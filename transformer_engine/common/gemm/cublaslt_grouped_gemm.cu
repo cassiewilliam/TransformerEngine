@@ -32,7 +32,7 @@ void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptr
                                       bool transa, bool transb, transformer_engine::DType dtype,
                                       void *workspace_ptr, size_t workspace_bytes, float alpha,
                                       float beta, int avg_m, int avg_n, int device, int math_sm_count,
-                                      cudaStream_t stream);
+                                      int tile_id, cudaStream_t stream);
 void cutlass_grouped_gemm_wgrad_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptrs,
                                             const int *m_arr, const int *n_arr, const int *k_arr,
                                             int avg_k, int num_gemms,
@@ -1077,6 +1077,12 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
     const int est_m = static_cast<int>(config.out_m);
     const int est_n = static_cast<int>(config.out_n);
     const int est_k = static_cast<int>(config.contraction_k);
+    // Tile-shape autotune knob: NVTE_SONIC_TILE_ID forces a variant (benchmark each to autotune); default 0.
+    // Measured (B200 4K-MoE, CUDA-graph fwd+bwd): tile 0 (256x256) is best for EVERY MoE GEMM shape here --
+    // 0.965ms vs tile 1 (256x128) 1.00ms (~4% slower) even at small N. So 256x256 is the autotuned optimum;
+    // the per-N heuristic was wrong. Knob + variants stay for other shapes / a future runtime autotuner.
+    int tile_id = transformer_engine::getenv<int>("NVTE_SONIC_TILE_ID", -1);
+    if (tile_id < 0) tile_id = 0;
     if (is_wgrad && d_dtype == transformer_engine::DType::kFloat32) {
       // FP32 wgrad (e.g. main_grad accumulation): the DEDICATED GemmGroupedWgrad kernel (FP32-capable
       // epilogue) is required -- the standard bf16/fp16 kernel below cannot emit an fp32 output. k_arr is
@@ -1096,14 +1102,14 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
           /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
           /*k_arr=*/setup_workspace.a_cols, est_k, static_cast<int>(num_tensors), A_sel.trans,
           B_sel.trans, A_sel.dtype, cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f,
-          est_m, est_n, device, config.sm_count, stream);
+          est_m, est_n, device, config.sm_count, tile_id, stream);
     } else {
       cutlass_grouped_gemm_device_ptrs(
           setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
           /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
           /*k_arr=*/setup_workspace.b_rows, est_k, static_cast<int>(num_tensors), A_sel.trans,
           B_sel.trans, A_sel.dtype, cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f,
-          est_m, est_n, device, config.sm_count, stream);
+          est_m, est_n, device, config.sm_count, tile_id, stream);
     }
     return;
   }

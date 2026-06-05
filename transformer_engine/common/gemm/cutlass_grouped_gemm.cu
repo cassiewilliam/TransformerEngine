@@ -150,37 +150,47 @@ void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptr
                                       bool transa, bool transb, transformer_engine::DType dtype,
                                       void *workspace_ptr, size_t workspace_bytes, float alpha,
                                       float beta, int avg_m, int avg_n, int device, int math_sm_count,
-                                      cudaStream_t stream) {
+                                      int tile_id, cudaStream_t stream) {
   using namespace transformer_engine;
   int sm_major = 0;
   NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
   const bool sm100 = (sm_major == 10);
 
-  auto run = [&](auto tag, auto sm100_tag) {
+  auto run = [&](auto tag, auto sm100_tag, auto tile_tag) {
     using T = decltype(tag);
     constexpr bool S = decltype(sm100_tag)::value;
+    constexpr int TID = decltype(tile_tag)::value;
     // CUTLASS-A = B operand, CUTLASS-B = A operand (matches cutlass_grouped_gemm's swap above).
     if (!transa && !transb) {
-      grouped_gemm::CutlassGroupedGemmDevice<false, false, T, S>(
+      grouped_gemm::CutlassGroupedGemmDevice<false, false, T, S, TID>(
           B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
           workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
     } else if (!transb && transa) {
-      grouped_gemm::CutlassGroupedGemmDevice<false, true, T, S>(
+      grouped_gemm::CutlassGroupedGemmDevice<false, true, T, S, TID>(
           B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
           workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
     } else if (transb && !transa) {
-      grouped_gemm::CutlassGroupedGemmDevice<true, false, T, S>(
+      grouped_gemm::CutlassGroupedGemmDevice<true, false, T, S, TID>(
           B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr,
           workspace_bytes, alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
     } else {
       NVTE_ERROR("Layout 'TT' is not supported by cutlass_grouped_gemm_device_ptrs.");
     }
   };
+  // Tile-id autotune knob: only SM100 has multiple tiles; non-SM100 clamps to 0. {0:256x256, 1:256x128}.
+  auto dispatch_tile = [&](auto tag, auto sm100_tag) {
+    constexpr bool S = decltype(sm100_tag)::value;
+    if (S && tile_id == 1) {
+      run(tag, sm100_tag, std::integral_constant<int, 1>{});
+    } else {
+      run(tag, sm100_tag, std::integral_constant<int, 0>{});
+    }
+  };
   auto dispatch = [&](auto tag) {
     if (sm100) {
-      run(tag, std::true_type{});
+      dispatch_tile(tag, std::true_type{});
     } else {
-      run(tag, std::false_type{});
+      dispatch_tile(tag, std::false_type{});
     }
   };
   if (dtype == DType::kBFloat16) {

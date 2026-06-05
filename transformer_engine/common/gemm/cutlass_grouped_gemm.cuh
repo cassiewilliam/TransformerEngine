@@ -114,7 +114,27 @@ struct GemmGivenSchedule {
 // kSm100=true  -> Blackwell (SM100) Ptr-Array TMA warp-specialized 1-SM schedule (tcgen05 UMMA).
 //                 Start with the 1-SM schedule (single-CTA, simplest constraints); a 2-SM/2-CTA
 //                 variant can be added later for higher throughput.
-template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false>
+// kTileId selects the SM100 threadblock tile (autotune knob; cluster stays 2x1x1 / 2-SM tcgen05):
+//   0 = 256x256x64 (default; best at large N), 1 = 256x128x64 (less N-tail waste at small N),
+//   2 = 256x192x64 (quack-style finer N-tile). Non-SM100 ignores kTileId (Hopper 128x128x128).
+template <bool kSm100, int kTileId>
+struct Sm100TileShapeSelector {
+  using type = cute::Shape<cute::_256, cute::_256, cute::_64>;
+};
+template <int kTileId>
+struct Sm100TileShapeSelector<false, kTileId> {
+  using type = cute::Shape<cute::_128, cute::_128, cute::_128>;
+};
+template <>
+struct Sm100TileShapeSelector<true, 1> {
+  using type = cute::Shape<cute::_256, cute::_128, cute::_64>;
+};
+template <>
+struct Sm100TileShapeSelector<true, 2> {
+  using type = cute::Shape<cute::_256, cute::_192, cute::_64>;
+};
+
+template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false, int kTileId = 0>
 struct ScheduleConfig {
   using ArchTag = std::conditional_t<kSm100, cutlass::arch::Sm100, cutlass::arch::Sm90>;
   // SM100 FINAL (converged over it1 1-SM / it2 2-SM / it3 1-SM@large-N): 2-SM / 2-CTA tcgen05.
@@ -126,9 +146,8 @@ struct ScheduleConfig {
   using EpilogueSchedule =
       std::conditional_t<kSm100, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
                          cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong>;
-  // it4: try N-tile 256 (vs 128) for higher large-N throughput.
-  using TileShape = std::conditional_t<kSm100, cute::Shape<cute::_256, cute::_256, cute::_64>,
-                                       cute::Shape<cute::_128, cute::_128, cute::_128>>;
+  // it4: N-tile is now an autotune knob (kTileId) -- see Sm100TileShapeSelector.
+  using TileShape = typename Sm100TileShapeSelector<kSm100, kTileId>::type;
   using ClusterShape = std::conditional_t<kSm100, cute::Shape<cute::_2, cute::_1, cute::_1>,
                                           cute::Shape<cute::_1, cute::_2, cute::_1>>;
 
@@ -138,9 +157,9 @@ struct ScheduleConfig {
   using DataType = DataType_;
 };
 
-template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false>
+template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false, int kTileId = 0>
 using GemmGrouped =
-    typename GemmGivenSchedule<ScheduleConfig<DataType_, trans_a, trans_b, kSm100>>::Gemm;
+    typename GemmGivenSchedule<ScheduleConfig<DataType_, trans_a, trans_b, kSm100, kTileId>>::Gemm;
 
 template <typename GemmT, typename ElementA, typename ElementB, typename ElementC, typename StrideA,
           typename StrideB, typename StrideC>
@@ -377,13 +396,13 @@ __global__ void cutlass_pack_device_args(int num, const int* m_arr, const int* n
   ldc[i] = LayoutC::packed({m, n}).stride(0);
 }
 
-template <bool trans_a, bool trans_b, typename Element, bool kSm100 = false>
+template <bool trans_a, bool trans_b, typename Element, bool kSm100 = false, int kTileId = 0>
 void CutlassGroupedGemmDevice(void** A_ptrs, void** B_ptrs, void** D_ptrs, const int* m_arr,
                               const int* n_arr, const int* k_arr, int avg_k, int num_gemms,
                               void* workspace_ptr_raw, size_t workspace_bytes, float alpha, float beta,
                               int avg_m, int avg_n, cudaStream_t stream, int device,
                               int math_sm_count) {
-  using Gemm = GemmGrouped<Element, trans_a, trans_b, kSm100>;
+  using Gemm = GemmGrouped<Element, trans_a, trans_b, kSm100, kTileId>;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
   using LayoutC = typename Gemm::LayoutC;
@@ -788,7 +807,7 @@ void cutlass_grouped_gemm_device_ptrs(void** A_ptrs, void** B_ptrs, void** D_ptr
                                       bool transa, bool transb, transformer_engine::DType dtype,
                                       void* workspace_ptr, size_t workspace_bytes, float alpha,
                                       float beta, int avg_m, int avg_n, int device, int math_sm_count,
-                                      cudaStream_t stream);
+                                      int tile_id, cudaStream_t stream);
 
 // On-device wgrad (NT) dispatch: dedicated GemmGroupedWgrad over the grouped setup's device arrays.
 // avg_m/avg_n MUST be the uniform weight output dims; k_arr is the per-expert ragged token contraction.
