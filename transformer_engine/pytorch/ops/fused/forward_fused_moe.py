@@ -48,13 +48,6 @@ from .._common import (
     validate_grouped_mlp_dims,
 )
 
-# When the SonicMoE fused MoE is enabled, default the grouped-tensor GEMM (the
-# fused MLP's down-proj forward/dgrad) to the on-device CUTLASS path. Users can
-# still override by setting NVTE_SONIC_GROUPED_CUTLASS explicitly. The accumulating
-# wgrad is routed back to cuBLAS in backward_fused_moe (it does not accumulate).
-if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) > 0:
-    os.environ.setdefault("NVTE_SONIC_GROUPED_CUTLASS", "1")
-
 # Each expert's token count MUST be a multiple of this for the CUTLASS kernel's
 # uniform-M (m_tile_expert=None) and varlen-M m-tiling. See the 256-alignment
 # assert in ``fuser_forward``.
