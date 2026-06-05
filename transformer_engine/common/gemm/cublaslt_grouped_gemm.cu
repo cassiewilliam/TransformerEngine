@@ -1054,12 +1054,14 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
                                  const GroupedGemmConfig &config, void *cublas_workspace_ptr,
                                  cudaStream_t stream) {
   // SonicMoE: dispatch CUTLASS straight from the on-device per-expert arrays (no host pointer loop /
-  // cudaMemcpyAsync). UNIFORM-contraction bf16|fp16 only (config.avg_k is the exact, uniform K -- so
-  // forward / dgrad, where M=d_rows is the ragged token dim). Gated by NVTE_USE_FUSED_MOE; the
-  // wgrad (ragged K) stays on cuBLAS here (its CUTLASS path is the discrete varlen-K kernel).
-  // NOTE: SM100 sets use_per_group_alpha_beta=true, but for a standard GEMM (no accumulate) every
-  // per-group alpha/beta is 1/0, so the scalar 1.0f/0.0f passed below is exact. (accumulate=beta!=0 is
-  // not yet routed here -- the gated cases are the non-accumulating forward/dgrad.)
+  // cudaMemcpyAsync). bf16|fp16, gated by NVTE_USE_FUSED_MOE. ALL grouped-GEMM cases route to CUTLASS
+  // here -- forward, dgrad, AND wgrad: the is_wgrad branch below (B transposed) handles the ragged-K
+  // wgrad (k_arr = the per-expert token contraction a_cols), so nothing falls back to cuBLAS. The exact
+  // per-expert dims come from the on-device d_cols/d_rows (m_arr/n_arr) and the real contraction K
+  // plumbed from nvte_grouped_gemm -- NOT config.avg_* (the cuBLAS hints).
+  // NOTE: SM100 sets use_per_group_alpha_beta=true, but for a standard (non-accumulating) GEMM every
+  // per-group alpha/beta is 1/0, so the scalar 1.0f/0.0f passed below is exact. FP32 wgrad (main_grad
+  // accumulation) takes the dedicated FP32-capable GemmGroupedWgrad path in the is_wgrad branch below.
   if (!config.use_fp8 &&
       (A_sel.dtype == transformer_engine::DType::kBFloat16 ||
        A_sel.dtype == transformer_engine::DType::kFloat16) &&
