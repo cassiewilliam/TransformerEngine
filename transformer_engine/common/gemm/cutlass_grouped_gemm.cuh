@@ -19,6 +19,7 @@
 
 #include <transformer_engine/transformer_engine.h>
 
+#include <atomic>
 #include <cub/cub.cuh>
 #include <type_traits>
 #include <vector>
@@ -228,12 +229,30 @@ int64_t inline getLddSize(int64_t num_gemms) {
   return (int64_t)(ROUND_UP(num_gemms * sizeof(int64_t), 128UL));
 }
 
-// cpu workspace size is 4MB
-static constexpr size_t kCPUWorkSpaceSize = 4 * 1024 * 1024;
+// Per grouped-GEMM host staging slot. Holds problem_sizes + per-expert ptr/stride arrays for the
+// host-loop launchers (~num_gemms * 60 B); 64 KB fits ~1000 experts (Case 7=32, Case 10=256) with
+// ample headroom. Slots are intentionally SMALL so the ring can be DEEP (depth, not slot size, is
+// what must cover the launch-ahead -- see kHostRingSlots).
+static constexpr size_t kHostSlotSize = 64 * 1024;
+// RING DEPTH (double-buffering). The host staging buffer's ONLY consumer is the async H2D copy
+// (cudaMemcpyAsync from pinned host -> device); the device buffer that the kernel reads during run
+// is protected by stream ordering (the next call's copy is enqueued after this call's kernel). The
+// HOST fill, however, is out-of-band (plain CPU writes, not stream-ordered), so with a SINGLE buffer
+// the next call's fill overwrites a slot whose copy is still pending -> corrupt sizes/ptrs to device
+// -> CUTLASS illegal/misaligned memory or NaN grads (Case 7/10; hidden under CUDA_LAUNCH_BLOCKING).
+// Giving each call its OWN rotating slot lets the prior copy drain slot K while the next fills slot
+// K+1 -> no race, NO cudaStreamSynchronize. The DEPTH must exceed the CPU's launch-ahead: the eager
+// backward enqueues ~6 grouped GEMMs/MoE-layer * ~42 layers ~= 250+/iter before the GPU drains them
+// (depth 64 was too shallow -> wrapped mid-iter -> NaN at iter 4). 1024 slots cover a full iter's
+// launch-ahead with large margin (also >= the CUDA kernel launch-queue bound on in-flight ops).
+static constexpr int kHostRingSlots = 1024;
+static constexpr size_t kCPUWorkSpaceSize =
+    kHostSlotSize * kHostRingSlots;  // 64 MB pinned (one-time)
 
 static char* getHostWorkspace() {
   static std::once_flag flag;
   static std::shared_ptr<char> workspace;
+  static std::atomic<uint64_t> ring_idx{0};
 
   std::call_once(flag, [&]() {
     // PINNED (page-locked) host memory. The per-expert pointer/problem-size arrays staged here are
@@ -249,7 +268,10 @@ static char* getHostWorkspace() {
     });
   });
 
-  return workspace.get();
+  // Hand out the next slot round-robin (ring buffer). See kHostRingSlots above for why this removes
+  // the host-buffer reuse race without a per-call stream sync.
+  const uint64_t slot = ring_idx.fetch_add(1, std::memory_order_relaxed) % kHostRingSlots;
+  return workspace.get() + slot * kHostSlotSize;
 }
 
 template <bool trans_a, bool trans_b, typename Element, bool kSm100 = false>
