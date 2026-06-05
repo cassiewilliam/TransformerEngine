@@ -48,6 +48,13 @@ from .._common import (
     validate_grouped_mlp_dims,
 )
 
+# When the SonicMoE fused MoE is enabled, default the grouped-tensor GEMM (the
+# fused MLP's down-proj forward/dgrad) to the on-device CUTLASS path. Users can
+# still override by setting NVTE_SONIC_GROUPED_CUTLASS explicitly. The accumulating
+# wgrad is routed back to cuBLAS in backward_fused_moe (it does not accumulate).
+if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) > 0:
+    os.environ.setdefault("NVTE_SONIC_GROUPED_CUTLASS", "1")
+
 # Each expert's token count MUST be a multiple of this for the CUTLASS kernel's
 # uniform-M (m_tile_expert=None) and varlen-M m-tiling. See the 256-alignment
 # assert in ``fuser_forward``.
@@ -117,10 +124,20 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         if not self.is_supported():
             self.grouped_swiglu_kernel()  # Try triggering import error
             raise RuntimeError(f"{self.__class__.__name__} is not supported on this system.")
-        # validate_grouped_mlp_dims enforces fc1.out_features == 2*fc2.in_features
-        # (GLU), matching num_groups, and 32-wide GLU interleave (ref __init__
-        # forward_grouped_mlp.py:120).
-        validate_grouped_mlp_dims(fc1, activation, fc2)
+        # validate_grouped_mlp_dims enforces fc1.out_features == 2*fc2.in_features (GLU),
+        # matching num_groups, and (for GLU) 32-wide interleaving. The bf16 CUTLASS SwiGLU
+        # kernel reads plain gate||up and ignores glu_interleave_size, so accept plain (None)
+        # interleave too: present 32 to the shared validator for the dim/num_groups checks,
+        # then restore. No compute effect -- the kernel never reads this field. (Adapted
+        # locally so validate_grouped_mlp_dims keeps its 32-wide contract for other callers.)
+        _plain_glu = getattr(activation, "glu_interleave_size", 32) is None
+        if _plain_glu:
+            activation.glu_interleave_size = 32
+        try:
+            validate_grouped_mlp_dims(fc1, activation, fc2)
+        finally:
+            if _plain_glu:
+                activation.glu_interleave_size = None
         # bf16 CUTLASS kernel is SwiGLU-only: reject GeGLU/SReLU here. The
         # reference instead selected a cuDNN act_func string; we only support
         # silu(gate)*up.
