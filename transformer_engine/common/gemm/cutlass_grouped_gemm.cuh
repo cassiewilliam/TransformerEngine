@@ -690,6 +690,84 @@ void CutlassGroupedGemmWgrad(const NVTETensor* A, const NVTETensor* B, NVTETenso
   }
 }
 
+// On-device variant of CutlassGroupedGemmWgrad: dispatches the DEDICATED wgrad kernel (GemmGroupedWgrad --
+// FP32-capable epilogue, 256x128 wgrad tile, varlen-K) straight from the grouped setup's on-device
+// pointer/dim arrays (no host pointer loop, no cudaMemcpyAsync of pointers). Body mirrors
+// CutlassGroupedGemmDevice but over the wgrad Config. avg_m/avg_n MUST be the UNIFORM weight output dims
+// (NOT the token avg, which would under-size the grid); k_arr is the per-expert RAGGED token contraction.
+template <bool trans_a, bool trans_b, typename ElementD, bool kSm100 = false, bool kBigN = false>
+void CutlassGroupedGemmWgradDevice(void** A_ptrs, void** B_ptrs, void** D_ptrs, const int* m_arr,
+                                   const int* n_arr, const int* k_arr, int avg_k, int num_gemms,
+                                   void* workspace_ptr_raw, size_t workspace_bytes, float alpha,
+                                   float beta, int avg_m, int avg_n, cudaStream_t stream, int device,
+                                   int math_sm_count) {
+  using Config = GemmGivenScheduleWgrad<trans_a, trans_b, ElementD, kSm100, kBigN>;
+  using Gemm = GemmGroupedWgrad<trans_a, trans_b, ElementD, kSm100, kBigN>;
+  using LayoutA = typename Config::LayoutA;
+  using LayoutB = typename Config::LayoutB;
+  using LayoutC = typename Config::LayoutC;
+  using ElementA = typename Config::ElementA;
+  using ElementB = typename Config::ElementB;
+  using ElementC = typename Config::ElementC;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+
+  typename Gemm::Arguments arguments;
+  size_t kernel_workspace_size = Gemm::get_workspace_size(arguments);
+  auto gemm_coord_size = getGemmCoordSize(num_gemms);
+  auto ldd_size = getLddSize(num_gemms);
+  auto param_workspace_size = gemm_coord_size + 3 * ldd_size;
+  auto total_workspace_size = param_workspace_size + kernel_workspace_size;
+
+  NVTE_CHECK(total_workspace_size < workspace_bytes,
+             "Insufficient workspace for CUTLASS device wgrad grouped GEMM: required=",
+             static_cast<int64_t>(total_workspace_size),
+             ", available=", static_cast<int64_t>(workspace_bytes));
+  char* workspace_ptr = reinterpret_cast<char*>(workspace_ptr_raw);
+
+  char* host_workspace = getHostWorkspace();
+  ProblemShapeType* problem_sizes_host = reinterpret_cast<ProblemShapeType*>(host_workspace);
+  for (int i = 0; i < num_gemms; i++) {
+    problem_sizes_host[i] = ProblemShapeType(avg_m, avg_n, avg_k);
+  }
+
+  ProblemShapeType* problem_sizes_device = reinterpret_cast<ProblemShapeType*>(workspace_ptr);
+  int64_t* lda64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 0 * ldd_size);
+  int64_t* ldb64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 1 * ldd_size);
+  int64_t* ldc64 = reinterpret_cast<int64_t*>(workspace_ptr + gemm_coord_size + 2 * ldd_size);
+
+  constexpr int kBlock = 128;
+  int grid = (num_gemms + kBlock - 1) / kBlock;
+  cutlass_pack_device_args<ProblemShapeType, LayoutA, LayoutB, LayoutC>
+      <<<grid, kBlock, 0, stream>>>(num_gemms, m_arr, n_arr, k_arr, problem_sizes_device, lda64,
+                                    ldb64, ldc64);
+
+  StrideA* lda = reinterpret_cast<StrideA*>(lda64);
+  StrideB* ldb = reinterpret_cast<StrideB*>(ldb64);
+  StrideC* ldc = reinterpret_cast<StrideC*>(ldc64);
+  const ElementA** ptr_A = const_cast<const ElementA**>(reinterpret_cast<ElementA**>(A_ptrs));
+  const ElementB** ptr_B = const_cast<const ElementB**>(reinterpret_cast<ElementB**>(B_ptrs));
+  ElementC** ptr_C = reinterpret_cast<ElementC**>(D_ptrs);
+
+  char* kernel_workspace_ptr = workspace_ptr + param_workspace_size;
+
+  arguments = MakeArguments<Gemm, ElementA, ElementB, ElementC, StrideA, StrideB, StrideC>(
+      num_gemms, problem_sizes_host, problem_sizes_device, ptr_A, lda, ptr_B, ldb, ptr_C, ldc, alpha,
+      beta, device, math_sm_count);
+
+  Gemm gemm;
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device wgrad grouped GEMM: can_implement failed (", num_gemms, " groups)");
+  }
+  if (gemm.initialize(arguments, kernel_workspace_ptr) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device wgrad grouped GEMM: initialize failed (", num_gemms, " groups)");
+  }
+  if (gemm.run(stream) != cutlass::Status::kSuccess) {
+    NVTE_ERROR("CUTLASS device wgrad grouped GEMM: run failed (", num_gemms, " groups)");
+  }
+}
+
 }  // namespace grouped_gemm
 }  // namespace transformer_engine
 
@@ -711,3 +789,13 @@ void cutlass_grouped_gemm_device_ptrs(void** A_ptrs, void** B_ptrs, void** D_ptr
                                       void* workspace_ptr, size_t workspace_bytes, float alpha,
                                       float beta, int avg_m, int avg_n, int device, int math_sm_count,
                                       cudaStream_t stream);
+
+// On-device wgrad (NT) dispatch: dedicated GemmGroupedWgrad over the grouped setup's device arrays.
+// avg_m/avg_n MUST be the uniform weight output dims; k_arr is the per-expert ragged token contraction.
+void cutlass_grouped_gemm_wgrad_device_ptrs(void** A_ptrs, void** B_ptrs, void** D_ptrs,
+                                            const int* m_arr, const int* n_arr, const int* k_arr,
+                                            int avg_k, int num_gemms,
+                                            transformer_engine::DType out_dtype, void* workspace_ptr,
+                                            size_t workspace_bytes, float alpha, float beta, int avg_m,
+                                            int avg_n, int device, int math_sm_count,
+                                            cudaStream_t stream);

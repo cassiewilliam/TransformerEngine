@@ -192,6 +192,45 @@ void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptr
   }
 }
 
+void cutlass_grouped_gemm_wgrad_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptrs,
+                                            const int *m_arr, const int *n_arr, const int *k_arr,
+                                            int avg_k, int num_gemms,
+                                            transformer_engine::DType out_dtype, void *workspace_ptr,
+                                            size_t workspace_bytes, float alpha, float beta, int avg_m,
+                                            int avg_n, int device, int math_sm_count,
+                                            cudaStream_t stream) {
+  using namespace transformer_engine;
+  int sm_major = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+  const bool sm100 = (sm_major == 10);
+  // kBigN N-tile selection mirrors cutlass_grouped_gemm_varlen_k: large average-K (>=1536) -> 256x256,
+  // else 256x128 (the MoE wgrad's K=tokens is small -> 256x128).
+  const bool big_n = sm100 && avg_k >= 1536;
+  // NT wgrad: CUTLASS-A = grad (B operand), CUTLASS-B = input (A operand), fixed template <true,false>.
+  auto run = [&](auto tag, auto sm100_tag, auto bign_tag) {
+    grouped_gemm::CutlassGroupedGemmWgradDevice<true, false, decltype(tag),
+                                                decltype(sm100_tag)::value, decltype(bign_tag)::value>(
+        B_ptrs, A_ptrs, D_ptrs, m_arr, n_arr, k_arr, avg_k, num_gemms, workspace_ptr, workspace_bytes,
+        alpha, beta, avg_m, avg_n, stream, device, math_sm_count);
+  };
+  auto dispatch = [&](auto tag) {
+    if (!sm100) {
+      run(tag, std::false_type{}, std::false_type{});
+    } else if (big_n) {
+      run(tag, std::true_type{}, std::true_type{});
+    } else {
+      run(tag, std::true_type{}, std::false_type{});
+    }
+  };
+  if (out_dtype == DType::kFloat32) {
+    dispatch(float{});
+  } else if (out_dtype == DType::kBFloat16) {
+    dispatch(cutlass::bfloat16_t{});
+  } else {
+    NVTE_ERROR("cutlass_grouped_gemm_wgrad_device_ptrs: only FP32/BF16 output supported.");
+  }
+}
+
 namespace {
 
 // Zero-initialize empty (K=0) groups (when not accumulating) and forward the non-empty groups to

@@ -33,6 +33,13 @@ void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptr
                                       void *workspace_ptr, size_t workspace_bytes, float alpha,
                                       float beta, int avg_m, int avg_n, int device, int math_sm_count,
                                       cudaStream_t stream);
+void cutlass_grouped_gemm_wgrad_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptrs,
+                                            const int *m_arr, const int *n_arr, const int *k_arr,
+                                            int avg_k, int num_gemms,
+                                            transformer_engine::DType out_dtype, void *workspace_ptr,
+                                            size_t workspace_bytes, float alpha, float beta, int avg_m,
+                                            int avg_n, int device, int math_sm_count,
+                                            cudaStream_t stream);
 
 namespace {
 
@@ -1046,30 +1053,51 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
   // NOTE: SM100 sets use_per_group_alpha_beta=true, but for a standard GEMM (no accumulate) every
   // per-group alpha/beta is 1/0, so the scalar 1.0f/0.0f passed below is exact. (accumulate=beta!=0 is
   // not yet routed here -- the gated cases are the non-accumulating forward/dgrad.)
-  // Exclude the wgrad (NT layout: !transa && transb). Its contraction K is the RAGGED token dim and its
-  // CUTLASS-A is column-major; the standard grouped kernel here mis-handles it (the dedicated varlen-K
-  // kernel is the right path, integrating it into the grouped-tensor flow is follow-up). Forward/dgrad
-  // (TN/NN) have a uniform K = b_rows and work. wgrad keeps cuBLAS here.
-  const bool is_wgrad_nt = (!A_sel.trans && B_sel.trans);
-  if (!config.use_fp8 && !is_wgrad_nt &&
+  if (!config.use_fp8 &&
       (A_sel.dtype == transformer_engine::DType::kBFloat16 ||
        A_sel.dtype == transformer_engine::DType::kFloat16) &&
       A_sel.dtype == B_sel.dtype && A_sel.dtype == d_dtype &&
       transformer_engine::getenv<bool>("NVTE_SONIC_GROUPED_CUTLASS", false)) {
     const int device = transformer_engine::cuda::current_device();
-    // d_rows/d_cols are cuBLAS column-major STORAGE dims ("rows=last, cols=first"), i.e. SWAPPED vs the
-    // logical (M,N): for D[M,N] row-major, d_rows=N(last), d_cols=M(first). CUTLASS wants M=output rows,
-    // N=output cols -> m_arr=d_cols, n_arr=d_rows. The contraction K is CUTLASS-A's (= B operand) K-dim:
-    // for trans_a=false (TN/NN forward/dgrad, uniform K) it is B's inner dim b_rows; for trans_a=true
-    // (NT wgrad, RAGGED K = tokens) it is B's outer dim b_cols. CUTLASS-A trans = B_sel.trans.
-    const int *k_arr = B_sel.trans ? setup_workspace.b_cols : setup_workspace.b_rows;
-    cutlass_grouped_gemm_device_ptrs(
-        setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
-        /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows, k_arr,
-        static_cast<int>(config.avg_k), static_cast<int>(num_tensors), A_sel.trans, B_sel.trans,
-        A_sel.dtype, cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f,
-        static_cast<int>(config.avg_m), static_cast<int>(config.avg_n), device, config.sm_count,
-        stream);
+    // d_rows/d_cols are cuBLAS column-major STORAGE dims ("rows=last, cols=first") = SWAPPED vs logical
+    // (M,N): for D[M,N] row-major, d_rows=N, d_cols=M -> m_arr=d_cols, n_arr=d_rows. The contraction K and
+    // the host (M,N) estimate differ by case:
+    //  - forward/dgrad (TN/NN, B not transposed): K = B's inner dim b_rows (uniform); output M is the
+    //    RAGGED token dim, so config.avg_m/avg_n (token avg / uniform N) are the right host estimate.
+    //  - wgrad (NT, B=dy transposed): K = the RAGGED token dim = a_cols (A=x's first dim). The output
+    //    M,N are the UNIFORM weight dims, but config.avg_m/avg_n hold the token avg (WRONG -> would
+    //    UNDER-size the grid -> incomplete tiles -> nan), so read the real uniform M/N from d_cols/d_rows.
+    const bool is_wgrad = B_sel.trans;
+    int est_m = static_cast<int>(config.avg_m);
+    int est_n = static_cast<int>(config.avg_n);
+    int est_k = static_cast<int>(config.avg_k);
+    if (is_wgrad) {
+      // wgrad: config.avg_m/avg_n are the token avg (NOT the uniform weight output dims) and config.avg_k
+      // is a cuBLAS hint (NOT the ragged token contraction). Read the real per-expert-0 values so the host
+      // estimate matches the device problem (else the grid under-sizes -> incomplete tiles -> nan) and the
+      // wgrad N-tile (kBigN, keyed on avg_k) is picked from the actual small token-K.
+      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_m, setup_workspace.d_cols, sizeof(int),
+                                      cudaMemcpyDeviceToHost, stream));
+      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_n, setup_workspace.d_rows, sizeof(int),
+                                      cudaMemcpyDeviceToHost, stream));
+      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_k, setup_workspace.a_cols, sizeof(int),
+                                      cudaMemcpyDeviceToHost, stream));
+      NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
+      // DEDICATED on-device wgrad kernel (GemmGroupedWgrad). k_arr = the ragged token contraction = a_cols.
+      cutlass_grouped_gemm_wgrad_device_ptrs(
+          setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
+          /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
+          /*k_arr=*/setup_workspace.a_cols, est_k, static_cast<int>(num_tensors), d_dtype,
+          cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f, est_m, est_n, device,
+          config.sm_count, stream);
+    } else {
+      cutlass_grouped_gemm_device_ptrs(
+          setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
+          /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
+          /*k_arr=*/setup_workspace.b_rows, est_k, static_cast<int>(num_tensors), A_sel.trans,
+          B_sel.trans, A_sel.dtype, cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f,
+          est_m, est_n, device, config.sm_count, stream);
+    }
     return;
   }
 
