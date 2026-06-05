@@ -460,6 +460,13 @@ struct GroupedGemmConfig {
   int64_t avg_m = 0;
   int64_t avg_n = 0;
   int64_t avg_k = 0;
+  // CUTLASS-dispatch host estimate (separate from the cuBLAS avg_* hints above, which the caller may
+  // override with the token avg). out_m/out_n are the REAL per-expert output dims (always from outputD);
+  // contraction_k is the REAL reduction (= the ragged token dim for the NT wgrad). These size the grouped
+  // scheduler's grid + pick the wgrad N-tile WITHOUT a per-call D2H read of the on-device setup dims.
+  int64_t out_m = 0;
+  int64_t out_n = 0;
+  int64_t contraction_k = 0;
   int sm_count = 0;
 };
 
@@ -1060,36 +1067,36 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
       transformer_engine::getenv<bool>("NVTE_SONIC_GROUPED_CUTLASS", false)) {
     const int device = transformer_engine::cuda::current_device();
     // d_rows/d_cols are cuBLAS column-major STORAGE dims ("rows=last, cols=first") = SWAPPED vs logical
-    // (M,N): for D[M,N] row-major, d_rows=N, d_cols=M -> m_arr=d_cols, n_arr=d_rows. The contraction K and
-    // the host (M,N) estimate differ by case:
-    //  - forward/dgrad (TN/NN, B not transposed): K = B's inner dim b_rows (uniform); output M is the
-    //    RAGGED token dim, so config.avg_m/avg_n (token avg / uniform N) are the right host estimate.
-    //  - wgrad (NT, B=dy transposed): K = the RAGGED token dim = a_cols (A=x's first dim). The output
-    //    M,N are the UNIFORM weight dims, but config.avg_m/avg_n hold the token avg (WRONG -> would
-    //    UNDER-size the grid -> incomplete tiles -> nan), so read the real uniform M/N from d_cols/d_rows.
+    // (M,N): for D[M,N] row-major, d_rows=N, d_cols=M -> m_arr=d_cols, n_arr=d_rows. The host (M,N,K)
+    // estimate is config.out_m/out_n/contraction_k (the REAL per-expert output dims + true reduction,
+    // plumbed from nvte_grouped_gemm) -- NOT config.avg_* (the cuBLAS hints, which for the NT wgrad hold
+    // the token avg and would UNDER-size the grouped scheduler's grid -> incomplete tiles -> nan). No D2H.
+    // The device per-expert K differs by case: forward/dgrad K = B's inner dim b_rows; wgrad K = the ragged
+    // token dim a_cols (A=x's first dim).
     const bool is_wgrad = B_sel.trans;
-    int est_m = static_cast<int>(config.avg_m);
-    int est_n = static_cast<int>(config.avg_n);
-    int est_k = static_cast<int>(config.avg_k);
-    if (is_wgrad) {
-      // wgrad: config.avg_m/avg_n are the token avg (NOT the uniform weight output dims) and config.avg_k
-      // is a cuBLAS hint (NOT the ragged token contraction). Read the real per-expert-0 values so the host
-      // estimate matches the device problem (else the grid under-sizes -> incomplete tiles -> nan) and the
-      // wgrad N-tile (kBigN, keyed on avg_k) is picked from the actual small token-K.
-      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_m, setup_workspace.d_cols, sizeof(int),
-                                      cudaMemcpyDeviceToHost, stream));
-      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_n, setup_workspace.d_rows, sizeof(int),
-                                      cudaMemcpyDeviceToHost, stream));
-      NVTE_CHECK_CUDA(cudaMemcpyAsync(&est_k, setup_workspace.a_cols, sizeof(int),
-                                      cudaMemcpyDeviceToHost, stream));
-      NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
-      // DEDICATED on-device wgrad kernel (GemmGroupedWgrad). k_arr = the ragged token contraction = a_cols.
+    const int est_m = static_cast<int>(config.out_m);
+    const int est_n = static_cast<int>(config.out_n);
+    const int est_k = static_cast<int>(config.contraction_k);
+    if (is_wgrad && d_dtype == transformer_engine::DType::kFloat32) {
+      // FP32 wgrad (e.g. main_grad accumulation): the DEDICATED GemmGroupedWgrad kernel (FP32-capable
+      // epilogue) is required -- the standard bf16/fp16 kernel below cannot emit an fp32 output. k_arr is
+      // the ragged token contraction = a_cols (A=x's first dim).
       cutlass_grouped_gemm_wgrad_device_ptrs(
           setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
           /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
           /*k_arr=*/setup_workspace.a_cols, est_k, static_cast<int>(num_tensors), d_dtype,
           cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f, est_m, est_n, device,
           config.sm_count, stream);
+    } else if (is_wgrad) {
+      // bf16/fp16 wgrad: the standard GemmGrouped kernel is ~20% FASTER than the dedicated GemmGroupedWgrad
+      // here -- its FP32-capable epilogue + small wgrad N-tile are overkill for a bf16 output. Same NT
+      // dispatch (transa/transb), but k_arr = the ragged token contraction = a_cols (not b_rows).
+      cutlass_grouped_gemm_device_ptrs(
+          setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
+          /*m_arr=*/setup_workspace.d_cols, /*n_arr=*/setup_workspace.d_rows,
+          /*k_arr=*/setup_workspace.a_cols, est_k, static_cast<int>(num_tensors), A_sel.trans,
+          B_sel.trans, A_sel.dtype, cublas_workspace_ptr, kGroupedGemmCublasWorkspaceSize, 1.0f, 0.0f,
+          est_m, est_n, device, config.sm_count, stream);
     } else {
       cutlass_grouped_gemm_device_ptrs(
           setup_workspace.A_ptrs, setup_workspace.B_ptrs, setup_workspace.D_ptrs,
@@ -1709,6 +1716,11 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
   gemm_config.avg_n = config_.avg_n.value_or(compute_avg_last_dim(outputD));
   gemm_config.avg_k =
       config_.avg_k.value_or(transa ? compute_avg_first_dim(inputA) : compute_avg_last_dim(inputA));
+  // CUTLASS host estimate (never the caller's avg_* override): the REAL per-expert output dims, and the
+  // true reduction -- the ragged token dim (inputA's first dim) for the NT wgrad, else avg_k.
+  gemm_config.out_m = compute_avg_first_dim(outputD);
+  gemm_config.out_n = compute_avg_last_dim(outputD);
+  gemm_config.contraction_k = (!transa && transb) ? compute_avg_first_dim(inputA) : gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, outputD->dtype(), num_tensors,
                        gemm_config, workspace.cublas_workspace_ptr, stream);
@@ -1859,6 +1871,12 @@ void nvte_grouped_gemm_with_discrete_inputA(const NVTETensor *A_list, size_t num
   gemm_config.avg_n =
       config_.avg_n.value_or(transb ? compute_avg_first_dim(inputB) : compute_avg_last_dim(inputB));
   gemm_config.avg_k = config_.avg_k.value_or(transa ? avg_first_dim : avg_last_dim);
+  // CUTLASS host estimate: output is grouped here, so the real dims come from outputD. (inputA is discrete
+  // here; this path is not the NT wgrad -- that is nvte_grouped_gemm_with_discrete_out -- so avg_k suffices
+  // for contraction_k.)
+  gemm_config.out_m = compute_avg_first_dim(outputD);
+  gemm_config.out_n = compute_avg_last_dim(outputD);
+  gemm_config.contraction_k = gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, outputD->dtype(), num_tensors,
                        gemm_config, workspace.cublas_workspace_ptr, stream);
@@ -1947,6 +1965,12 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
       config_.avg_n.value_or(transb ? compute_avg_first_dim(inputB) : compute_avg_last_dim(inputB));
   gemm_config.avg_k =
       config_.avg_k.value_or(transa ? compute_avg_first_dim(inputA) : compute_avg_last_dim(inputA));
+  // CUTLASS host estimate: the output is DISCRETE here (avg_m/avg_n above are input-derived = the token
+  // avg, not the output dims), so read the real per-expert output M,N from D_list[0]'s shape. The NT wgrad
+  // reduction is the ragged token dim (inputA's first dim).
+  gemm_config.out_m = static_cast<int64_t>(d0->data.shape[0]);
+  gemm_config.out_n = static_cast<int64_t>(d0->data.shape[1]);
+  gemm_config.contraction_k = (!transa && transb) ? compute_avg_first_dim(inputA) : gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, d_dtype, num_tensors, gemm_config,
                        workspace.cublas_workspace_ptr, stream);
