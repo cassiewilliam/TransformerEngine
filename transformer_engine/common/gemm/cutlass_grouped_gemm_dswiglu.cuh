@@ -976,20 +976,29 @@ struct Sm100DSwiGluKernel {
         // M2b: per-thread dprob accumulator. The 2-SM tcgen05 T2R maps each epi thread to ONE TMEM row (all
         // kEpiTileN cols), so a thread's elements share ONE local row → sum dA·A' in a REGISTER and do ONE
         // global atomicAdd after the loop (vs the old per-element smem atomic). Validated by M2B_DPROB n_fail.
+        // OPT (LSU-op-bound): the 2-SM tcgen05 T2R maps THIS thread to ONE local row (all kEpiTileN
+        // cols) — the same invariant the dprob atomicAdd below relies on (get<0>(tTMc(0)) is constant).
+        // Hoist every per-ROW quantity (lrow, grow, the M bound, prob[grow], the h row base) OUT of the
+        // per-COL loop, so the loop issues only the two per-col h reads (gate/up) + two smem writes —
+        // drops the redundant per-element prob[grow] reload (kEpiTileN-1 LSU reads saved per thread).
+        const int lrow = get<0>(tTMc(0));            // LOCAL row — constant for this thread
+        const int grow = lrow + cta_row_offset;      // GLOBAL token row — constant
+        const bool row_ok = grow < params.M;
+        const ElementAcc p = (row_ok && params.prob != nullptr)
+                                 ? static_cast<ElementAcc>(params.prob[grow])
+                                 : ElementAcc(1);
+        const int64_t hrow_base = static_cast<int64_t>(grow) * h_row;  // saved h[grow, 0]
         ElementAcc dprob_acc = ElementAcc(0);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(r_dA); ++i) {
-          int lrow = get<0>(tTMc(i));  // LOCAL row ∈ [0,kEpiTileM)
-          int lcol = get<1>(tTMc(i));  // LOCAL col ∈ [0,kEpiTileN)
-          const int grow = lrow + cta_row_offset;  // GLOBAL token row
+          const int lcol = get<1>(tTMc(i));        // LOCAL col ∈ [0,kEpiTileN)
           const int gcol = lcol + cta_col_offset;  // GLOBAL intermediate col ∈ [0,I)
-          const ElementAcc dA = r_dA(i);          // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
-          ElementAcc gate = ElementAcc(0), up = ElementAcc(0), p = ElementAcc(1);
-          if (grow < params.M) {
-            const int64_t hbase = static_cast<int64_t>(grow) * h_row + gcol;  // saved h[grow, gcol]
-            gate = static_cast<ElementAcc>(params.dGrad[hbase]);              // h gate-half
-            up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]);     // h up-half (col I+gcol)
-            if (params.prob != nullptr) p = params.prob[grow];
+          const ElementAcc dA = r_dA(i);           // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
+          ElementAcc gate = ElementAcc(0), up = ElementAcc(0);
+          if (row_ok) {
+            const int64_t hbase = hrow_base + gcol;                       // saved h[grow, gcol]
+            gate = static_cast<ElementAcc>(params.dGrad[hbase]);          // h gate-half
+            up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]); // h up-half (col I+gcol)
           }
           const ElementAcc grad = dA * p;
           const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
