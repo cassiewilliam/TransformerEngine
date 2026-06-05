@@ -21,6 +21,7 @@
 
 #include <cub/cub.cuh>
 #include <type_traits>
+#include <vector>
 
 #include "../common.h"
 #include "../util/logging.h"
@@ -428,14 +429,30 @@ void CutlassGroupedGemmDevice(void** A_ptrs, void** B_ptrs, void** D_ptrs, const
              ", available=", static_cast<int64_t>(workspace_bytes));
   char* workspace_ptr = reinterpret_cast<char*>(workspace_ptr_raw);
 
-  // problem_sizes_host = AVERAGE estimate (no per-expert host build, no D2H sync).
-  char* host_workspace = getHostWorkspace();
-  ProblemShapeType* problem_sizes_host = reinterpret_cast<ProblemShapeType*>(host_workspace);
-  for (int i = 0; i < num_gemms; i++) {
-    // K does not affect the grouped scheduler's tile count (= M/tileM * N/tileN), so the avg-K host
-    // estimate is harmless; the exact per-expert K drives the mainloop via problem_sizes_device.
-    problem_sizes_host[i] = ProblemShapeType(avg_m, avg_n, avg_k);
-  }
+  // problem_sizes_host: EXACT per-expert M via a small D2H of ONLY the ragged m_arr.
+  // The persistent grouped scheduler derives its TILE COUNT from these host sizes. The previous
+  // AVERAGE estimate (avg_m) undercounts Sum(ceil(M_e/tileM) * ceil(N/tileN)) whenever the per-expert
+  // M (token counts from real MoE routing) are ragged / not tile(256)-aligned: the average cannot
+  // bound the per-expert sum, so partial last tiles are never scheduled -> uninitialized output ->
+  // NaN. (Uniform Me=768 in unit tests hides this: avg == exact.) Exact per-expert M matches the
+  // host-loop CutlassGroupedGemm and cuBLAS, robust to ANY distribution.
+  // Only M (the token dim) is ragged across experts; N (the weight output dim) is UNIFORM, so avg_n
+  // is already exact -- the n_arr D2H is redundant and dropped. K does not affect the tile count, so
+  // avg_k is fine; the exact per-expert K still drives the mainloop via problem_sizes_device.
+  // SonicMoE: pass NO host problem shapes (nullptr) -> ZERO D2H, ZERO host loop, CUDA-graph capturable.
+  // CUTLASS's grouped scheduler then takes the device-only branch in get_tiled_cta_shape_mnl
+  // (group_array_problem_shape.hpp:74-80 is_host_problem_shape_available(); sm90_tile_scheduler_group.hpp):
+  //   if (!is_host_problem_shape_available()) total_ctas = sm_count;   // launch the LARGEST persistent grid
+  // and the ON-DEVICE scheduler iterates the EXACT per-expert tiles from problem_sizes_device (packed
+  // below by cutlass_pack_device_args). The old code did a cudaMemcpyAsync(m_arr)+cudaStreamSynchronize to
+  // fill an EXACT host estimate because the AVERAGE took the "else" branch and UNDERCOUNTED ragged M ->
+  // missing tiles -> NaN. Passing nullptr sidesteps both: no undercount (max grid), no sync stall, no
+  // device->host pointer (which the host get_tiled_cta_shape_mnl would dereference and crash). avg_n/avg_k
+  // are now unused here (the device pack provides exact per-tile sizes/strides). (void)avg_n;(void)avg_k;
+  (void)avg_m;
+  (void)avg_n;
+  (void)avg_k;
+  ProblemShapeType* problem_sizes_host = nullptr;
 
   // Device param arrays (packed on device below).
   ProblemShapeType* problem_sizes_device = reinterpret_cast<ProblemShapeType*>(workspace_ptr);
