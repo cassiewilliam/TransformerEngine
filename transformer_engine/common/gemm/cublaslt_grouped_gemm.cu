@@ -470,7 +470,7 @@ struct GroupedGemmConfig {
   int sm_count = 0;
 };
 
-constexpr int kMaxGroups = 64;
+constexpr int kMaxGroups = 256;
 // Arguments for the grouped GEMM kernel that operates on multiple output tensors.
 struct MultiTensorGroupGemmOutputArgs {
   void *data_ptrs[kMaxGroups];
