@@ -422,9 +422,10 @@ struct Sm100SwiGluKernel {
 
   // ---- device entry ----
   CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
-#if !defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM100F_ENABLED)
+#if !defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && \
+    !defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM103F_ENABLED)
     if (cute::thread0()) {
-      printf("ERROR: Sm100SwiGluKernel requires SM100a/f MMA. Compile with -arch=sm_100a.\n");
+      printf("ERROR: Sm100SwiGluKernel requires SM100a/f or SM103a/f MMA. Compile with -arch=sm_100a/sm_103a.\n");
     }
     return;
 #else
