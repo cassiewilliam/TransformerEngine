@@ -246,7 +246,14 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         need_dprob = scales is not None and activation_ctx.extra_input_requires_grad
         grad_scales = None
 
-        if (not need_recompute) and hasattr(tex, "te_cutlass_grouped_dswiglu"):
+        # B2 can be disabled via NVTE_FUSE_MOE_DSWIGLU=0 (falls back to the separate dgrad + dswiglu +
+        # swiglu-for-dprob path) -- lets us A/B the fused-dswiglu epilogue vs the per-op kernels.
+        _use_b2 = (
+            (not need_recompute)
+            and hasattr(tex, "te_cutlass_grouped_dswiglu")
+            and int(os.environ.get("NVTE_FUSE_MOE_DSWIGLU", "1")) != 0
+        )
+        if _use_b2:
             # ---- B2: fused FC2-dgrad + dswiglu + dprob, reading the SAVED h (no materialized dA) ----
             h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
             # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
