@@ -382,8 +382,13 @@ struct Sm100DSwiGluKernel {
       // second B (the forward's up-weight) is dropped (single accumulator, no gate/up split).
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutX>> smem_x;        // dY tiles  (A operand)
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW2t>> smem_w2t;  // W2ᵀ tiles (B operand)
-      // V2: 2-stage co-loaded h tile (gate||up, gu-inner). cosize = kHStages*kEpiTileM*kEpiTileN*2.
-      cute::ArrayEngine<ElementOut, kHStages * kEpiTileM * kEpiTileN * 2> smem_h;
+      // V2 (SCRAPPED): TMA-h-load buffer reclaimed — shrunk to size 1 so TileK=64/kStages=4 fits the
+      // 228KB SM100 budget. The v2_h path is forced OFF (params.v2_h=false) and never dereferences this.
+      // 128B-aligned stub (64 bf16 = 128B): the failed TMA-h-load V2 buffer is reclaimed (~64KB freed for
+      // TileK=64/kStages=4), but its size MUST stay a multiple of 128B so the following smem_out_gate keeps
+      // its 128B alignment -- a size-1 (2B) stub misaligns smem_out_gate -> the dY1 TMA store hits a
+      // CUDA "misaligned address". v2_h is forced OFF and never dereferences this stub.
+      cute::ArrayEngine<ElementOut, 64> smem_h;  // V1 path; TMA-h-load V2 scrapped.
       // M2: TWO output-staging tiles for the dswiglu output dY1[M,2I] — dgate → dY1[:, :I], dup → dY1[:, I:].
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_gate;  // dgate staging (dY1[:, :I])
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_up;    // dup   staging (dY1[:, I:])
@@ -634,9 +639,8 @@ struct Sm100DSwiGluKernel {
       Tensor sX = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});        // dY
       Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w2t.begin()), SmemLayoutW2t{});  // W2ᵀ
 
-      // V2: co-load h. gmem h[M,2I] viewed as (N=I, gu=2, M); smem tile = SmemLayoutH (gu-inner).
-      Tensor mH = params.tma_load_h.get_tma_tensor(make_shape(M, N, cute::_2{}));  // (M,I,2)
-      Tensor sH = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
+      // V2 (SCRAPPED): the h co-load tensors mH/sH are now built INSIDE the (dead) v2_h branch below so
+      // they never reference the reclaimed (size-1) smem_h when v2_h==false.
 
       // CTA-in-cluster layout for tma_partition (sm100_mma_warpspecialized.hpp:521-538).
       Layout cta_layout_mnk = make_layout(ClusterShape{});
@@ -701,6 +705,10 @@ struct Sm100DSwiGluKernel {
         // stage h_prod.index() (released by the epilogue 2 tiles ago), arms expect_tx(32768), and the
         // single 3D-box TMA fills it -> overlaps the mainloop + epilogue of the preceding tile.
         if (params.v2_h) {
+          // V2 (SCRAPPED): build the h co-load views here, inside the dead branch, so smem_h is never
+          // referenced when v2_h==false. gmem h[M,2I] viewed as (M,I,2); smem tile = SmemLayoutH.
+          Tensor mH = params.tma_load_h.get_tma_tensor(make_shape(M, N, cute::_2{}));  // (M,I,2)
+          Tensor sH = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
           const int h_row_base = m_tile * kTileM + int(block_rank_in_cluster) *
                                  (kTileM / int(size(typename TiledMma::AtomThrID{})));
           const int h_col_base = n_tile_local * kTileN;
@@ -983,8 +991,8 @@ struct Sm100DSwiGluKernel {
       // grad·silu(gate) → sUp; then TWO TMA bulk-stores → dY1[:, :I] (gate) and dY1[:, I:2I] (up).
       Tensor sGate = make_tensor(make_smem_ptr(ss.tensors.smem_out_gate.begin()), SmemLayoutA{});  // dgate
       Tensor sUp = make_tensor(make_smem_ptr(ss.tensors.smem_out_up.begin()), SmemLayoutA{});      // dup
-      // V2: epilogue-side view of the co-loaded h smem (gu-inner); per-tile .data() set after the wait.
-      Tensor sH_epi = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
+      // V2 (SCRAPPED): epilogue-side view of the (reclaimed) h smem is built INSIDE the dead v2_h branch
+      // below, so the size-1 smem_h is never referenced when v2_h==false.
       Tensor mDY1_tma = params.tma_store_dy1.get_tma_tensor(make_shape(M, 2 * N));  // (M,2I) coords
       ThrCopy thrblk_s2g = params.tma_store_dy1.get_slice(Int<0>{});
       Tensor bSG_sGate = thrblk_s2g.partition_S(sGate);  // (TMA,TMA_M,TMA_N)
@@ -1028,12 +1036,14 @@ struct Sm100DSwiGluKernel {
         Tensor tTM_dA = thr_tmem_load.partition_S(tAcc_dA);  // (T2R,T2R_M,T2R_N) tmem source (dA)
         copy(tiled_tmem_load, tTM_dA, r_dA);
 
-        // V2: block until THIS tile's h has landed in smem, then point at its stage buffer (h_cons.index()
-        // — the DEDICATED h-pipeline state, NOT epi_cons). V1 (v2_h==false) leaves sH_tile untouched.
-        Tensor sH_tile = sH_epi;
+        // V2 (SCRAPPED): block until THIS tile's h has landed in smem, then point at its stage buffer
+        // (h_cons.index() — the DEDICATED h-pipeline state, NOT epi_cons). This is a DEAD branch
+        // (v2_h==false always); sH_tile is a descriptor over the reclaimed size-1 smem_h and is NEVER
+        // dereferenced unless v2_h (it is read only inside the v2_h guard in the per-element loop below).
+        Tensor sH_tile = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
         if (params.v2_h) {
           pipeline_h.consumer_wait(h_cons);                 // block until THIS tile's h landed
-          sH_tile.data() = sH_epi.data() + h_cons.index() * (kEpiTileM * kEpiTileN * 2);
+          sH_tile.data() = sH_tile.data() + h_cons.index() * (kEpiTileM * kEpiTileN * 2);
         }
 
 #ifdef SWIGLU_DEBUG_PRINT
@@ -1081,8 +1091,84 @@ struct Sm100DSwiGluKernel {
                                  : ElementAcc(1);
         const int64_t hrow_base = static_cast<int64_t>(grow) * h_row;  // saved h[grow, 0]
         ElementAcc dprob_acc = ElementAcc(0);
+
+        // OPT2 (EPILOGUE LSU-reduction): the SM100_TMEM_LOAD_32dp32b32x DstLayout
+        // ((_32,_1024):(_1024,_1), copy_traits_sm100.hpp:1635) gives a single thread's successive
+        // register values STRIDE 1 in the coordinate (value-mode stride = 1), and the 2-SM tcgen05 T2R
+        // maps THIS thread to ONE local row over ALL kEpiTileN cols. Hence lcol(i)=lcol(0)+i is
+        // CONSECUTIVE, and gcol(i)=lcol(i)+cta_col_offset is consecutive too (cta_col_offset=n_tile*kTileN
+        // is a multiple of kTileN=64). So 4 consecutive gate cols are 4 CONTIGUOUS bf16 in dGrad[hbase..]
+        // and the 4 up cols are contiguous at dGrad[hbase+I..] (I=params.N, a multiple of 64 ⇒ aligned).
+        // We replace the per-element pair of scalar bf16 global loads (8 LSU ops / 4 elems) with TWO 8B
+        // vector loads (uint2 = 4×bf16): the real fix for the EPILOGUE-bound (scattered-LSU) bottleneck.
+        // The fp32 math is BIT-IDENTICAL to V1 — only the global access width changes (each bf16 lane is
+        // still promoted to fp32 via static_cast then run through the SAME scalar expf/mul). The wide path
+        // is gated on (4 consecutive gcol) && (8B-aligned base); else it falls back to the scalar path, so
+        // correctness holds even if the column mapping ever changes. The dprob register accumulator and
+        // the per-ROW OPT1 hoist (lrow/grow/row_ok/p/hrow_base) are unchanged.
+        const int kVecN = static_cast<int>(size(r_dA));  // cols this thread walks (== kEpiTileN at full tile)
+        // bf16 helper: promote one packed pair (lo16,hi16 of a uint) to two fp32 lanes.  The source is
+        // dGrad (ElementOut), so unpack as ElementOut — matches the scalar path's static_cast exactly.
+        auto unpack2 = [](uint32_t w, ElementAcc& a0, ElementAcc& a1) {
+          const ElementOut e0 = reinterpret_cast<const ElementOut*>(&w)[0];
+          const ElementOut e1 = reinterpret_cast<const ElementOut*>(&w)[1];
+          a0 = static_cast<ElementAcc>(e0);
+          a1 = static_cast<ElementAcc>(e1);
+        };
+        // Per-element SwiGLU-backward body (identical math for both the vector and scalar paths).
+        auto dswiglu_one = [&](int lcol, ElementAcc dA, ElementAcc gate, ElementAcc up) {
+          const ElementAcc grad = dA * p;
+          const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
+          const ElementAcc s = gate * sig;                                       // silu(gate)
+          const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
+          sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
+          sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
+          // M2b: dprob col-reduce — accumulate dA·A' (A' = silu(gate)·up = s·up, the forward SwiGLU output,
+          // NOT prob-scaled; QuACK's postact, a FREE byproduct). OOB rows have up=0 → adds 0.
+          if (params.dprob != nullptr) dprob_acc += dA * s * up;
+        };
+
+        int i = 0;
+        // ---- VECTOR BODY: 4 elems/iter via two 8B (uint2 = 4×bf16) loads (gate-half + up-half). ----
+        // Only on the V1 (!v2_h), row_ok path; the smem-h (v2_h) path keeps the scalar loop below.
+        if (row_ok && !params.v2_h) {
+          CUTLASS_PRAGMA_UNROLL
+          for (; i + 4 <= kVecN; i += 4) {
+            const int lcol0 = get<1>(tTMc(i));
+            const int gcol0 = lcol0 + cta_col_offset;
+            // Confirm the 4 cols are consecutive (proven) AND the 8B load base is naturally aligned.
+            const bool contig =
+                (get<1>(tTMc(i + 1)) == lcol0 + 1) && (get<1>(tTMc(i + 2)) == lcol0 + 2) &&
+                (get<1>(tTMc(i + 3)) == lcol0 + 3) && ((gcol0 & 3) == 0);
+            if (contig) {
+              const int64_t hbase = hrow_base + gcol0;  // saved h[grow, gcol0]
+              const uint2 gv = *reinterpret_cast<const uint2*>(&params.dGrad[hbase]);            // 4×bf16 gate
+              const uint2 uv = *reinterpret_cast<const uint2*>(&params.dGrad[hbase + params.N]); // 4×bf16 up
+              ElementAcc gate[4], up[4];
+              unpack2(gv.x, gate[0], gate[1]);
+              unpack2(gv.y, gate[2], gate[3]);
+              unpack2(uv.x, up[0], up[1]);
+              unpack2(uv.y, up[2], up[3]);
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < 4; ++j) {
+                dswiglu_one(lcol0 + j, static_cast<ElementAcc>(r_dA(i + j)), gate[j], up[j]);
+              }
+            } else {
+              // Misaligned/strided head (should not occur given the proven mapping) — scalar fallback.
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < 4; ++j) {
+                const int lcol = get<1>(tTMc(i + j));
+                const int64_t hbase = hrow_base + lcol + cta_col_offset;
+                const ElementAcc gate = static_cast<ElementAcc>(params.dGrad[hbase]);
+                const ElementAcc up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]);
+                dswiglu_one(lcol, static_cast<ElementAcc>(r_dA(i + j)), gate, up);
+              }
+            }
+          }
+        }
+        // ---- SCALAR TAIL / v2_h / OOB-row PATH (bit-identical to V1) ----
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(r_dA); ++i) {
+        for (; i < kVecN; ++i) {
           const int lcol = get<1>(tTMc(i));        // LOCAL col ∈ [0,kEpiTileN)
           const int gcol = lcol + cta_col_offset;  // GLOBAL intermediate col ∈ [0,I)
           const ElementAcc dA = r_dA(i);           // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
@@ -1098,15 +1184,7 @@ struct Sm100DSwiGluKernel {
               up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]); // h up-half (col I+gcol)
             }
           }
-          const ElementAcc grad = dA * p;
-          const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
-          const ElementAcc s = gate * sig;                                       // silu(gate)
-          const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
-          sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
-          sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
-          // M2b: dprob col-reduce — accumulate dA·A' (A' = silu(gate)·up = s·up, the forward SwiGLU output,
-          // NOT prob-scaled; QuACK's postact, a FREE byproduct). OOB rows have up=0 → adds 0.
-          if (params.dprob != nullptr) dprob_acc += dA * s * up;
+          dswiglu_one(lcol, dA, gate, up);
         }
         // M2b: ONE global atomicAdd per thread — this thread's row partial → dprob[row] (cross-CTA, since an
         // m_tile's I-slices land on different CTAs). The thread's LOCAL row is constant = get<0>(tTMc(0)).
@@ -1310,7 +1388,7 @@ cudaError_t LaunchDSwiGluGrouped(
   params.tma_load_w2t = mainloop_params.tma_load_b;
   params.tma_store_dy1 = tma_store_dy1;
   params.tma_load_h = tma_load_h;                       // V2 h co-load descriptor over (I,2,M)
-  params.v2_h = (getenv("NVTE_DSWIGLU_V2") != nullptr);  // V2 gate (off => byte-identical V1 path)
+  params.v2_h = false;  // V2 (TMA-h-load) SCRAPPED — always V1 (scattered params.dGrad reads). smem_h reclaimed.
   params.ptr_dY1 = dY1;
   params.dGrad = dGrad;  // [M, I] incoming grad wrt the prob-scaled SwiGLU output
   params.dA = dA;
