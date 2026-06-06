@@ -43,13 +43,19 @@ void cutlass_grouped_swiglu(const void *X, const void *W1, void *A, int G, int M
   // = M_varlen. nullptr => uniform M = G*Me (M_varlen unused). The .cuh launcher reads this identically.
   cudaError_t status = cudaErrorInvalidValue;
   if (dtype == DType::kBFloat16) {
-    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t>(
+    // Tuned default (B200 autotune, M=16384/I=512/d=2048): TileM256/TileN128/TileK32/kStages8/
+    // ClusterM2/MinBlocks1/AccStages2 = ~759 TFLOPS, ~1.6x the old TileN64/TileK16 default (~471).
+    // TileK=16 (32B K-step) was the dominant inefficiency; TK32 + TN128 is the 2-acc sweet spot
+    // (TK48/64 either fail numerically or lose pipeline stages). See cutlass_grouped_gemm_swiglu.cuh.
+    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::bfloat16_t, cutlass::bfloat16_t, 256,
+                                                      128, 32, 8, 2, 1, 2>(
         reinterpret_cast<const cutlass::bfloat16_t *>(X),
         reinterpret_cast<const cutlass::bfloat16_t *>(W1),
         reinterpret_cast<cutlass::bfloat16_t *>(A), G, Me, I, d, stream, device, math_sm_count,
         m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);
   } else if (dtype == DType::kFloat16) {
-    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::half_t, cutlass::half_t>(
+    status = grouped_gemm_swiglu::LaunchSwiGluGrouped<cutlass::half_t, cutlass::half_t, 256, 128, 32,
+                                                      8, 2, 1, 2>(
         reinterpret_cast<const cutlass::half_t *>(X), reinterpret_cast<const cutlass::half_t *>(W1),
         reinterpret_cast<cutlass::half_t *>(A), G, Me, I, d, stream, device, math_sm_count,
         m_tile_expert, M_varlen, /*d_m_gather_idx=*/nullptr, /*T_src=*/0, /*d_prob=*/prob);

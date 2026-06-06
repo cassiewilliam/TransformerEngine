@@ -42,6 +42,14 @@
 
 #include "cutlass/bfloat16.h"
 #include "gemm/cutlass_grouped_gemm_swiglu.cuh"
+#if defined(SWIGLU_V2)
+#include "gemm/cutlass_grouped_gemm_swiglu_v2.cuh"
+#ifndef CLUSTERM
+#define CLUSTERM 2
+#endif
+#define LAUNCH_GROUPED_V2(...) \
+  transformer_engine::grouped_gemm_swiglu::LaunchSwiGluGroupedV2<Element, ElementOut, TILEM, TILEN, TILEK, KSTAGES, CLUSTERM, 1, ACCSTAGES>(__VA_ARGS__)
+#endif
 
 using Element = cutlass::bfloat16_t;     // bf16 in
 using ElementOut = cutlass::bfloat16_t;  // bf16 out
@@ -136,7 +144,31 @@ int main(int argc, char** argv) {
   CHECK_CUDA(cudaMalloc(&dW1, sizeof(Element) * (size_t)W1rows * d));
   CHECK_CUDA(cudaMalloc(&dA, sizeof(ElementOut) * (size_t)M * I));
   CHECK_CUDA(cudaMemcpy(dX, hX.data(), sizeof(Element) * (size_t)M * d, cudaMemcpyHostToDevice));
+#if defined(SWIGLU_V2)
+  // V2 reads W1 gran-G interleaved per output-tile (host-permute = the V2a Muon-not-needed test input;
+  // the host fp32 ref below still reads PLAIN hW1, so it stays the oracle). dst rows == v2_gate/up_acc_col.
+  {
+    const int kOutN_h = TILEN;        // output n-tile == V1 TileN
+    const int kMmaN_h = 2 * TILEN;    // interleaved MMA width
+    const int Gint = GLU_G;           // sweepable interleave gran
+    std::vector<Element> hW1_il((size_t)W1rows * d);
+    for (int e = 0; e < G; ++e)
+      for (int t = 0; t < I / kOutN_h; ++t)
+        for (int c = 0; c < kOutN_h; ++c) {
+          int g = c / Gint, j = c % Gint;
+          size_t dst_gate = (size_t)(e * twoI + t * kMmaN_h + (2 * g * Gint + j));
+          size_t dst_up = (size_t)(e * twoI + t * kMmaN_h + (2 * g * Gint + Gint + j));
+          size_t src_gate = (size_t)(e * twoI + t * kOutN_h + c);      // plain gate row
+          size_t src_up = (size_t)(e * twoI + I + t * kOutN_h + c);    // plain up   row
+          std::memcpy(&hW1_il[dst_gate * d], &hW1[src_gate * d], sizeof(Element) * d);
+          std::memcpy(&hW1_il[dst_up * d], &hW1[src_up * d], sizeof(Element) * d);
+        }
+    CHECK_CUDA(cudaMemcpy(dW1, hW1_il.data(), sizeof(Element) * (size_t)W1rows * d,
+                          cudaMemcpyHostToDevice));
+  }
+#else
   CHECK_CUDA(cudaMemcpy(dW1, hW1.data(), sizeof(Element) * (size_t)W1rows * d, cudaMemcpyHostToDevice));
+#endif
   CHECK_CUDA(cudaMemset(dA, 0, sizeof(ElementOut) * (size_t)M * I));
 
   // VARLEN-M: upload the per-m-tile expert table (device); nullptr in uniform mode.
@@ -175,9 +207,15 @@ int main(int argc, char** argv) {
   const int T_src_arg = gather ? M : 0;  // pure permutation => unpermuted source has M rows
 
   // ---- launch (grouped) ----
+#if defined(SWIGLU_V2)
+  cudaError_t st = LAUNCH_GROUPED_V2(
+      dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount, mte_arg, M_arg,
+      gather_arg, T_src_arg);
+#else
   cudaError_t st = LAUNCH_GROUPED(
       dX, dW1, dA, G, Me, I, d, /*stream=*/0, dev, /*sm_count=*/prop.multiProcessorCount, mte_arg, M_arg,
       gather_arg, T_src_arg);
+#endif
   if (st != cudaSuccess) {
     std::printf("Launch returned: %s\n", cudaGetErrorString(st));
   }
@@ -274,18 +312,30 @@ int main(int argc, char** argv) {
   // ---- perf timing (fused grouped kernel) ----
   const int warm = 10, iters = 100;
   for (int it = 0; it < warm; ++it)
+#if defined(SWIGLU_V2)
+    LAUNCH_GROUPED_V2(
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
+        gather_arg, T_src_arg);
+#else
     LAUNCH_GROUPED(
         dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
         gather_arg, T_src_arg);
+#endif
   CHECK_CUDA(cudaDeviceSynchronize());
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0);
   cudaEventCreate(&e1);
   cudaEventRecord(e0);
   for (int it = 0; it < iters; ++it)
+#if defined(SWIGLU_V2)
+    LAUNCH_GROUPED_V2(
+        dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
+        gather_arg, T_src_arg);
+#else
     LAUNCH_GROUPED(
         dX, dW1, dA, G, Me, I, d, 0, dev, prop.multiProcessorCount, mte_arg, M_arg,
         gather_arg, T_src_arg);
+#endif
   cudaEventRecord(e1);
   CHECK_CUDA(cudaEventSynchronize(e1));
   float ms = 0;
