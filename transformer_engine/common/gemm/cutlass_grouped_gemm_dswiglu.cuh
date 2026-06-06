@@ -94,7 +94,7 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<ProblemShapeType>;
 //                          tile N+1 overlaps the epilogue of tile N; 1 = single-buffer serialized handoff
 //                          = the old behavior). Tunable; the per-tile buffer alternation is implemented.
 template <typename Element_ /*bf16/fp16*/, typename ElementOut_ /*bf16/fp16*/, int TileM_ = 256,
-          int TileN_ = 64, int TileK_ = 16, int kStages_ = 8, int ClusterM_ = 2,
+          int TileN_ = 64, int TileK_ = 32, int kStages_ = 8, int ClusterM_ = 2,
           int MinBlocks_ = 1, int AccStages_ = 2>
 struct DSwiGluConfig {
   static_assert(ClusterM_ == 1 || ClusterM_ == 2, "ClusterM_ must be 1 (1-SM) or 2 (2-SM)");
@@ -1115,18 +1115,31 @@ struct Sm100DSwiGluKernel {
           a0 = static_cast<ElementAcc>(e0);
           a1 = static_cast<ElementAcc>(e1);
         };
-        // Per-element SwiGLU-backward body (identical math for both the vector and scalar paths).
-        auto dswiglu_one = [&](int lcol, ElementAcc dA, ElementAcc gate, ElementAcc up) {
+        // Per-element SwiGLU-backward COMPUTE (identical math for both the vector and scalar paths).
+        // OPT3 (smem-WRITE vectorize): the body no longer writes smem itself — it RETURNS the two bf16
+        // results (dgate, dup) via out-refs so the vector path can COALESCE 4 of them into ONE uint2 smem
+        // store each (4× fewer LSU smem-store ops on the hot group). The scalar tail/v2_h path stores them
+        // one at a time (unchanged width). The fp32 math (sig/silu/siluprime), the static_cast<ElementOut>
+        // truncation, and the dprob accumulation are BIT-IDENTICAL to the prior in-body scalar stores.
+        auto dswiglu_one = [&](ElementAcc dA, ElementAcc gate, ElementAcc up, ElementOut& dgate_out,
+                               ElementOut& dup_out) {
           const ElementAcc grad = dA * p;
           const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
           const ElementAcc s = gate * sig;                                       // silu(gate)
           const ElementAcc siluprime = sig + s * (ElementAcc(1) - sig);          // d silu / d gate
-          sGate(lrow, lcol) = static_cast<ElementOut>(grad * up * siluprime);    // dgate → dY1[:, :I]
-          sUp(lrow, lcol) = static_cast<ElementOut>(grad * s);                   // dup   → dY1[:, I:2I]
+          dgate_out = static_cast<ElementOut>(grad * up * siluprime);            // dgate → dY1[:, :I]
+          dup_out = static_cast<ElementOut>(grad * s);                           // dup   → dY1[:, I:2I]
           // M2b: dprob col-reduce — accumulate dA·A' (A' = silu(gate)·up = s·up, the forward SwiGLU output,
           // NOT prob-scaled; QuACK's postact, a FREE byproduct). OOB rows have up=0 → adds 0.
           if (params.dprob != nullptr) dprob_acc += dA * s * up;
         };
+        // sGate/sUp share SmemLayoutA = (kEpiTileM,kEpiTileN):(kEpiTileN,1) — UNIT-stride in lcol, so the
+        // 4 cols [lcol0,lcol0+3) of a fixed lrow are 4 CONTIGUOUS bf16 in smem at base lrow*kEpiTileN+lcol0.
+        // Raw smem base (begin() == the same ElementOut* the sGate/sUp tensors wrap); manual offset matches
+        // the (kEpiTileN,1) stride exactly, so the uint2 store writes the SAME 8 bytes as 4 scalar stores.
+        ElementOut* const sGate_base = ss.tensors.smem_out_gate.begin();
+        ElementOut* const sUp_base = ss.tensors.smem_out_up.begin();
+        const int sm_row_off = lrow * kEpiTileN;  // per-thread row base (lrow constant for this thread)
 
         int i = 0;
         // ---- VECTOR BODY: 4 elems/iter via two 8B (uint2 = 4×bf16) loads (gate-half + up-half). ----
@@ -1149,10 +1162,20 @@ struct Sm100DSwiGluKernel {
               unpack2(gv.y, gate[2], gate[3]);
               unpack2(uv.x, up[0], up[1]);
               unpack2(uv.y, up[2], up[3]);
+              // Compute the 4 dgate/dup into a packed register group, then COALESCE each into ONE uint2 smem
+              // store (8 scalar bf16 stores → 2 wide stores; the dprob accumulation runs inside dswiglu_one).
+              ElementOut dg[4], du[4];
               CUTLASS_PRAGMA_UNROLL
               for (int j = 0; j < 4; ++j) {
-                dswiglu_one(lcol0 + j, static_cast<ElementAcc>(r_dA(i + j)), gate[j], up[j]);
+                dswiglu_one(static_cast<ElementAcc>(r_dA(i + j)), gate[j], up[j], dg[j], du[j]);
               }
+              // (lcol0&3)==0 (from contig) && kEpiTileN multiple of 4 ⇒ (sm_row_off+lcol0) is a multiple of 4
+              // ⇒ 8B-aligned ElementOut* ⇒ the uint2 store is naturally aligned. Same 8 bytes, same order as
+              // 4 scalar sGate(lrow,lcol0+j)/sUp(lrow,lcol0+j) writes (SmemLayoutA unit-stride) — bit-identical.
+              *reinterpret_cast<uint2*>(sGate_base + sm_row_off + lcol0) =
+                  *reinterpret_cast<const uint2*>(&dg[0]);
+              *reinterpret_cast<uint2*>(sUp_base + sm_row_off + lcol0) =
+                  *reinterpret_cast<const uint2*>(&du[0]);
             } else {
               // Misaligned/strided head (should not occur given the proven mapping) — scalar fallback.
               CUTLASS_PRAGMA_UNROLL
@@ -1161,7 +1184,10 @@ struct Sm100DSwiGluKernel {
                 const int64_t hbase = hrow_base + lcol + cta_col_offset;
                 const ElementAcc gate = static_cast<ElementAcc>(params.dGrad[hbase]);
                 const ElementAcc up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]);
-                dswiglu_one(lcol, static_cast<ElementAcc>(r_dA(i + j)), gate, up);
+                ElementOut dgate_out, dup_out;
+                dswiglu_one(static_cast<ElementAcc>(r_dA(i + j)), gate, up, dgate_out, dup_out);
+                sGate(lrow, lcol) = dgate_out;
+                sUp(lrow, lcol) = dup_out;
               }
             }
           }
@@ -1184,7 +1210,10 @@ struct Sm100DSwiGluKernel {
               up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]); // h up-half (col I+gcol)
             }
           }
-          dswiglu_one(lcol, dA, gate, up);
+          ElementOut dgate_out, dup_out;
+          dswiglu_one(dA, gate, up, dgate_out, dup_out);
+          sGate(lrow, lcol) = dgate_out;
+          sUp(lrow, lcol) = dup_out;
         }
         // M2b: ONE global atomicAdd per thread — this thread's row partial → dprob[row] (cross-CTA, since an
         // m_tile's I-slices land on different CTAs). The thread's LOCAL row is constant = get<0>(tTMc(0)).
@@ -1282,7 +1311,7 @@ struct Sm100DSwiGluKernel {
 // ============================================================================================
 // The tuning params default to the DSwiGluConfig defaults, so the existing call
 // LaunchDSwiGluGrouped<Element, ElementOut>(...) resolves to the current (default-tuned) behavior.
-template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
+template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 32,
           int kStages_ = 8, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchDSwiGluGrouped(
     const Element* X,      // [G*Me, d]  row-major  M2: dY  — incoming grad wrt FC2 output Y (A operand)
