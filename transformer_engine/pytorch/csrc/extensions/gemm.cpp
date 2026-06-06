@@ -10,6 +10,7 @@
 #include <string>
 
 #include "../extensions.h"
+#include "common/gemm/cutlass_grouped_gemm_down.h"     // SonicMoE F2: cutlass_grouped_down C-API
 #include "common/gemm/cutlass_grouped_gemm_dswiglu.h"  // SonicMoE B1: cutlass_grouped_dswiglu C-API
 #include "common/gemm/cutlass_grouped_gemm_swiglu.h"   // SonicMoE F2: cutlass_grouped_swiglu C-API
 #include "common/util/cuda_runtime.h"
@@ -654,6 +655,46 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
                          static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
                          at::cuda::getCurrentCUDAStream());
   return A;
+}
+
+// SonicMoE F2 (NVTE_USE_SONIC_DOWN_KERNEL): fused-MoE DOWN-projection (FC2) grouped GEMM. Thin
+// marshalling — torch tensors -> raw ptrs + dtype -> the SM100 CUTLASS C-API cutlass_grouped_down
+// (common/gemm). Plain per-expert grouped GEMM Y[M,N] = A[M,K] @ W2[G*N,K]^T (NO activation). For the
+// MoE down: A = the up-proj output [M, I] (K = I), W2 = the FC2 weight [G*H, I] (N = H = d), Y = [M, H].
+// REUSES the SAME TileM=256 m_tile_expert table the fused up-proj built (both kernels m-tile by 256).
+at::Tensor te_cutlass_grouped_down(at::Tensor a, at::Tensor w2,
+                                   std::optional<at::Tensor> m_tile_expert, int64_t G, int64_t N,
+                                   int64_t K, int64_t M) {
+  NVTE_CHECK(a.is_cuda() && w2.is_cuda(),
+             "te_cutlass_grouped_down: a and w2 must be CUDA tensors.");
+  NVTE_CHECK(a.scalar_type() == w2.scalar_type(),
+             "te_cutlass_grouped_down: a and w2 must share dtype (bf16 or fp16).");
+  NVTE_CHECK(a.scalar_type() == at::kBFloat16 || a.scalar_type() == at::kHalf,
+             "te_cutlass_grouped_down: only bf16/fp16 are supported.");
+  NVTE_CHECK(a.is_contiguous() && w2.is_contiguous(),
+             "te_cutlass_grouped_down: a and w2 must be contiguous (row-major).");
+  // Shape contract: a = [M, K] (K = I), w2 = [G*N, K] (N = H). Validate loudly.
+  NVTE_CHECK(a.dim() == 2 && a.size(0) == M && a.size(1) == K,
+             "te_cutlass_grouped_down: a must be [M, K].");
+  NVTE_CHECK(w2.dim() == 2 && w2.size(0) == G * N && w2.size(1) == K,
+             "te_cutlass_grouped_down: w2 must be [G*N, K].");
+
+  // VARLEN-M (uneven, 256-aligned experts) when m_tile_expert is provided; else uniform M (Me = M/G).
+  // The SAME int32 m_tile_expert table the up-proj uses (TileM=256), so no separate build needed.
+  const int *mte = nullptr;
+  if (m_tile_expert.has_value() && m_tile_expert->numel() > 0) {
+    NVTE_CHECK(m_tile_expert->scalar_type() == at::kInt && m_tile_expert->is_cuda(),
+               "te_cutlass_grouped_down: m_tile_expert must be an int32 CUDA tensor.");
+    mte = m_tile_expert->data_ptr<int>();
+  }
+
+  auto Y = at::empty({M, N}, a.options());  // [M, N] down-proj output (N = H)
+  cutlass_grouped_down(a.data_ptr(), w2.data_ptr(), Y.data_ptr(), static_cast<int>(G),
+                       static_cast<int>(N), static_cast<int>(K), static_cast<int>(M), mte,
+                       GetTransformerEngineDType(a.scalar_type()),
+                       static_cast<int>(a.get_device()), /*math_sm_count=*/0,
+                       at::cuda::getCurrentCUDAStream());
+  return Y;
 }
 
 // SonicMoE B1 (NVTE_USE_FUSED_MOE): fused SwiGLU-backward grouped GEMM. Recomputes h = X@W1^T in TMEM
