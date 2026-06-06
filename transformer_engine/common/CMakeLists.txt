@@ -304,7 +304,6 @@ if(NVTE_SPECIFIC_ARCHS)
   # NVTE_SPECIFIC_ARCHS only (same arch + -g0/-dopt flags).
   set(sonic_swiglu_sources
       gemm/cutlass_grouped_gemm_swiglu.cu
-      gemm/cutlass_grouped_gemm_swiglu_v2.cu
       gemm/cutlass_grouped_gemm_dswiglu.cu)
   # F2 down-proj: the V2-derived 2-SM tcgen05 kernel is SM100 (B200) ONLY -- it does not compile for
   # sm_103a (B300, not a target). Built as a SEPARATE group with 103a filtered out of its arch list.

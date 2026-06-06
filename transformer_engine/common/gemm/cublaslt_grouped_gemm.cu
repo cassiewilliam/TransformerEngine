@@ -1067,7 +1067,8 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
        A_sel.dtype == transformer_engine::DType::kFloat16) &&
       A_sel.dtype == B_sel.dtype && A_sel.dtype == d_dtype &&
       (transformer_engine::getenv<bool>("NVTE_USE_FUSED_MOE", false) ||
-       transformer_engine::getenv<bool>("NVTE_USE_QUACK_SONIC_MOE", false))) {
+       transformer_engine::getenv<bool>("NVTE_USE_QUACK_SONIC_MOE", false) ||
+       transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false))) {
     const int device = transformer_engine::cuda::current_device();
     // d_rows/d_cols are cuBLAS column-major STORAGE dims ("rows=last, cols=first") = SWAPPED vs logical
     // (M,N): for D[M,N] row-major, d_rows=N, d_cols=M -> m_arr=d_cols, n_arr=d_rows. The host (M,N,K)

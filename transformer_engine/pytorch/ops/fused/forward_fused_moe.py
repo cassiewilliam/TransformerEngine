@@ -304,22 +304,6 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             )
             if prob is not None:
                 A = A * prob.view(-1, 1).to(A.dtype)
-        elif int(os.environ.get("NVTE_SWIGLU_V2", "0")) > 0 and hasattr(
-            tex, "te_cutlass_grouped_swiglu_v2"
-        ):
-            # FUSED_MOE up = SwiGLU V2 (single-interleaved 5D-TMA, Muon-safe contiguous W1; same args as V1)
-            A = tex.te_cutlass_grouped_swiglu_v2(
-                x,
-                w1,
-                m_tile_expert,
-                prob,
-                G,
-                Me,
-                I,
-                d,
-                M_varlen,
-                0,
-            )
         else:
             A = self.grouped_swiglu_kernel()(
                 x,

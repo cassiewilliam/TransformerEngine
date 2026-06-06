@@ -13,7 +13,6 @@
 #include "common/gemm/cutlass_grouped_gemm_down.h"     // SonicMoE F2: cutlass_grouped_down C-API
 #include "common/gemm/cutlass_grouped_gemm_dswiglu.h"  // SonicMoE B1: cutlass_grouped_dswiglu C-API
 #include "common/gemm/cutlass_grouped_gemm_swiglu.h"   // SonicMoE F2: cutlass_grouped_swiglu C-API
-#include "common/gemm/cutlass_grouped_gemm_swiglu_v2.h"  // SonicMoE F2: cutlass_grouped_swiglu_v2 C-API
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -655,53 +654,6 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
                          GetTransformerEngineDType(x.scalar_type()),
                          static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
                          at::cuda::getCurrentCUDAStream());
-  return A;
-}
-
-// SonicMoE F2 V2 (gran-8 gate/up interleave): SAME marshalling as te_cutlass_grouped_swiglu, routed to
-// the V2 C-API. W1 LAYOUT DIFFERS (see cutlass_grouped_gemm_swiglu_v2.h): DEFAULT build expects W1
-// HOST-PERMUTED to gran-G interleaved per output-tile; the SWIGLU_V2_5D_TMA build expects contiguous W1.
-// The tensor SHAPE / dtype / contiguity checks are identical to V1, so this is a copy with the V2 call.
-at::Tensor te_cutlass_grouped_swiglu_v2(at::Tensor x, at::Tensor w1,
-                                        std::optional<at::Tensor> m_tile_expert,
-                                        std::optional<at::Tensor> prob, int64_t G, int64_t Me,
-                                        int64_t I, int64_t d, int64_t M_varlen,
-                                        int64_t math_sm_count) {
-  NVTE_CHECK(x.is_cuda() && w1.is_cuda(),
-             "te_cutlass_grouped_swiglu_v2: x and w1 must be CUDA tensors.");
-  NVTE_CHECK(x.scalar_type() == w1.scalar_type(),
-             "te_cutlass_grouped_swiglu_v2: x and w1 must share dtype (bf16 or fp16).");
-  NVTE_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf,
-             "te_cutlass_grouped_swiglu_v2: only bf16/fp16 are supported.");
-  NVTE_CHECK(x.is_contiguous() && w1.is_contiguous(),
-             "te_cutlass_grouped_swiglu_v2: x and w1 must be contiguous (row-major).");
-
-  // varlen-M (uneven, 256-aligned experts) when m_tile_expert is provided; else uniform M = G*Me.
-  const bool varlen = m_tile_expert.has_value() && m_tile_expert->numel() > 0;
-  const int M = varlen ? static_cast<int>(M_varlen) : static_cast<int>(G * Me);
-  const int *mte = nullptr;
-  if (varlen) {
-    NVTE_CHECK(m_tile_expert->scalar_type() == at::kInt && m_tile_expert->is_cuda(),
-               "te_cutlass_grouped_swiglu_v2: m_tile_expert must be an int32 CUDA tensor.");
-    mte = m_tile_expert->data_ptr<int>();
-  }
-
-  // prob (optional): per-token router gate, fp32 [M]; epilogue scales A[m,:] *= prob[m].
-  const float *prob_ptr = nullptr;
-  if (prob.has_value() && prob->numel() > 0) {
-    NVTE_CHECK(prob->scalar_type() == at::kFloat && prob->is_cuda() && prob->is_contiguous(),
-               "te_cutlass_grouped_swiglu_v2: prob must be a contiguous fp32 CUDA tensor.");
-    NVTE_CHECK(prob->numel() == M, "te_cutlass_grouped_swiglu_v2: prob must have M entries.");
-    prob_ptr = prob->data_ptr<float>();
-  }
-
-  auto A = at::empty({M, I}, x.options());  // [M, I] fused SwiGLU output
-  cutlass_grouped_swiglu_v2(x.data_ptr(), w1.data_ptr(), A.data_ptr(), static_cast<int>(G),
-                            static_cast<int>(Me), static_cast<int>(I), static_cast<int>(d), mte,
-                            static_cast<int>(M_varlen), prob_ptr,
-                            GetTransformerEngineDType(x.scalar_type()),
-                            static_cast<int>(x.get_device()), static_cast<int>(math_sm_count),
-                            at::cuda::getCurrentCUDAStream());
   return A;
 }
 
