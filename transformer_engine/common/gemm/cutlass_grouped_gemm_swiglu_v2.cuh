@@ -20,10 +20,21 @@
  *   qa/test_tma_interleave.cu:33-51  (GROUND TRUTH: 4D-on-contiguous == 2D-on-host-gran8, BITWISE,
  *                                     for swizzle 0 AND 128B — the layout this file's host desc mirrors)
  *
- * STATUS: SCAFFOLD. The HOST descriptor + V2 Config are concrete (grounded against the test above).
- *   The DEVICE body (load/MMA/epilogue) is a CHANGE-SPEC against cutlass_grouped_gemm_swiglu.cuh V1,
- *   NOT yet compilable code: it must be compile-iterated on a SM100 box (the V1 kernel's own history
- *   shows TMEM/MMA/partition correctness only converges by building) and then AUTOTUNED for 性能最优.
+ * STATUS: FIRST-CUT (compile-iterate on a SM100 box). IMPLEMENTED in this file:
+ *   - DEVICE body operator() is concrete (NOT a stub): single interleaved GEMM at N=kMmaN into ONE acc,
+ *     ONE TMEM-load, gran-G de-interleave epilogue (silu(gate)*up) + prob + V1 TMA-store. Mirrors the
+ *     down_v2 single-B-tile structure (load 1 W partition, 1 cute::gemm, 1 acc buffer, 1 partition_S).
+ *   - DEFAULT path = V2a: W1 is HOST-PERMUTED to gran-G interleaved per output-tile and fed through the
+ *     SAME plain 2D TMA machinery V1/down_v2 use (Config::TMA_W1 at box-N=kMmaN). This is the compilable
+ *     path: it touches only proven V1 partition/gemm/store ops, so it should "compile or close".
+ *   - OPTIONAL path = V2b (5D-TMA-from-CONTIGUOUS, Muon-safe), macro-gated by SWIGLU_V2_5D_TMA: the
+ *     make_w1_gran8_5d_desc() raw CUtensorMap is built in the launcher and the LOAD warp issues a raw
+ *     cute::SM100_TMA_2SM_LOAD_5D / SM90_TMA_LOAD_5D into the SAME smem_w1_il buffer (no host permute).
+ *     This path is NOT yet expected to pass without box iteration (R1 swizzle match) and is OFF by
+ *     default so the build stays green; it is wired end-to-end (descriptor + Params + device issue) so
+ *     it can be flipped on and debugged in place. See the deliverable report for the phased plan.
+ *   The whole file must still be compile-iterated on a SM100 box (TMEM/MMA/partition correctness only
+ *   converges by building, per the V1 kernel's history) and then AUTOTUNED for 性能最优.
  *
  * OPEN RISKS that REQUIRE the box (cannot be resolved by reading source):
  *   R1 SWIZZLE MATCH: the 5D desc swizzle MUST equal the COMPILED Config::SmemLayoutW1 swizzle. V1 uses
@@ -44,6 +55,8 @@
 #include <cuda.h>  // CUtensorMap, cuTensorMapEncodeTiled
 
 #include "cute/tensor.hpp"
+#include "cute/arch/copy_sm90_tma.hpp"   // cute::SM90_TMA_LOAD_5D (V2b raw 5D issue, 1-SM)
+#include "cute/arch/copy_sm100_tma.hpp"  // cute::SM100_TMA_2SM_LOAD_5D (V2b raw 5D issue, 2-SM)
 #include "cutlass_grouped_gemm_swiglu.cuh"  // V1: SwiGluConfig, Sm100SwiGluKernel, LaunchSwiGluGrouped
 
 namespace transformer_engine {
@@ -78,7 +91,10 @@ inline CUresult make_w1_gran8_5d_desc(CUtensorMap* desc, const Element* W1, int 
   const cuuint64_t gd[5] = {(cuuint64_t)d, 8u, 2u, (cuuint64_t)(I / 8), (cuuint64_t)G};
   const cuuint64_t gs[4] = {(cuuint64_t)d * e, (cuuint64_t)I * d * e, (cuuint64_t)8 * d * e,
                             (cuuint64_t)2 * I * d * e};
-  const int kbox = (kSwizzleBytes != 0) ? (kSwizzleBytes / (int)sizeof(Element)) : TileK;
+  // box-K = TileK (the per-op K-tile extent), DECOUPLED from the swizzle pattern. The old
+  // kSwizzleBytes/sizeof coincidentally == TileK only at TileK16/sw32; at other TileK it under/over-fills
+  // the K-tile → barrier byte mismatch → deadlock. The swizzle below is the smem PATTERN (separate).
+  const int kbox = TileK;
   const cuuint32_t sd[5] = {(cuuint32_t)kbox, 8u, 2u, (cuuint32_t)(LOAD_BN / 16), 1u};
   const cuuint32_t es[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMapSwizzle sw = kSwizzleBytes == 128  ? CU_TENSOR_MAP_SWIZZLE_128B
@@ -103,8 +119,8 @@ inline CUresult make_w1_gran8_5d_desc(CUtensorMap* desc, const Element* W1, int 
 #define GLU_G 1   // sweepable {1,8,16,32}. gran-1 = QuACK-style adjacent cols = lowest R3 risk (default).
 #endif
 
-template <typename Element_, typename ElementOut_, int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
+template <typename Element_, typename ElementOut_, int TileM_ = 256, int TileN_ = 64, int TileK_ = 32,
+          int kStages_ = 8, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 struct SwiGluConfigV2 {
   static_assert(ClusterM_ == 1 || ClusterM_ == 2, "ClusterM_ must be 1 or 2");
 
@@ -164,7 +180,7 @@ struct SwiGluConfigV2 {
   static constexpr uint32_t TmaTransactionBytes = CollectiveMma::TmaTransactionBytes;
 
   // R1 (B200-confirmed in scaffold): SmemLayoutW1 = Sw<1,4,3> = 32B swizzle for TileK=16 bf16.
-  static constexpr int kSwizzleBytesW1 = 32;
+  static constexpr int kSwizzleBytesW1 = 32;  // smem PATTERN (R1: match SmemLayoutW1); box-K is TileK (decoupled)
 
   // ---- OUTPUT side derived from kOutN (NOT kMmaN) — byte-identical to V1 swiglu.cuh:215-233 -------
   static constexpr int kEpiTileM_cfg =
@@ -282,7 +298,12 @@ struct Sm100SwiGluKernelV2 {
 
   struct Params {
     TMA_X tma_load_x;
-    TMA_W1 tma_load_w1;   // ONE descriptor over host-permuted [G*2I, d] at box-N = kMmaN
+    TMA_W1 tma_load_w1;   // V2a: ONE plain-2D descriptor over host-permuted [G*2I, d] at box-N = kMmaN
+    // V2b (SWIGLU_V2_5D_TMA): raw 5D CUtensorMap over the CONTIGUOUS (un-permuted, Muon-safe) W1, built
+    // by make_w1_gran8_5d_desc in the launcher. Carried unconditionally (a CUtensorMap is 128B POD); the
+    // LOAD warp only dereferences it on the 5D path. n5d_per_expert = I/(LOAD_BN/16) groups per expert.
+    CUtensorMap w1_5d_desc{};
+    int load_bn_5d = 0;     // == kMmaN box-N for the 5D path (groups of 16 N-rows per box col)
     TMA_A tma_store_a;
     ElementOut* ptr_A;
     StrideA dA;
@@ -418,7 +439,21 @@ struct Sm100SwiGluKernelV2 {
         const int w1_il_ntile = e * n2w_per_expert + n_tile_local;
 
         Tensor tXgX_k = tXgX(_, m_tile, _, _0{});
-        Tensor tWgW_k = tWgW(_, w1_il_ntile, _, _0{});  //<<V2 ONE slice
+        Tensor tWgW_k = tWgW(_, w1_il_ntile, _, _0{});  //<<V2 ONE slice (V2a host-permuted path)
+
+#ifdef SWIGLU_V2_5D_TMA
+        // V2b: raw 5D coords into the CONTIGUOUS W1 (no host permute). The 5D desc box covers
+        // (k:K_box, w8:8, gu:2, group:LOAD_BN/16, expert:1). For THIS output tile:
+        //   c3 (group base) = n_tile_local * (kMmaN/16)   c4 (expert) = e
+        //   c1=w8 origin=0   c2=gu origin=0               c0=k*K_box (K-tile base, set in the k-loop)
+        const int grp16 = params.load_bn_5d / 16;            // per-CTA box: (kMmaN/2)/16 under 2-SM
+        // Each CTA loads its OWN N-half: full-tile group start + this CTA's half-offset. Without the
+        // per-CTA offset both CTAs fetch the same full kMmaN tile → barrier byte mismatch → deadlock.
+        const int c3_group_base =
+            n_tile_local * (Config::kMmaN / 16) +
+            (kIs2Sm ? (block_rank_in_cluster % int(cute::size(typename TiledMma::AtomThrID{}))) * grp16 : 0);
+        const int c4_expert = e;
+#endif
 
         for (int k = 0; k < k_tile_count; ++k) {
           pipeline_load.producer_acquire(load_prod);
@@ -426,7 +461,30 @@ struct Sm100SwiGluKernelV2 {
           int wr = load_prod.index();
           if (cute::elect_one_sync()) {
             copy(params.tma_load_x.with(*bar, mcast_mask_x), tXgX_k(_, k), tXsX(_, wr));
+#ifdef SWIGLU_V2_5D_TMA
+            // RAW 5D issue into the SAME smem_w1_il stage buffer. The cp.async.bulk.tensor.5d delivers
+            // gate/up interleaved at gran-8 straight from contiguous HBM (Muon-safe). R1: the desc swizzle
+            // (kSwizzleBytesW1) MUST equal the COMPILED SmemLayoutW1 swizzle or the smem tile mismatches.
+            // K_box columns are moved per op; the K-tile origin is k*K_box along the inner (d) axis.
+            const int K_box = (Config::kSwizzleBytesW1 != 0)
+                                  ? (Config::kSwizzleBytesW1 / int(sizeof(Element)))
+                                  : int(size<2>(TileShape{}));
+            void* dst5d = static_cast<void*>(&(*tWsW(_, wr).data()));  // stage-buffer smem base
+            uint64_t* mbar5d = reinterpret_cast<uint64_t*>(bar);  // producer barrier as raw mbar ptr
+            uint64_t cache_hint = 0;  // CU_TENSOR_MAP_L2_PROMOTION baked in the desc; no per-op hint
+            // (void)mcast_mask_b: the raw 5D ops take NO mask arg — the 2-SM variant sets the peer bit on
+            // the mbar internally (Sm100MmaPeerBitMask). coords = (c0=k, c1=w8, c2=gu, c3=group, c4=e).
+            (void)mcast_mask_b;
+            if (kIs2Sm) {
+              cute::SM100_TMA_2SM_LOAD_5D::copy(&params.w1_5d_desc, mbar5d, cache_hint, dst5d,
+                                                k * K_box, 0, 0, c3_group_base, c4_expert);
+            } else {
+              cute::SM90_TMA_LOAD_5D::copy(&params.w1_5d_desc, mbar5d, cache_hint, dst5d, k * K_box, 0,
+                                           0, c3_group_base, c4_expert);
+            }
+#else
             copy(params.tma_load_w1.with(*bar, mcast_mask_b), tWgW_k(_, k), tWsW(_, wr)); //<<V2 1 copy
+#endif
           }
           ++load_prod;
         }
@@ -614,8 +672,8 @@ struct Sm100SwiGluKernelV2 {
 //   - the W1 TMA box-N is kMmaN (induced by Config::TileShape), so ONE descriptor covers it.
 //   - num_n_local_tiles uses kOutN (NOT kMmaN). Persistent occupancy launch identical to V1.
 // ============================================================================================
-template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
+template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 32,
+          int kStages_ = 8, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchSwiGluGroupedV2(
     const Element* X, const Element* W1_il /*[G*2I,d] gran-G interleaved per output-tile*/,
     ElementOut* A, int G, int Me, int I, int d, cudaStream_t stream, int device = 0, int sm_count = 0,
@@ -655,7 +713,23 @@ cudaError_t LaunchSwiGluGroupedV2(
 
   typename Kernel::Params params;
   params.tma_load_x = mainloop_params.tma_load_a;
-  params.tma_load_w1 = mainloop_params.tma_load_b;   // N=kMmaN interleaved B descriptor
+  params.tma_load_w1 = mainloop_params.tma_load_b;   // V2a: N=kMmaN interleaved B descriptor
+  // V2b 5D box-N = PER-CTA N width (kMmaN/2 under 2-SM). Each CTA must load ONLY its N-half so the
+  // delivered bytes match the per-CTA SmemLayoutW1 + per-CTA transaction_bytes. Using the full kMmaN made
+  // both CTAs duplicate the whole tile → CTA0 barrier got 2x bytes → mbarrier never completes → deadlock.
+  const int per_cta_n = Config::kMmaN / int(cute::size(typename Config::AtomThrShapeMNK{}));
+  params.load_bn_5d = per_cta_n;
+#ifdef SWIGLU_V2_5D_TMA
+  // V2b: build the raw 5D CUtensorMap over the CONTIGUOUS, un-permuted W1 (Muon-safe). W1_il here is the
+  // CONTIGUOUS [G*2I, d] (NOT host-permuted) when this path is on; gate/up are interleaved at gran-8 by
+  // the 5D box geometry, not by a host permute. The swizzle MUST match Config::kSwizzleBytesW1 (R1).
+  {
+    constexpr int TileK = TileK_;
+    CUresult r = make_w1_gran8_5d_desc<Element>(&params.w1_5d_desc, W1_il, G, I, d, TileK,
+                                                /*LOAD_BN=*/per_cta_n, Config::kSwizzleBytesW1);
+    if (r != CUDA_SUCCESS) return cudaErrorInvalidValue;
+  }
+#endif
   params.tma_store_a = tma_store_a;
   params.ptr_A = A;
   params.dA = dA;

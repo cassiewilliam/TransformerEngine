@@ -168,6 +168,15 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
                                      std::optional<at::Tensor> prob, int64_t G, int64_t Me,
                                      int64_t I, int64_t d, int64_t M_varlen, int64_t math_sm_count);
 
+// SonicMoE F2 V2 (gran-8 gate/up interleave): same signature/contract as te_cutlass_grouped_swiglu,
+// routed to the V2 kernel (ONE wide GEMM + de-interleave epilogue). W1 layout differs (DEFAULT build
+// expects W1 host-permuted to gran-G interleaved per output-tile; see the C-API header).
+at::Tensor te_cutlass_grouped_swiglu_v2(at::Tensor x, at::Tensor w1,
+                                        std::optional<at::Tensor> m_tile_expert,
+                                        std::optional<at::Tensor> prob, int64_t G, int64_t Me,
+                                        int64_t I, int64_t d, int64_t M_varlen,
+                                        int64_t math_sm_count);
+
 // SonicMoE B1: fused SwiGLU-backward grouped GEMM (SM100). Recomputes h = X@W1^T in TMEM and applies the
 // SwiGLU backward fused with it, returning dY1: [M, 2I] = dgate||dup. x: [M, d]; w1: [G*2I, d]; dgrad
 // (= dA): [M, I] incoming grad wrt the prob-scaled SwiGLU output. m_tile_expert/prob as in the forward.
@@ -178,7 +187,7 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
                                       int64_t math_sm_count,
                                       std::optional<at::Tensor> dprob = std::nullopt);
 
-// SonicMoE F2 (NVTE_USE_SONIC_DOWN_KERNEL): fused-MoE down-projection (FC2) grouped GEMM, SM100 /
+// SonicMoE F2 (NVTE_USE_QUACK_SONIC_MOE): fused-MoE down-projection (FC2) grouped GEMM, SM100 /
 // bf16|fp16.  Y[M, N] = A[M, K] @ W2[G*N, K]^T  per expert (plain grouped GEMM, NO activation).
 // For the MoE down-proj: a = up-proj output [M, I] (K = I), w2 = FC2 weight [G*H, I] (N = H = d),
 // returns Y: [M, H]. m_tile_expert (optional, int32 [ceil(M/256)]): the SAME varlen-M expert table

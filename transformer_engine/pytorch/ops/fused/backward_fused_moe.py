@@ -75,7 +75,11 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         to per-op bf16 grouped GEMM, which is always available on SM100).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
+        # NVTE_USE_QUACK_SONIC_MOE implies FUSED_MOE: either flag enables the op.
+        if (
+            int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0
+            and int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) <= 0
+        ):
             return False
         if get_device_compute_capability()[0] != 10:
             return False
@@ -257,13 +261,13 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # ---- B2: fused FC2-dgrad + dswiglu + dprob, reading the SAVED h (no materialized dA) ----
             h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
 
-            # -- QuACK reference path (NVTE_DSWIGLU_QUACK=1): replace the CUTLASS dswiglu kernel
+            # -- QuACK reference path (NVTE_USE_QUACK_SONIC_MOE=1): replace the CUTLASS dswiglu kernel
             #    with quack.gemm_interface.gemm_dgated, producing the SAME dY1 [M,2I] (concatenated
             #    [gate||up]) and grad_scales (dprob [M]). This establishes the 80us QuACK dswiglu as
             #    a correctness+perf baseline INSIDE this pipeline. Pure-Python; no kernel rebuild.
             #    Falls back to the CUTLASS path below if quack can't be imported.
             _quack_ok = False
-            if int(os.environ.get("NVTE_DSWIGLU_QUACK", "0")):
+            if int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) > 0:
                 try:
                     from quack.gemm_interface import (  # pylint: disable=import-outside-toplevel
                         gemm_dgated,

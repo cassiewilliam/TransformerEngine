@@ -34,7 +34,7 @@ void cutlass_grouped_down(const void *A, const void *W2, void *Y, int G, int N, 
   using namespace transformer_engine;
 
   // SM100 (Blackwell, CC 10.x) only: the kernel uses the 2-SM (cta_group::2) tcgen05 schedule. The
-  // upstream dispatcher should already gate on NVTE_USE_SONIC_DOWN_KERNEL + is_blackwell, but assert
+  // upstream dispatcher should already gate on NVTE_USE_QUACK_SONIC_MOE + is_blackwell, but assert
   // here so a mis-routed call fails loudly instead of launching invalid PTX.
   int sm_major = 0;
   NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));

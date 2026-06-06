@@ -94,7 +94,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         on ``fuse_grouped_mlp_ops`` to only feed it GLU triples).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
+        # NVTE_USE_QUACK_SONIC_MOE implies FUSED_MOE: either flag enables the op.
+        if (
+            int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0
+            and int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) <= 0
+        ):
             return False
         if get_device_compute_capability()[0] != 10:
             return False
@@ -270,7 +274,10 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # The single kernel call: replaces up-GroupedLinear(d->2I) + SwiGLU
         # (+ optional router-prob mul). Returns A: bf16 [M, I].
         # math_sm_count=0 => kernel auto-detects (qa test passes 0).
-        if int(os.environ.get("NVTE_USE_QUACK_GATED", "0")) > 0:
+        if (
+            int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) > 0
+            or int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) > 0
+        ):
             # QuACK gemm_gated branch (fastest fused up-proj+SwiGLU; ~1.6x the CUTLASS kernel E2E).
             # concat_layout=("B",) consumes the SAME plain [G*2I,d] weights as the CUTLASS path -- no
             # re-interleave, so NO Muon/checkpoint impact and NO perf loss (verified: 1340 vs 1348 TF,
@@ -297,6 +304,22 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             )
             if prob is not None:
                 A = A * prob.view(-1, 1).to(A.dtype)
+        elif int(os.environ.get("NVTE_SWIGLU_V2", "0")) > 0 and hasattr(
+            tex, "te_cutlass_grouped_swiglu_v2"
+        ):
+            # FUSED_MOE up = SwiGLU V2 (single-interleaved 5D-TMA, Muon-safe contiguous W1; same args as V1)
+            A = tex.te_cutlass_grouped_swiglu_v2(
+                x,
+                w1,
+                m_tile_expert,
+                prob,
+                G,
+                Me,
+                I,
+                d,
+                M_varlen,
+                0,
+            )
         else:
             A = self.grouped_swiglu_kernel()(
                 x,
@@ -316,8 +339,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # --- FC2 (down-proj) --------------------------------------------------
         # H = fc2 out_features (= model dim d); I = fc2 in_features (the ffn half, == K for the kernel).
         H = fc2_weight_shape[0]
-        if int(os.environ.get("NVTE_USE_SONIC_DOWN_KERNEL", "0")) > 0:
-            # SonicMoE CUTLASS down-proj kernel (NVTE_USE_SONIC_DOWN_KERNEL): a dedicated SM100 2-SM
+        if hasattr(tex, "te_cutlass_grouped_down"):  # down V2 = DEFAULT in the fused op (FUSED_MOE & QUACK_SONIC)
+            # SonicMoE CUTLASS down-proj kernel (down V2): a dedicated SM100 2-SM
             # tcgen05 grouped GEMM Y[M,H] = A[M,I] @ W2[G*H,I]^T per expert (~726 TFLOP/s). REUSES the
             # SAME TileM=256 m_tile_expert table built above for the up-proj (both kernels m-tile by
             # 256) -- no separate table. w2_2d is the FC2 weight as a contiguous [G*H, I] bf16 tensor,
