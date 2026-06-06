@@ -261,111 +261,40 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # ---- B2: fused FC2-dgrad + dswiglu + dprob, reading the SAVED h (no materialized dA) ----
             h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
 
-            # -- QuACK reference path (NVTE_USE_QUACK_SONIC_MOE=1): replace the CUTLASS dswiglu kernel
-            #    with quack.gemm_interface.gemm_dgated, producing the SAME dY1 [M,2I] (concatenated
-            #    [gate||up]) and grad_scales (dprob [M]). This establishes the 80us QuACK dswiglu as
-            #    a correctness+perf baseline INSIDE this pipeline. Pure-Python; no kernel rebuild.
-            #    Falls back to the CUTLASS path below if quack can't be imported.
-            _quack_ok = False
-            if int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) > 0:
-                try:
-                    from quack.gemm_interface import (  # pylint: disable=import-outside-toplevel
-                        gemm_dgated,
-                    )
-
-                    _quack_ok = True
-                except Exception:  # pylint: disable=broad-except  # noqa: BLE001
-                    _quack_ok = False  # quack unavailable -> use CUTLASS path
-
-            if _quack_ok:
-                # cu_seqlens_m: [G+1] int32 cumsum of per-expert token counts, built EXACTLY like the
-                # forward's QuACK call (forward_fused_moe.py:282-283). split_sizes is the saved int64
-                # per-expert count tensor.
-                cu_seqlens_m = torch.nn.functional.pad(
-                    split_sizes.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
-                )
-                # B = W2 in quack's grouped layout (E, K=H, N=I). My per-expert FC2 weight is [d=H, I];
-                # _get_fc2_weight_2d returns a contiguous [G*H, I] (per-expert [H,I] stacked), so the
-                # (E,H,I) view IS the public B operand (mirrors the bench's randn(E,H,I)-contiguous; the
-                # bench's permute(1,2,0).permute(2,0,1) round-trips to (E,H,I)). Contiguous => N=I is
-                # unit-stride, which the kernel requires (never the expert/L dim).
-                w2_ehi = self._get_fc2_weight_2d(
-                    fc2_op, num_groups, fc2_weight_shape, dtype
-                ).view(num_groups, d, I)
-                # A = dO [M, H], must be K(=H)-major (last dim unit-stride) for varlen_m.
-                dO = grad_output.contiguous()
-                # PreAct LAYOUT: gemm_dgated reads PreAct as ELEMENT-INTERLEAVED [g0,u0,g1,u1,...] (the
-                # SM100 epilogue recasts adjacent bf16 pairs as gate/up; quack's own forward stores h
-                # interleaved by default -- sonicmoe/functional/__init__.py:414). My saved h is
-                # CONCATENATED [gate(I)||up(I)], so I MUST interleave it here (and de-interleave dY1 after).
-                h_gate = h[:, :I]
-                h_up = h[:, I:]
-                h_interleaved = torch.stack((h_gate, h_up), dim=2).reshape(M, two_i).contiguous()
-                prob_f32 = (
-                    maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
-                    if scales is not None
-                    else None
-                )
-                dx_out = torch.empty(M, two_i, dtype=dtype, device=device)  # interleaved dgate/dup
-                a_prime = torch.empty(M, I, dtype=dtype, device=device)     # recomputed swiglu(h)
-                # A_idx = identity gather (grouped layout already token-sorted; rows map 1:1).
-                A_idx = torch.arange(M, dtype=torch.int32, device=device)
-                _, _, ds = gemm_dgated(
-                    dO,
-                    w2_ehi,
-                    PreAct=h_interleaved,
-                    activation="swiglu",
-                    dx_out=dx_out,
-                    postact_out=a_prime,
-                    colvec_scale=prob_f32,
-                    colvec_reduce=True,
-                    cu_seqlens_m=cu_seqlens_m,
-                    A_idx=A_idx,
-                    dynamic_scheduler=False,
-                )
-                # dx_out is interleaved [dg0,du0,...]; convert back to CONCATENATED [dgate(I)||dup(I)]
-                # so the existing downstream (FC1 backward expects [gate||up]) is unchanged.
-                dx_il = dx_out.reshape(M, I, 2)
-                dY1 = torch.cat((dx_il[:, :, 0], dx_il[:, :, 1]), dim=1)
-                dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-                if need_dprob and ds is not None:
-                    # ds = colvec_reduce = <swiglu(h), dA> per token (fp32) == dprob.
-                    grad_scales = ds.reshape(-1).to(dtype=dtype)
-            else:
-                # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
-                # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
-                tile_m = 256
-                num_tiles = (M + tile_m - 1) // tile_m
-                m_tile_expert = torch.repeat_interleave(
-                    torch.arange(num_groups, device=device, dtype=torch.int32),
-                    torch.div(split_sizes, tile_m, rounding_mode="floor"),
-                    output_size=num_tiles,
-                )
-                w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
-                prob_f32 = (
-                    maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
-                    if scales is not None
-                    else None
-                )
-                # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
-                dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
-                dY1 = tex.te_cutlass_grouped_dswiglu(
-                    grad_output.contiguous(),  # dY2 [M, d]
-                    w2_2d,                     # W2  [G*d, I]
-                    h,                         # saved SwiGLU input [M, 2I]
-                    m_tile_expert,
-                    prob_f32,
-                    num_groups,  # G
-                    0,           # Me (unused in varlen-M mode)
-                    I,
-                    d,
-                    M,           # M_varlen
-                    0,           # math_sm_count (auto)
-                    dprob,
-                )
-                dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-                if dprob is not None:
-                    grad_scales = dprob.to(dtype=dtype)
+            # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
+            # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
+            tile_m = 256
+            num_tiles = (M + tile_m - 1) // tile_m
+            m_tile_expert = torch.repeat_interleave(
+                torch.arange(num_groups, device=device, dtype=torch.int32),
+                torch.div(split_sizes, tile_m, rounding_mode="floor"),
+                output_size=num_tiles,
+            )
+            w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
+            prob_f32 = (
+                maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
+                if scales is not None
+                else None
+            )
+            # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
+            dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
+            dY1 = tex.te_cutlass_grouped_dswiglu(
+                grad_output.contiguous(),  # dY2 [M, d]
+                w2_2d,                     # W2  [G*d, I]
+                h,                         # saved SwiGLU input [M, 2I]
+                m_tile_expert,
+                prob_f32,
+                num_groups,  # G
+                0,           # Me (unused in varlen-M mode)
+                I,
+                d,
+                M,           # M_varlen
+                0,           # math_sm_count (auto)
+                dprob,
+            )
+            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
+            if dprob is not None:
+                grad_scales = dprob.to(dtype=dtype)
         else:
             # ---- FALLBACK: materialize dA, use saved-or-recomputed h, per-op dswiglu + dprob ----
             dA = torch.empty(M, I, dtype=dtype, device=device)
