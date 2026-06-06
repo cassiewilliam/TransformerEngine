@@ -94,11 +94,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         on ``fuse_grouped_mlp_ops`` to only feed it GLU triples).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        # NVTE_USE_QUACK_SONIC_MOE implies FUSED_MOE: either flag enables the op.
-        if (
-            int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0
-            and int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) <= 0
-        ):
+        # F group is gated by NVTE_USE_FUSED_MOE (single canonical flag).
+        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
             return False
         if get_device_compute_capability()[0] != 10:
             return False
@@ -274,10 +271,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # The single kernel call: replaces up-GroupedLinear(d->2I) + SwiGLU
         # (+ optional router-prob mul). Returns A: bf16 [M, I].
         # math_sm_count=0 => kernel auto-detects (qa test passes 0).
-        if (
-            int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) > 0
-            or int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) > 0
-        ):
+        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) > 0:
             # QuACK gemm_gated branch (fastest fused up-proj+SwiGLU; ~1.6x the CUTLASS kernel E2E).
             # concat_layout=("B",) consumes the SAME plain [G*2I,d] weights as the CUTLASS path -- no
             # re-interleave, so NO Muon/checkpoint impact and NO perf loss (verified: 1340 vs 1348 TF,

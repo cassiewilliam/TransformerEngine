@@ -1065,8 +1065,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const int blackwell_sm = transformer_engine::cuda::sm_arch(current_device);
   const bool is_blackwell = (blackwell_sm >= 100 && blackwell_sm < 110);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
-  const bool use_sonic_moe = transformer_engine::getenv<bool>("NVTE_USE_FUSED_MOE", false) ||
-                             transformer_engine::getenv<bool>("NVTE_USE_QUACK_SONIC_MOE", false);
+  const bool use_sonic_moe = transformer_engine::getenv<bool>("NVTE_USE_FUSED_MOE", false);
   const bool use_cutlass_base = use_cutlass || use_sonic_moe;
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);

@@ -75,11 +75,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         to per-op bf16 grouped GEMM, which is always available on SM100).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        # NVTE_USE_QUACK_SONIC_MOE implies FUSED_MOE: either flag enables the op.
-        if (
-            int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0
-            and int(os.environ.get("NVTE_USE_QUACK_SONIC_MOE", "0")) <= 0
-        ):
+        # F group is gated by NVTE_USE_FUSED_MOE (single canonical flag).
+        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
             return False
         if get_device_compute_capability()[0] != 10:
             return False

@@ -657,7 +657,7 @@ at::Tensor te_cutlass_grouped_swiglu(at::Tensor x, at::Tensor w1,
   return A;
 }
 
-// SonicMoE F2 (NVTE_USE_QUACK_SONIC_MOE): fused-MoE DOWN-projection (FC2) grouped GEMM. Thin
+// SonicMoE F2 (NVTE_USE_FUSED_MOE): fused-MoE DOWN-projection (FC2) grouped GEMM. Thin
 // marshalling — torch tensors -> raw ptrs + dtype -> the SM100 CUTLASS C-API cutlass_grouped_down
 // (common/gemm). Plain per-expert grouped GEMM Y[M,N] = A[M,K] @ W2[G*N,K]^T (NO activation). For the
 // MoE down: A = the up-proj output [M, I] (K = I), W2 = the FC2 weight [G*H, I] (N = H = d), Y = [M, H].

@@ -178,7 +178,7 @@ at::Tensor te_cutlass_grouped_dswiglu(at::Tensor x, at::Tensor w1, at::Tensor dg
                                       int64_t math_sm_count,
                                       std::optional<at::Tensor> dprob = std::nullopt);
 
-// SonicMoE F2 (NVTE_USE_QUACK_SONIC_MOE): fused-MoE down-projection (FC2) grouped GEMM, SM100 /
+// SonicMoE F2 (NVTE_USE_FUSED_MOE): fused-MoE down-projection (FC2) grouped GEMM, SM100 /
 // bf16|fp16.  Y[M, N] = A[M, K] @ W2[G*N, K]^T  per expert (plain grouped GEMM, NO activation).
 // For the MoE down-proj: a = up-proj output [M, I] (K = I), w2 = FC2 weight [G*H, I] (N = H = d),
 // returns Y: [M, H]. m_tile_expert (optional, int32 [ceil(M/256)]): the SAME varlen-M expert table
