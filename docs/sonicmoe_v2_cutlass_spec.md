@@ -97,11 +97,13 @@ gu 维 stride=I 跳 gate→up），box 一次 co-load gate+up tile 进新 smem b
   V2 的 co-load + swizzle + **float2 向量化读**（gate/up 相邻）才是关键差异，有翻盘机会，需实测
 - rebuild：`/data1/min.yang/te_build/build/cmake` → `rm CMakeFiles/.../cutlass_grouped_gemm_dswiglu.cu.o && ninja libtransformer_engine.so && cp 到 te_build/`（~10min/轮）
 - 验证：每轮 e2e DROP-IN（`te_fused_moe_e2e_test.py --correctness`，5 梯度 n_fail=0）+ moe_cg_real perf（GPU4 warmup30 avg100）
-- gate：`NVTE_DSWIGLU_V2` env，A/B V1 vs V2
 - 目标判据：Fuse MoE(V2) < 1.133ms（打过 separate 路）才算赢
+- **注**：此 spec 描述的 V2 retune 路线后被实测证伪（5D-TMA / V2a 两条路皆慢于 V1），
+  本仓已删 V2 scaffold 与 `NVTE_DSWIGLU_V2` / `NVTE_FUSE_MOE_DSWIGLU` 等历史 A/B gate。
+  F 走 QuACK `gemm_gated` (fwd) + CUTLASS B2 `te_cutlass_grouped_dswiglu` (bwd) 单一路径。
 
 ---
 
 ## 6. 已 bank
 - OPT1（commit 9dcc7653）：dswiglu epilogue hoist per-row 常量，DROP-IN PASS，1.343ms < 原 Fuse MoE 1.355（hook 已达成，但非最优）
-- env gate `NVTE_FUSE_MOE_DSWIGLU`（commit 4b7065a8）：B2 on/off A/B
+- ~~env gate `NVTE_FUSE_MOE_DSWIGLU`（commit 4b7065a8）：B2 on/off A/B~~  *已废弃：调试 knob，commit 705f28aa 后 F 永远走 B2，flag 移除。*

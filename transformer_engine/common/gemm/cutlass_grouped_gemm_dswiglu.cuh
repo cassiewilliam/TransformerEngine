@@ -37,7 +37,6 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cstdlib>  // std::getenv (V2 NVTE_DSWIGLU_V2 gate in LaunchDSwiGluGrouped)
 #include <type_traits>
 
 // cute/tensor.hpp MUST come first: it pulls cute/atom/copy_atom.hpp (defines Copy_Atom) before
