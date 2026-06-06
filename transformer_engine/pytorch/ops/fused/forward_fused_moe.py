@@ -270,56 +270,99 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # The single kernel call: replaces up-GroupedLinear(d->2I) + SwiGLU
         # (+ optional router-prob mul). Returns A: bf16 [M, I].
         # math_sm_count=0 => kernel auto-detects (qa test passes 0).
-        A = self.grouped_swiglu_kernel()(
-            x,
-            w1,
-            m_tile_expert,
-            prob,
-            G,
-            Me,
-            I,
-            d,
-            M_varlen,
-            0,
-        )
-        # VERIFY: kernel returns A in bf16 [M, I]; confirm on B200.
+        if int(os.environ.get("NVTE_USE_QUACK_GATED", "0")) > 0:
+            # QuACK gemm_gated branch (fastest fused up-proj+SwiGLU; ~1.6x the CUTLASS kernel E2E).
+            # concat_layout=("B",) consumes the SAME plain [G*2I,d] weights as the CUTLASS path -- no
+            # re-interleave, so NO Muon/checkpoint impact and NO perf loss (verified: 1340 vs 1348 TF,
+            # mean_rel 8e-4). Handles ragged tokens via cu_seqlens (no 256-pad requirement). See
+            # docs/swiglu_v2_quack_analysis_v2.html. gemm_gated has no per-token prob param, so the
+            # router-gate multiply (applied INSIDE the CUTLASS kernel) is done here post-hoc.
+            from quack.gemm_interface import gemm_gated  # local import: optional QuACK dependency
+
+            cu_seqlens_m = torch.nn.functional.pad(
+                split_sizes.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
+            )  # [G+1] per-expert m-offsets, on-device (no host sync)
+            # w1 [G*2I,d] row-major == [E,2I,d]; -> B=[E,d,2I] (K=d contiguous, expert blocks
+            # contiguous) which is exactly what gemm_gated + concat_layout=("B",) wants.
+            B_gated = w1.view(num_groups, two_i, d).permute(0, 2, 1)
+            A = torch.empty(M, I, dtype=dtype, device=device)
+            gemm_gated(
+                x,
+                B_gated,
+                activation="swiglu",
+                cu_seqlens_m=cu_seqlens_m,
+                postact_out=A,
+                store_preact=False,
+                concat_layout=("B",),
+            )
+            if prob is not None:
+                A = A * prob.view(-1, 1).to(A.dtype)
+        else:
+            A = self.grouped_swiglu_kernel()(
+                x,
+                w1,
+                m_tile_expert,
+                prob,
+                G,
+                Me,
+                I,
+                d,
+                M_varlen,
+                0,
+            )
+        # VERIFY: A is bf16 [M, I]; confirm on B200.
         A = A.view(M, I)
 
-        # --- FC2 (down-proj): plain bf16 grouped GEMM -------------------------
-        # NOT the CUTLASS kernel. We reuse general_grouped_gemm_for_grouped_tensor
-        # (the same primitive GroupedLinear's bf16 graph-safe forward uses, see
-        # grouped_linear.py:1244) with layout="TN": out = A @ W2^T per expert.
-        w2 = self._get_fc2_weight(fc2_op, num_groups, fc2_weight_shape, dtype, device)
+        # --- FC2 (down-proj) --------------------------------------------------
+        # H = fc2 out_features (= model dim d); I = fc2 in_features (the ffn half, == K for the kernel).
+        H = fc2_weight_shape[0]
+        if int(os.environ.get("NVTE_USE_SONIC_DOWN_KERNEL", "0")) > 0:
+            # SonicMoE CUTLASS down-proj kernel (NVTE_USE_SONIC_DOWN_KERNEL): a dedicated SM100 2-SM
+            # tcgen05 grouped GEMM Y[M,H] = A[M,I] @ W2[G*H,I]^T per expert (~726 TFLOP/s). REUSES the
+            # SAME TileM=256 m_tile_expert table built above for the up-proj (both kernels m-tile by
+            # 256) -- no separate table. w2_2d is the FC2 weight as a contiguous [G*H, I] bf16 tensor,
+            # mirroring _get_fc1_weight_2d. Replaces the general_grouped_gemm_for_grouped_tensor down
+            # path below. Gated OFF by default (env flag); see docs / cutlass_grouped_gemm_down_v2.cuh.
+            w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
+            # te_cutlass_grouped_down(a=A[M,I], w2=[G*H,I], m_tile_expert, G, N=H, K=I, M) -> Y[M,H].
+            fc2_out = tex.te_cutlass_grouped_down(A, w2_2d, m_tile_expert, num_groups, H, I, M)
+            out = fc2_out.view(M, H)
+        else:
+            # Plain bf16 grouped GEMM (default). NOT the CUTLASS kernel. We reuse
+            # general_grouped_gemm_for_grouped_tensor (the same primitive GroupedLinear's bf16
+            # graph-safe forward uses, see grouped_linear.py:1244) with layout="TN": out = A @ W2^T
+            # per expert.
+            w2 = self._get_fc2_weight(fc2_op, num_groups, fc2_weight_shape, dtype, device)
 
-        grouped_A = GroupedTensor(
-            shape=(M, I),
-            dtype=dtype,
-            num_tensors=num_groups,
-            quantizer=None,
-            data=A.reshape(-1),
-            first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * I,
-        )
-        fc2_out = torch.empty(M, fc2_weight_shape[0], dtype=dtype, device=device)
-        grouped_fc2_out = GroupedTensor(
-            shape=(M, fc2_weight_shape[0]),
-            dtype=dtype,
-            num_tensors=num_groups,
-            quantizer=None,
-            data=fc2_out.reshape(-1),
-            first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * fc2_weight_shape[0],
-        )
-        general_grouped_gemm_for_grouped_tensor(
-            w2,
-            grouped_A,
-            grouped_fc2_out,
-            layout="TN",
-            use_split_accumulator=_2X_ACC_FPROP,
-        )
+            grouped_A = GroupedTensor(
+                shape=(M, I),
+                dtype=dtype,
+                num_tensors=num_groups,
+                quantizer=None,
+                data=A.reshape(-1),
+                first_dims=split_sizes,
+                tensor_offsets=base_split_offsets * I,
+            )
+            fc2_out = torch.empty(M, H, dtype=dtype, device=device)
+            grouped_fc2_out = GroupedTensor(
+                shape=(M, H),
+                dtype=dtype,
+                num_tensors=num_groups,
+                quantizer=None,
+                data=fc2_out.reshape(-1),
+                first_dims=split_sizes,
+                tensor_offsets=base_split_offsets * H,
+            )
+            general_grouped_gemm_for_grouped_tensor(
+                w2,
+                grouped_A,
+                grouped_fc2_out,
+                layout="TN",
+                use_split_accumulator=_2X_ACC_FPROP,
+            )
 
-        # Reshape output to the original leading dims (ref forward_grouped_mlp.py:439).
-        out = fc2_out.view(M, fc2_weight_shape[0])
+            # Reshape output to the original leading dims (ref forward_grouped_mlp.py:439).
+            out = fc2_out.view(M, H)
 
         # --- SAVE h (Design B: backward fuses dA=dY@W2 + dswiglu reading saved h) -----------
         # The reference (backward_grouped_mlp.py) reads the SAVED SwiGLU input h=[gate||up] in the
@@ -476,6 +519,44 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         gt = _make_grouped(weight_data)
         self._fc2_w_cache = (key, gt)
         return gt
+
+    def _get_fc2_weight_2d(
+        self,
+        fc2_op: GroupedLinear,
+        num_groups: int,
+        fc2_weight_shape: tuple[int, int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return FC2 weight as a contiguous bf16 [G*H, I] tensor for the CUTLASS down kernel.
+
+        Mirrors ``_get_fc1_weight_2d`` (which returns [G*2I, d]). The CUTLASS down kernel
+        ``cutlass_grouped_down`` wants ONE contiguous [G*N, K] = [G*H, I] buffer (per-expert
+        [H, I] = [out_features, in_features] blocks stacked over experts), used as the B operand
+        (Y = A @ W2^T). ``fc2_weight_shape`` is (out_features=H, in_features=I).
+        """
+        out_features, in_features = fc2_weight_shape  # (H, I)
+        if fc2_op.single_grouped_weight:
+            # ALIGNED with _get_fc1_weight_2d / the reference: the packed [G, H, I] buffer is reused
+            # as a VIEW -> [G*H, I]. No copy (the buffer is already contiguous).
+            if not isinstance(fc2_op.weight, GroupedTensor):
+                raise RuntimeError(
+                    "FC2 expected GroupedTensor weight with single_grouped_weight=True."
+                )
+            w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
+            return w.view(num_groups * out_features, in_features)
+        # Per-expert params: the kernel needs ONE contiguous [G*H, I] buffer, so we stack. CACHE the
+        # stack keyed on the source weights' (id, _version): weights are constant across micro-batches,
+        # so the copy only re-runs when the optimizer updates them in-place (bumps _version). Separate
+        # cache from _get_fc2_weight (that one returns a GroupedTensor; this returns a raw 2D tensor).
+        weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+        key = tuple((id(w), w._version) for w in weight_params)
+        cache = getattr(self, "_fc2_w2d_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        stacked = torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
+        self._fc2_w2d_cache = (key, stacked)
+        return stacked
 
     @staticmethod
     def _save_backward_ctx(
