@@ -14,7 +14,7 @@
  *   CollectiveBuilder grouped GEMM ~2.1x on the up-proj (1141 vs ~550 TFLOP/s). The generic builder
  *   is tile-insensitive at K=512 (~699 TFLOP/s); this custom deep-pipeline kernel should beat it.
  *
- * HOW IT DIFFERS FROM V2 (cutlass_grouped_gemm_swiglu_v2.cuh) — the exact strip-down:
+ * HOW IT DIFFERS FROM V1 (cutlass_grouped_gemm_swiglu.cuh) — the exact strip-down:
  *   1. NO interleave / NO 5D descriptor. W_e is a plain [N,K] block; ONE plain 2D TMA (the SAME
  *      machinery V1 uses for ONE of its two W tiles) into ONE smem buffer. Dropped:
  *      make_w1_gran8_5d_desc, GLU_G, v2_gate_acc_col / v2_up_acc_col, swiglu_pair.
@@ -54,7 +54,7 @@ namespace grouped_gemm_down {
 using namespace cute;
 
 // ============================================================================================
-// DownGemmConfigV2 — mirror of SwiGluConfigV2 (cutlass_grouped_gemm_swiglu_v2.cuh:106-188) with:
+// DownGemmConfigV2 — derived from the V1 SwiGluConfig (cutlass_grouped_gemm_swiglu.cuh) with:
 //   * kMmaN = TileN  (NOT 2*TileN): single output, single GEMM, single acc.   <<DOWN
 //   * NO GLU_G / kGluGran / kInterleaveN.                                       <<DOWN
 //   * LayoutW = ColumnMajor (K-contiguous weights, == V1 LayoutW1).
@@ -533,7 +533,7 @@ struct Sm100DownGemmKernelV2 {
 };
 
 // ============================================================================================
-// LaunchDownGemmGroupedV2 — mirror of LaunchSwiGluGroupedV2 (swiglu_v2.cuh:617-722) MINUS the
+// LaunchDownGemmGroupedV2 — derived from V1 LaunchSwiGluGrouped (cutlass_grouped_gemm_swiglu.cuh) MINUS the
 // SwiGLU-only args (W is plain [G*N,K], NO interleave; NO gather, NO prob).  Same occupancy launch.
 //   X   : [M, K]   row-major (expert e owns a contiguous, TileM-aligned row range)
 //   W   : [G*N, K] row-major (expert e: rows [e*N, (e+1)*N); used Tᵀ as the B operand)
