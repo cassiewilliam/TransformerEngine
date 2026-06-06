@@ -37,6 +37,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include <cstdlib>  // std::getenv (V2 NVTE_DSWIGLU_V2 gate in LaunchDSwiGluGrouped)
 #include <type_traits>
 
 // cute/tensor.hpp MUST come first: it pulls cute/atom/copy_atom.hpp (defines Copy_Atom) before
@@ -93,7 +94,7 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<ProblemShapeType>;
 //                          tile N+1 overlaps the epilogue of tile N; 1 = single-buffer serialized handoff
 //                          = the old behavior). Tunable; the per-tile buffer alternation is implemented.
 template <typename Element_ /*bf16/fp16*/, typename ElementOut_ /*bf16/fp16*/, int TileM_ = 256,
-          int TileN_ = 64, int TileK_ = 16, int kStages_ = 16, int ClusterM_ = 2,
+          int TileN_ = 64, int TileK_ = 16, int kStages_ = 8, int ClusterM_ = 2,
           int MinBlocks_ = 1, int AccStages_ = 2>
 struct DSwiGluConfig {
   static_assert(ClusterM_ == 1 || ClusterM_ == 2, "ClusterM_ must be 1 (1-SM) or 2 (2-SM)");
@@ -161,6 +162,8 @@ struct DSwiGluConfig {
   // so MMA(tile N+1) overlaps epilogue(tile N); AccStages_==1
   // collapses to the single-buffer serialized handoff. The per-tile buffer alternation is in operator().
   static constexpr int kAccStages = AccStages_;
+
+  static constexpr int kHStages = 2;  // h co-load pipeline depth (TMA fill(N+1) || epi read(N))
 
   // CollectiveMma used purely as a type-provider (TiledMma / SmemLayout / fragments / TMA atoms /
   // TransactionBytes), exactly like FMHA reuses CollectiveBuilder for CollectiveMmaQK/PV.
@@ -244,6 +247,21 @@ struct DSwiGluConfig {
                         cute::make_layout(cute::make_shape(int(0), int(0)),
                                           cute::make_stride(int(0), cute::_1{}))),
       SmemLayoutA{}));
+
+  // ---- V2 h-CO-LOAD (TMA fill of the saved SwiGLU input h into smem, read in the epilogue) -------
+  // gu-INNER (unit-stride) so gate/up are adjacent bf16 in smem -> one 32b LDS. (P4 layout wins.)
+  using SmemLayoutH = decltype(cute::make_layout(
+      cute::make_shape(cute::Int<kEpiTileM_cfg>{}, cute::Int<kEpiTileN_cfg>{}, cute::_2{}),
+      cute::make_stride(cute::Int<kEpiTileN_cfg * 2>{}, cute::_1{}, cute::Int<kEpiTileN_cfg>{})));
+  // gmem h[M,2I] viewed as (N=I, gu=2, M): UNIT-stride on the I-col mode (the TMA box's contiguous dim),
+  // gu strided by I (gate->up hop), M strided by 2I. Box = product_each(shape(SmemLayoutH)) reordered to
+  // match -> see E10 host build. Placeholder extents (real ones from the host tensor).
+  using TMA_H = decltype(make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementOut const*>(nullptr)),
+                        cute::make_layout(cute::make_shape(int(0), int(0), cute::_2{}),
+                                          cute::make_stride(int(0), cute::_1{}, int(0)))),
+      SmemLayoutH{}));
 };
 
 // ============================================================================================
@@ -275,6 +293,14 @@ struct Sm100DSwiGluKernel {
   using SmemLayoutA =
       typename Config::SmemLayoutA;  // sA staging-tile smem layout (kEpiTileM,kEpiTileN)
   static constexpr int Stages = Config::Stages;
+
+  // ---- V2 h-CO-LOAD typedefs ----
+  using SmemLayoutH = typename Config::SmemLayoutH;
+  using TMA_H = typename Config::TMA_H;
+  static constexpr int kHStages = Config::kHStages;
+  // TMA-producer -> 128-thread epilogue-consumer. NOT PipelineTmaUmmaAsync (that edge is TMA->UMMA);
+  // SM90 PipelineTmaAsync is the only one taking an explicit num_consumers warpgroup count.
+  using PipelineH = cutlass::PipelineTmaAsync<kHStages>;
 
   using ArchTag = cutlass::arch::Sm100;
   // TMEM allocator follows the MMA atom: 2-SM (cta_group::2) when AtomThrShapeMNK size==2, else 1-SM.
@@ -356,6 +382,8 @@ struct Sm100DSwiGluKernel {
       // second B (the forward's up-weight) is dropped (single accumulator, no gate/up split).
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutX>> smem_x;        // dY tiles  (A operand)
       cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutW2t>> smem_w2t;  // W2ᵀ tiles (B operand)
+      // V2: 2-stage co-loaded h tile (gate||up, gu-inner). cosize = kHStages*kEpiTileM*kEpiTileN*2.
+      cute::ArrayEngine<ElementOut, kHStages * kEpiTileM * kEpiTileN * 2> smem_h;
       // M2: TWO output-staging tiles for the dswiglu output dY1[M,2I] — dgate → dY1[:, :I], dup → dY1[:, I:].
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_gate;  // dgate staging (dY1[:, :I])
       cute::ArrayEngine<ElementOut, kEpiTileM * kEpiTileN> smem_out_up;    // dup   staging (dY1[:, I:])
@@ -363,6 +391,7 @@ struct Sm100DSwiGluKernel {
     struct PipelineStorage : cute::aligned_struct<16, _0> {
       alignas(16) typename PipelineLoad::SharedStorage load;
       alignas(16) typename PipelineEpi::SharedStorage epi;
+      alignas(16) typename PipelineH::SharedStorage h;  // V2 Load->Epi h pipeline
     } pipelines;
     uint32_t tmem_base_ptr;
   };
@@ -386,6 +415,8 @@ struct Sm100DSwiGluKernel {
     TMA_A tma_store_dy1;    // ONE TMA-STORE descriptor over the whole output dY1[M,2I] (row-major); each
     // tile issues TWO box-stores into it — dgate-half at box col n_tile_local, dup-half at nI_per_expert
     // + n_tile_local (the [M,2I] dgate||dup layout).  Per-tile placement is just the box coordinate.
+    TMA_H tma_load_h;       // V2 co-load desc over h[M,2I] as (I,gu=2,M)
+    bool v2_h = false;      // V2 gate: TMA-h-load+smem read. false => V1 scattered params.dGrad reads.
     ElementOut* ptr_dY1;    // [M, 2I] output (dgate || dup), row-major
     StrideA dA;             // (kept for API symmetry; the dY1 store uses the TMA descriptor)
     // ---- B2 BACKWARD-SPECIFIC INPUT --------------------------------------------------------------
@@ -497,6 +528,19 @@ struct Sm100DSwiGluKernel {
                              /*InitBarriers*/ cute::true_type{},
                              /*InitMasks*/ cute::false_type{});
 
+    // ---- V2 dedicated h-load pipeline (TMA producer = Load warp -> 128-thread epilogue consumer) ----
+    typename PipelineH::Params hp;
+    hp.role = (role == kLoad) ? PipelineH::ThreadCategory::Producer
+                              : PipelineH::ThreadCategory::Consumer;
+    hp.is_leader = (role == kLoad) && lane_predicate;   // per-CTA, no 2-SM multicast on h
+    hp.num_consumers = NumEpiThreads;                   // 128 epilogue threads release
+    hp.num_producers = 1;
+    hp.transaction_bytes = uint32_t(kEpiTileM * kEpiTileN * 2 * sizeof(ElementOut));  // 32768
+    hp.initializing_warp = 0;
+    // ClusterShape PASSED POSITIONALLY (SM90 ctor requires it); inits barriers+masks INSIDE the ctor.
+    // NO separate init_masks() call (that method does not exist on PipelineTmaAsync).
+    PipelineH pipeline_h(ss.pipelines.h, hp, ClusterShape{}, cute::true_type{}, cute::true_type{});
+
     TmemAllocator tmem_allocator{};
 
     // Make pipeline-init visible cluster-wide, then init masks (sm100 gemm kernel:682,694).
@@ -511,6 +555,9 @@ struct Sm100DSwiGluKernel {
     typename PipelineEpi::PipelineState epi_prod =
         cutlass::make_producer_start_state<PipelineEpi>();
     typename PipelineEpi::PipelineState epi_cons;
+    // V2: dedicated h-pipeline states (own producer/consumer, NOT tracking epi_*).
+    typename PipelineH::PipelineState h_prod = cutlass::make_producer_start_state<PipelineH>();
+    typename PipelineH::PipelineState h_cons;
 
     const int M = params.M, N = params.N, K = params.K;
     const int k_tile_count = K / size<2>(TileShape{});  // d / 64
@@ -587,6 +634,10 @@ struct Sm100DSwiGluKernel {
       Tensor sX = make_tensor(make_smem_ptr(ss.tensors.smem_x.begin()), SmemLayoutX{});        // dY
       Tensor sWg = make_tensor(make_smem_ptr(ss.tensors.smem_w2t.begin()), SmemLayoutW2t{});  // W2ᵀ
 
+      // V2: co-load h. gmem h[M,2I] viewed as (N=I, gu=2, M); smem tile = SmemLayoutH (gu-inner).
+      Tensor mH = params.tma_load_h.get_tma_tensor(make_shape(M, N, cute::_2{}));  // (M,I,2)
+      Tensor sH = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
+
       // CTA-in-cluster layout for tma_partition (sm100_mma_warpspecialized.hpp:521-538).
       Layout cta_layout_mnk = make_layout(ClusterShape{});
       Layout cta_layout_vmnk =
@@ -646,6 +697,36 @@ struct Sm100DSwiGluKernel {
         const int row_base = m_tile * kTileM + cta_local_row_base;
 #endif
 
+        // V2: issue THIS tile's h co-load ONCE (outside the K-loop). Producer acquires the EMPTY of
+        // stage h_prod.index() (released by the epilogue 2 tiles ago), arms expect_tx(32768), and the
+        // single 3D-box TMA fills it -> overlaps the mainloop + epilogue of the preceding tile.
+        if (params.v2_h) {
+          const int h_row_base = m_tile * kTileM + int(block_rank_in_cluster) *
+                                 (kTileM / int(size(typename TiledMma::AtomThrID{})));
+          const int h_col_base = n_tile_local * kTileN;
+          pipeline_h.producer_acquire(h_prod);                  // waits EMPTY of stage h_prod.index()
+          auto* hbar = pipeline_h.producer_get_barrier(h_prod); // arms expect_tx(32768) on this stage
+          if (cute::elect_one_sync()) {
+            Tensor gH = local_tile(mH, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}, cute::_2{}),
+                                   make_coord(h_row_base / kEpiTileM, h_col_base / kEpiTileN, 0));
+            // Stage-offset the smem tile BEFORE TMA-partitioning so the partitioned dst points at THIS
+            // h-pipeline stage's buffer (h_prod.index()); the layout (single-stage SmemLayoutH) is the
+            // exact one tma_load_h's atom was built over, so the offset only moves .data().
+            Tensor sH_stg = sH;
+            sH_stg.data() = sH.data() + h_prod.index() * (kEpiTileM * kEpiTileN * 2);
+            // TMA-PARTITION (mirror the X/W2ᵀ loads above) — but SINGLE-CTA, NO multicast: use the
+            // explicit-defaults tma_partition overload (cta_coord=Int<0>{}, cta_layout=Layout<_1,_0>{}).
+            // group_modes<0,3> folds the rank-3 (kEpiTileM,kEpiTileN,2) tile into ONE TMA-tile mode (the
+            // atom's box), exactly as group_modes<0,3>(sX)/(tCgX) do for X. Both sides are rank-1 (just
+            // the TMA mode; no leftover Rest/stage iterator), so size<0> matches and copy_unpack gets the
+            // partitioned (TMA,TMA_Iter) layout the atom's register-layout assertion expects.
+            auto [tHgH, tHsH] = tma_partition(params.tma_load_h, group_modes<0, 3>(sH_stg),
+                                              group_modes<0, 3>(gH));
+            copy(params.tma_load_h.with(*hbar), tHgH, tHsH);    // 3D box; single-CTA, no multicast
+          }
+          ++h_prod;  // ONCE per output tile (NOT per k)
+        }
+
         for (int k = 0; k < k_tile_count; ++k) {
           pipeline_load.producer_acquire(load_prod);
           auto* bar = pipeline_load.producer_get_barrier(load_prod);
@@ -700,6 +781,7 @@ struct Sm100DSwiGluKernel {
       }
       // Drain ONCE after all tiles so peer CTAs in the cluster don't exit early.
       pipeline_load.producer_tail(load_prod);
+      if (params.v2_h) pipeline_h.producer_tail(h_prod);
     }
 
     // =========================================================================================
@@ -901,6 +983,8 @@ struct Sm100DSwiGluKernel {
       // grad·silu(gate) → sUp; then TWO TMA bulk-stores → dY1[:, :I] (gate) and dY1[:, I:2I] (up).
       Tensor sGate = make_tensor(make_smem_ptr(ss.tensors.smem_out_gate.begin()), SmemLayoutA{});  // dgate
       Tensor sUp = make_tensor(make_smem_ptr(ss.tensors.smem_out_up.begin()), SmemLayoutA{});      // dup
+      // V2: epilogue-side view of the co-loaded h smem (gu-inner); per-tile .data() set after the wait.
+      Tensor sH_epi = make_tensor(make_smem_ptr(ss.tensors.smem_h.begin()), SmemLayoutH{});
       Tensor mDY1_tma = params.tma_store_dy1.get_tma_tensor(make_shape(M, 2 * N));  // (M,2I) coords
       ThrCopy thrblk_s2g = params.tma_store_dy1.get_slice(Int<0>{});
       Tensor bSG_sGate = thrblk_s2g.partition_S(sGate);  // (TMA,TMA_M,TMA_N)
@@ -943,6 +1027,14 @@ struct Sm100DSwiGluKernel {
         tAcc_dA.data() = ss.tmem_base_ptr + epi_buf;
         Tensor tTM_dA = thr_tmem_load.partition_S(tAcc_dA);  // (T2R,T2R_M,T2R_N) tmem source (dA)
         copy(tiled_tmem_load, tTM_dA, r_dA);
+
+        // V2: block until THIS tile's h has landed in smem, then point at its stage buffer (h_cons.index()
+        // — the DEDICATED h-pipeline state, NOT epi_cons). V1 (v2_h==false) leaves sH_tile untouched.
+        Tensor sH_tile = sH_epi;
+        if (params.v2_h) {
+          pipeline_h.consumer_wait(h_cons);                 // block until THIS tile's h landed
+          sH_tile.data() = sH_epi.data() + h_cons.index() * (kEpiTileM * kEpiTileN * 2);
+        }
 
 #ifdef SWIGLU_DEBUG_PRINT
         // Guard to the FIRST tile only (tile == cluster_id) so the persistent loop doesn't spam.
@@ -996,9 +1088,15 @@ struct Sm100DSwiGluKernel {
           const ElementAcc dA = r_dA(i);           // dA = dY·W2ᵀ (the FC2 dgrad, from TMEM)
           ElementAcc gate = ElementAcc(0), up = ElementAcc(0);
           if (row_ok) {
-            const int64_t hbase = hrow_base + gcol;                       // saved h[grow, gcol]
-            gate = static_cast<ElementAcc>(params.dGrad[hbase]);          // h gate-half
-            up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]); // h up-half (col I+gcol)
+            if (params.v2_h) {
+              // V2: gate/up read as two separate smem loads (N-inner smem, gu strided middle).
+              gate = static_cast<ElementAcc>(sH_tile(lrow, lcol, 0));
+              up   = static_cast<ElementAcc>(sH_tile(lrow, lcol, 1));
+            } else {
+              const int64_t hbase = hrow_base + gcol;                       // saved h[grow, gcol]
+              gate = static_cast<ElementAcc>(params.dGrad[hbase]);          // h gate-half
+              up = static_cast<ElementAcc>(params.dGrad[hbase + params.N]); // h up-half (col I+gcol)
+            }
           }
           const ElementAcc grad = dA * p;
           const ElementAcc sig = ElementAcc(1) / (ElementAcc(1) + expf(-gate));  // σ(gate)
@@ -1027,6 +1125,8 @@ struct Sm100DSwiGluKernel {
         cutlass::arch::fence_view_async_tmem_load();
         pipeline_epi.consumer_release(epi_cons);
         ++epi_cons;
+        // V2: release THIS tile's h stage (frees it for the Load warp's producer_acquire 2 tiles ahead).
+        if (params.v2_h) { pipeline_h.consumer_release(h_cons); ++h_cons; }
 
         // Make all of sGate+sUp visible across the 128 epilogue threads, AND make those generic (LSU) smem
         // writes visible to the async TMA proxy, BEFORE issuing the two TMA bulk-stores.
@@ -1105,7 +1205,7 @@ struct Sm100DSwiGluKernel {
 // The tuning params default to the DSwiGluConfig defaults, so the existing call
 // LaunchDSwiGluGrouped<Element, ElementOut>(...) resolves to the current (default-tuned) behavior.
 template <typename Element, typename ElementOut, int TileM_ = 256, int TileN_ = 64, int TileK_ = 16,
-          int kStages_ = 16, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
+          int kStages_ = 8, int ClusterM_ = 2, int MinBlocks_ = 1, int AccStages_ = 2>
 cudaError_t LaunchDSwiGluGrouped(
     const Element* X,      // [G*Me, d]  row-major  M2: dY  — incoming grad wrt FC2 output Y (A operand)
     const Element* W1,     // [G*I,  d]  row-major  M2: W2ᵀ — transposed FC2 weight, expert-in-N (B operand)
@@ -1174,6 +1274,14 @@ cudaError_t LaunchDSwiGluGrouped(
   auto tma_store_dy1 =
       make_tma_copy(cute::SM90_TMA_STORE{}, mDY1_store, typename Config::SmemLayoutA{});
 
+  // V2 h co-load descriptor: gmem h[M,2I] viewed as (N=I, gu=2, M):(1, I, 2I). UNIT-stride on the I-col
+  // mode (the TMA box's contiguous dim); gu strided by I (gate->up hop); M strided by 2I. The smem box
+  // is Config::SmemLayoutH (gu-inner). Built ONCE over the true (I,2,M) extent.
+  cute::Tensor mH_load = cute::make_tensor(
+      cute::make_gmem_ptr(dGrad),
+      cute::make_layout(cute::make_shape(M, I, cute::_2{}), cute::make_stride(2 * I, cute::_1{}, I)));
+  auto tma_load_h = make_tma_copy(cute::SM90_TMA_LOAD{}, mH_load, typename Config::SmemLayoutH{});
+
   // ---- F1 GATHER FUSION: build the gather TMA descriptor over the FULL UNPERMUTED X ------------
   // The gmem tensor is the unpermuted X viewed as a 2D [T_src, d] RowMajor tensor (K=d contiguous,
   // stride (d,1)).  make_tma_copy with SM100_TMA_LOAD_MULTICAST_2D_GATHER4 auto-detects gather: it
@@ -1201,6 +1309,8 @@ cudaError_t LaunchDSwiGluGrouped(
   params.tma_load_x = mainloop_params.tma_load_a;
   params.tma_load_w2t = mainloop_params.tma_load_b;
   params.tma_store_dy1 = tma_store_dy1;
+  params.tma_load_h = tma_load_h;                       // V2 h co-load descriptor over (I,2,M)
+  params.v2_h = (getenv("NVTE_DSWIGLU_V2") != nullptr);  // V2 gate (off => byte-identical V1 path)
   params.ptr_dY1 = dY1;
   params.dGrad = dGrad;  // [M, I] incoming grad wrt the prob-scaled SwiGLU output
   params.dA = dA;
