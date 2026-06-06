@@ -247,85 +247,42 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         need_dprob = scales is not None and activation_ctx.extra_input_requires_grad
         grad_scales = None
 
-        # B2 can be disabled via NVTE_FUSE_MOE_DSWIGLU=0 (falls back to the separate dgrad + dswiglu +
-        # swiglu-for-dprob path) -- lets us A/B the fused-dswiglu epilogue vs the per-op kernels.
-        _use_b2 = (
-            (not need_recompute)
-            and hasattr(tex, "te_cutlass_grouped_dswiglu")
-            and int(os.environ.get("NVTE_FUSE_MOE_DSWIGLU", "1")) != 0
+        h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
+
+        # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
+        # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
+        tile_m = 256
+        num_tiles = (M + tile_m - 1) // tile_m
+        m_tile_expert = torch.repeat_interleave(
+            torch.arange(num_groups, device=device, dtype=torch.int32),
+            torch.div(split_sizes, tile_m, rounding_mode="floor"),
+            output_size=num_tiles,
         )
-        if _use_b2:
-            # ---- B2: fused FC2-dgrad + dswiglu + dprob, reading the SAVED h (no materialized dA) ----
-            h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
-
-            # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
-            # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
-            tile_m = 256
-            num_tiles = (M + tile_m - 1) // tile_m
-            m_tile_expert = torch.repeat_interleave(
-                torch.arange(num_groups, device=device, dtype=torch.int32),
-                torch.div(split_sizes, tile_m, rounding_mode="floor"),
-                output_size=num_tiles,
-            )
-            w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
-            prob_f32 = (
-                maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
-                if scales is not None
-                else None
-            )
-            # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
-            dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
-            dY1 = tex.te_cutlass_grouped_dswiglu(
-                grad_output.contiguous(),  # dY2 [M, d]
-                w2_2d,                     # W2  [G*d, I]
-                h,                         # saved SwiGLU input [M, 2I]
-                m_tile_expert,
-                prob_f32,
-                num_groups,  # G
-                0,           # Me (unused in varlen-M mode)
-                I,
-                d,
-                M,           # M_varlen
-                0,           # math_sm_count (auto)
-                dprob,
-            )
-            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-            if dprob is not None:
-                grad_scales = dprob.to(dtype=dtype)
-        else:
-            # ---- FALLBACK: materialize dA, use saved-or-recomputed h, per-op dswiglu + dprob ----
-            dA = torch.empty(M, I, dtype=dtype, device=device)
-            grouped_dA = GroupedTensor(
-                shape=(M, I), dtype=dtype, num_tensors=num_groups, quantizer=None,
-                data=dA.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * I,
-            )
-            if fc2_ctx.input_requires_grad or fc1_ctx.input_requires_grad or fc1_ctx.weight_requires_grad:
-                general_grouped_gemm_for_grouped_tensor(
-                    grouped_fc2_weight, grouped_dy2, grouped_dA,
-                    layout="NN", use_split_accumulator=_2X_ACC_DGRAD,
-                )
-            if not need_recompute:
-                h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i)
-            else:
-                h = torch.empty(M, two_i, dtype=dtype, device=device)
-                grouped_h = GroupedTensor(
-                    shape=(M, two_i), dtype=dtype, num_tensors=num_groups, quantizer=None,
-                    data=h.reshape(-1), first_dims=split_sizes, tensor_offsets=base_split_offsets * two_i,
-                )
-                general_grouped_gemm_for_grouped_tensor(
-                    grouped_fc1_weight, grouped_x, grouped_h,
-                    layout="TN", use_split_accumulator=_2X_ACC_FPROP,
-                )
-            grad_swiglu_out = dA
-            if scales is not None:
-                prob = maybe_dequantize(scales, dtype).reshape(-1)
-                grad_swiglu_out = dA * prob.unsqueeze(-1)
-            dY1 = tex.dswiglu(grad_swiglu_out, h, None)
-            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-            if need_dprob:
-                swiglu_out = maybe_dequantize(tex.swiglu(h, None), dtype).reshape(M, I)
-                grad_scales = torch.linalg.vecdot(swiglu_out, dA).to(dtype=dtype)
-
+        w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
+        prob_f32 = (
+            maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
+            if scales is not None
+            else None
+        )
+        # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
+        dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
+        dY1 = tex.te_cutlass_grouped_dswiglu(
+            grad_output.contiguous(),  # dY2 [M, d]
+            w2_2d,                     # W2  [G*d, I]
+            h,                         # saved SwiGLU input [M, 2I]
+            m_tile_expert,
+            prob_f32,
+            num_groups,  # G
+            0,           # Me (unused in varlen-M mode)
+            I,
+            d,
+            M,           # M_varlen
+            0,           # math_sm_count (auto)
+            dprob,
+        )
+        dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
+        if dprob is not None:
+            grad_scales = dprob.to(dtype=dtype)
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
         #   dX      = dY1 @ W1            (layout "NN")  -> grad wrt MoE input
