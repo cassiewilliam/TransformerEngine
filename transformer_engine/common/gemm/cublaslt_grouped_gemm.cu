@@ -1081,9 +1081,14 @@ inline void execute_grouped_gemm(const GroupedGemmSetupWorkspace &setup_workspac
     const int est_n = static_cast<int>(config.out_n);
     const int est_k = static_cast<int>(config.contraction_k);
     // Tile-shape autotune knob: NVTE_SONIC_TILE_ID forces a variant (benchmark each to autotune); default 0.
-    // Measured (B200 4K-MoE, CUDA-graph fwd+bwd): tile 0 (256x256) is best for EVERY MoE GEMM shape here --
-    // 0.965ms vs tile 1 (256x128) 1.00ms (~4% slower) even at small N. So 256x256 is the autotuned optimum;
-    // the per-N heuristic was wrong. Knob + variants stay for other shapes / a future runtime autotuner.
+    // Variants (cluster + tile bundled via Sm100ScheduleSelector in cutlass_grouped_gemm.cuh):
+    //   0 = 2SM 256x256x64 cluster<2,1,1> (default; best at M-per-expert >= 256)
+    //   1 = 2SM 256x128x64 cluster<2,1,1>
+    //   3 = 1SM 128x256x64 cluster<1,1,1> (B200 small-M: per-expert M < 256; e.g. Case 7 M=96)
+    // Measured (B200 4K-MoE M=768, CUDA-graph fwd+bwd): tile 0 (256x256) is best for EVERY MoE GEMM shape
+    // there -- 0.965ms vs tile 1 (256x128) 1.00ms. But Case 7 (hidden=2048, ffn=512, MBS=4, GBS=8192,
+    // EP=8, 256 experts, topk=12) yields per-expert M=96; the 2SM cluster's effective M-tile = 512 wastes
+    // 81% of M -> CUTLASS ties cuBLAS instead of beating it. tile_id=3 (1SM 128x256) cuts M-waste to 25%.
     int tile_id = transformer_engine::getenv<int>("NVTE_SONIC_TILE_ID", -1);
     if (tile_id < 0) tile_id = 0;
     if (is_wgrad && d_dtype == transformer_engine::DType::kFloat32) {

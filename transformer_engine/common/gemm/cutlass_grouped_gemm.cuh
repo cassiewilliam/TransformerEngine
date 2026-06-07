@@ -113,45 +113,67 @@ struct GemmGivenSchedule {
 };
 
 // kSm100=false -> Hopper (SM90) Ptr-Array TMA warp-specialized Pingpong (original path).
-// kSm100=true  -> Blackwell (SM100) Ptr-Array TMA warp-specialized 1-SM schedule (tcgen05 UMMA).
-//                 Start with the 1-SM schedule (single-CTA, simplest constraints); a 2-SM/2-CTA
-//                 variant can be added later for higher throughput.
-// kTileId selects the SM100 threadblock tile (autotune knob; cluster stays 2x1x1 / 2-SM tcgen05):
-//   0 = 256x256x64 (default; best at large N), 1 = 256x128x64 (less N-tail waste at small N),
-//   2 = 256x192x64 (quack-style finer N-tile). Non-SM100 ignores kTileId (Hopper 128x128x128).
+// kSm100=true  -> Blackwell (SM100) Ptr-Array TMA warp-specialized tcgen05 UMMA. Two schedule
+//                 families are wired through Sm100ScheduleSelector:
+//   - 2SM (KernelPtrArrayTmaWarpSpecialized2SmSm100 + PtrArrayTmaWarpSpecialized2Sm, Cluster<2,1,1>)
+//     used for tile_id=0/1/2 with TileM=256. Optimal at M-per-expert >= 256 (B300/B200 4K-MoE).
+//   - 1SM (KernelPtrArrayTmaWarpSpecialized1SmSm100 + PtrArrayTmaWarpSpecialized1Sm, Cluster<1,1,1>)
+//     used for tile_id=3 with TileM=128. At per-expert M=96 (Case 7: hidden=2048, ffn=512, EP=8,
+//     MBS=4, GBS=8192, topk=12, 256 experts -> M=96), the 2SM cluster's effective M-tile = 512
+//     wastes 81% of M; the 1SM TileM=128 cuts the waste to 25%. Empirically the right pick when
+//     M_per_expert < 256.
+//
+// kTileId variants (cluster + tile bundled via Sm100ScheduleSelector):
+//   0 = 2SM 256x256x64 cluster<2,1,1>  (default; best at M>=256, large-N)
+//   1 = 2SM 256x128x64 cluster<2,1,1>  (less N-tail waste at small N)
+//   2 = 2SM 256x192x64 cluster<2,1,1>  (quack-style finer N-tile; defined only)
+//   3 = 1SM 128x256x64 cluster<1,1,1>  (B200 small-M: per-expert M < 256)
+// Non-SM100 ignores kTileId (Hopper 128x128x128).
 template <bool kSm100, int kTileId>
-struct Sm100TileShapeSelector {
-  using type = cute::Shape<cute::_256, cute::_256, cute::_64>;
+struct Sm100ScheduleSelector {
+  using TileShape = cute::Shape<cute::_256, cute::_256, cute::_64>;
+  using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
 };
 template <int kTileId>
-struct Sm100TileShapeSelector<false, kTileId> {
-  using type = cute::Shape<cute::_128, cute::_128, cute::_128>;
+struct Sm100ScheduleSelector<false, kTileId> {
+  using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
 };
 template <>
-struct Sm100TileShapeSelector<true, 1> {
-  using type = cute::Shape<cute::_256, cute::_128, cute::_64>;
+struct Sm100ScheduleSelector<true, 1> {
+  using TileShape = cute::Shape<cute::_256, cute::_128, cute::_64>;
+  using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
 };
 template <>
-struct Sm100TileShapeSelector<true, 2> {
-  using type = cute::Shape<cute::_256, cute::_192, cute::_64>;
+struct Sm100ScheduleSelector<true, 2> {
+  using TileShape = cute::Shape<cute::_256, cute::_192, cute::_64>;
+  using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+};
+// tile_id=3: B200 small-M (per-expert M < 256). 1-SM schedule, TileM=128, cluster<1,1,1>.
+template <>
+struct Sm100ScheduleSelector<true, 3> {
+  using TileShape = cute::Shape<cute::_128, cute::_256, cute::_64>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
 };
 
 template <typename DataType_, bool trans_a, bool trans_b, bool kSm100 = false, int kTileId = 0>
 struct ScheduleConfig {
   using ArchTag = std::conditional_t<kSm100, cutlass::arch::Sm100, cutlass::arch::Sm90>;
-  // SM100 FINAL (converged over it1 1-SM / it2 2-SM / it3 1-SM@large-N): 2-SM / 2-CTA tcgen05.
-  // Small-N: 2-SM ties 1-SM (~232 vs ~238 TFLOPS, noise). Large-N: 2-SM 1202 vs 1-SM 690 TFLOPS
-  // (1.74x). => 2-SM wins universally. cluster 2x1x1, tile M=256.
-  using KernelSchedule =
-      std::conditional_t<kSm100, cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100,
-                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>;
-  using EpilogueSchedule =
-      std::conditional_t<kSm100, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
-                         cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong>;
-  // it4: N-tile is now an autotune knob (kTileId) -- see Sm100TileShapeSelector.
-  using TileShape = typename Sm100TileShapeSelector<kSm100, kTileId>::type;
-  using ClusterShape = std::conditional_t<kSm100, cute::Shape<cute::_2, cute::_1, cute::_1>,
-                                          cute::Shape<cute::_1, cute::_2, cute::_1>>;
+  using Sel = Sm100ScheduleSelector<kSm100, kTileId>;
+  using KernelSchedule = typename Sel::KernelSchedule;
+  using EpilogueSchedule = typename Sel::EpilogueSchedule;
+  using TileShape = typename Sel::TileShape;
+  using ClusterShape = typename Sel::ClusterShape;
 
   using LayoutA = GroupedGemmInputALayout<trans_a>;
   using LayoutB = GroupedGemmInputBLayout<trans_b>;

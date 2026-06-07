@@ -177,11 +177,17 @@ void cutlass_grouped_gemm_device_ptrs(void **A_ptrs, void **B_ptrs, void **D_ptr
       NVTE_ERROR("Layout 'TT' is not supported by cutlass_grouped_gemm_device_ptrs.");
     }
   };
-  // Tile-id autotune knob: only SM100 has multiple tiles; non-SM100 clamps to 0. {0:256x256, 1:256x128}.
+  // Tile-id autotune knob: only SM100 has multiple tiles; non-SM100 clamps to 0.
+  //   0 = 2SM 256x256x64 cluster<2,1,1>  (default, large-M)
+  //   1 = 2SM 256x128x64 cluster<2,1,1>  (narrow-N variant)
+  //   3 = 1SM 128x256x64 cluster<1,1,1>  (B200 small-M: per-expert M < 256, e.g. Case 7 M=96)
+  // tile_id=2 (256x192) is defined but not instantiated; tile_id values not in {0,1,3} fall back to 0.
   auto dispatch_tile = [&](auto tag, auto sm100_tag) {
     constexpr bool S = decltype(sm100_tag)::value;
     if (S && tile_id == 1) {
       run(tag, sm100_tag, std::integral_constant<int, 1>{});
+    } else if (S && tile_id == 3) {
+      run(tag, sm100_tag, std::integral_constant<int, 3>{});
     } else {
       run(tag, sm100_tag, std::integral_constant<int, 0>{});
     }
