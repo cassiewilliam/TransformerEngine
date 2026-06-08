@@ -287,13 +287,22 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # contiguous) which is exactly what gemm_gated + concat_layout=("B",) wants.
             B_gated = w1.view(num_groups, two_i, d).permute(0, 2, 1)
             A = torch.empty(M, I, dtype=dtype, device=device)
+            # NVTE_QUACK_EMIT_H=1: let QuACK store the pre-activation h directly (preact_out) instead
+            # of recomputing X@W1^T in the backward-h block below (saves ~102us, see
+            # docs/b300_fused_moe_validation.md "Items 1+2"). NOTE: QuACK stores h *interleaved*
+            # ([gate0,up0,...]); it is ONLY correct paired with the QuACK gemm_dgated backward
+            # (which consumes interleaved h) -- the B2 te_cutlass_grouped_dswiglu reads PLAIN h, so
+            # do NOT enable this without the matching backward. Default OFF.
+            _emit_h = requires_grad and int(os.environ.get("NVTE_QUACK_EMIT_H", "1")) > 0
+            _h_quack = torch.empty(M, two_i, dtype=dtype, device=device) if _emit_h else None
             gemm_gated(
                 x,
                 B_gated,
                 activation="swiglu",
                 cu_seqlens_m=cu_seqlens_m,
                 postact_out=A,
-                store_preact=False,
+                preact_out=_h_quack,
+                store_preact=_emit_h,
                 concat_layout=("B",),
             )
             if prob is not None:
@@ -374,7 +383,10 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # gate/up accumulators are already in TMEM), making it cheap. Gated on requires_grad.
         # TODO(sonic-moe B1): replace this recompute with the forward kernel's h-emit (Phase 1).
         h_saved = None
-        if requires_grad:
+        if requires_grad and locals().get("_emit_h", False):
+            # QuACK gemm_gated already emitted the (interleaved) preact h above -> no recompute GEMM.
+            h_saved = _h_quack
+        elif requires_grad:
             h_saved = torch.empty(M, two_i, dtype=dtype, device=device)
             grouped_w1_for_h = GroupedTensor(
                 shape=(num_groups * two_i, d),

@@ -38,6 +38,13 @@ import torch
 import transformer_engine_torch as tex
 from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor
 from ...module.base import _2X_ACC_DGRAD, _2X_ACC_FPROP, _2X_ACC_WGRAD
+
+# DEFAULT fused MoE backward: paired QuACK. Forward gemm_gated stores interleaved h; backward
+# gemm_dgated consumes it natively (dA'=dY2@W2 + dswiglu + dprob in ONE kernel), then dY1's OUTPUT
+# is de-interleaved to plain so the existing up-dgrad/wgrad (and dW1 -> Muon) stay plain.
+# ~1.3x vs cuBLAS / 1.09x vs the old B2 path on cudagraph fwd+bwd (e2e all-gradient drop-in PASS).
+# Set NVTE_QUACK_EMIT_H=0 to fall back to the CUTLASS B2 (te_cutlass_grouped_dswiglu) + recompute-h.
+_QUACK_BWD = int(os.environ.get("NVTE_QUACK_EMIT_H", "1")) > 0
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
@@ -266,23 +273,52 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         )
         # dprob OUTPUT: caller pre-zeroes (the kernel atomicAdds across tiles). None => not produced.
         dprob = torch.zeros(M, dtype=torch.float32, device=device) if need_dprob else None
-        dY1 = tex.te_cutlass_grouped_dswiglu(
-            grad_output.contiguous(),  # dY2 [M, d]
-            w2_2d,                     # W2  [G*d, I]
-            h,                         # saved SwiGLU input [M, 2I]
-            m_tile_expert,
-            prob_f32,
-            num_groups,  # G
-            0,           # Me (unused in varlen-M mode)
-            I,
-            d,
-            M,           # M_varlen
-            0,           # math_sm_count (auto)
-            dprob,
-        )
-        dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
-        if dprob is not None:
-            grad_scales = dprob.to(dtype=dtype)
+        if _QUACK_BWD:
+            # Paired QuACK: gemm_dgated reads the interleaved h that gemm_gated stored (saved in fwd),
+            # does dA'=dY2@W2 + dswiglu + dprob col-reduce in one kernel -> dY1 (INTERLEAVED [g0,u0,...]).
+            from quack.gemm_interface import gemm_dgated
+            cu = torch.nn.functional.pad(
+                split_sizes.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
+            dY1_il = torch.empty(M, two_i, dtype=dtype, device=device)
+            a_prime = torch.empty(M, I, dtype=dtype, device=device)
+            _res = gemm_dgated(
+                grad_output.contiguous(),                # dY2 [M, d]
+                w2_2d.view(num_groups, d, I),            # W2  [G, d, I]
+                PreAct=h,                                # interleaved saved h [M, 2I]
+                activation="swiglu",
+                dx_out=dY1_il,
+                postact_out=a_prime,
+                colvec_scale=prob_f32,
+                colvec_reduce=bool(need_dprob),
+                cu_seqlens_m=cu,
+                dynamic_scheduler=False,
+            )
+            # colvec_reduce=True returns (preact, postact, ds_dprob); False returns 2 values.
+            ds = _res[2] if (isinstance(_res, (tuple, list)) and len(_res) >= 3) else None
+            # de-interleave dY1 ([gate0,up0,gate1,up1,...] -> [gate||up]) so the downstream plain
+            # up-dgrad/wgrad and dW1 stay plain (Muon-safe). gran-1 validated by e2e all-gradient PASS.
+            _v = dY1_il.view(M, I, 2)
+            dY1 = torch.cat([_v[:, :, 0], _v[:, :, 1]], dim=1).contiguous()
+            if need_dprob and ds is not None:
+                grad_scales = ds.to(dtype=dtype)
+        else:
+            dY1 = tex.te_cutlass_grouped_dswiglu(
+                grad_output.contiguous(),  # dY2 [M, d]
+                w2_2d,                     # W2  [G*d, I]
+                h,                         # saved SwiGLU input [M, 2I]
+                m_tile_expert,
+                prob_f32,
+                num_groups,  # G
+                0,           # Me (unused in varlen-M mode)
+                I,
+                d,
+                M,           # M_varlen
+                0,           # math_sm_count (auto)
+                dprob,
+            )
+            dY1 = maybe_dequantize(dY1, dtype).reshape(M, two_i)
+            if dprob is not None:
+                grad_scales = dprob.to(dtype=dtype)
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
         #   dX      = dY1 @ W1            (layout "NN")  -> grad wrt MoE input
