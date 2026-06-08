@@ -45,6 +45,16 @@ from ...module.base import _2X_ACC_DGRAD, _2X_ACC_FPROP, _2X_ACC_WGRAD
 # ~1.3x vs cuBLAS / 1.09x vs the old B2 path on cudagraph fwd+bwd (e2e all-gradient drop-in PASS).
 # Set NVTE_QUACK_EMIT_H=0 to fall back to the CUTLASS B2 (te_cutlass_grouped_dswiglu) + recompute-h.
 _QUACK_BWD = int(os.environ.get("NVTE_QUACK_EMIT_H", "1")) > 0
+# TODO(sonic-moe): before flipping NVTE_QUACK_ZEROCOPY to default-ON, validate the main_grad path
+# with a Megatron e2e (accumulate=True): te_fused_moe_e2e_test.py checks `.grad` only, so it does
+# NOT exercise the `_compute_grouped_wgrad` CUTLASS-GGT fallback (accumulate / delayed-wgrad /
+# single-grouped-weight) or its interleaved->plain de-interleave. Confirm dW1/dW2 match with
+# accumulate_into_main_grad=True, then this can become the default (it is ~1.51x vs cuBLAS /
+# 1.157x vs the Step-1 default on cudagraph fwd+bwd).
+# STEP 2 (zero-copy, experimental, default OFF): consume the INTERLEAVED dY1 directly in the
+# up-dgrad/wgrad via QuACK gemm (concat_layout=("B",)/("out",)) so the de-interleave `cat` kernel
+# (~10-30us) is dropped. Validate with te_fused_moe_e2e_test.py before making default.
+_QUACK_ZEROCOPY = _QUACK_BWD and int(os.environ.get("NVTE_QUACK_ZEROCOPY", "0")) > 0
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
@@ -295,10 +305,16 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             )
             # colvec_reduce=True returns (preact, postact, ds_dprob); False returns 2 values.
             ds = _res[2] if (isinstance(_res, (tuple, list)) and len(_res) >= 3) else None
-            # de-interleave dY1 ([gate0,up0,gate1,up1,...] -> [gate||up]) so the downstream plain
-            # up-dgrad/wgrad and dW1 stay plain (Muon-safe). gran-1 validated by e2e all-gradient PASS.
-            _v = dY1_il.view(M, I, 2)
-            dY1 = torch.cat([_v[:, :, 0], _v[:, :, 1]], dim=1).contiguous()
+            if _QUACK_ZEROCOPY:
+                # STEP 2 (zero-copy): keep dY1 INTERLEAVED; the up-dgrad and up-wgrad consume it
+                # directly via QuACK gemm (concat_layout de-interleaves -> plain dX / plain dW1).
+                # No de-interleave `cat` kernel.
+                dY1 = dY1_il
+            else:
+                # STEP 1 (default): de-interleave ([gate0,up0,...] -> [gate||up]) so the plain
+                # up-dgrad/wgrad + dW1 stay plain (Muon-safe). gran-1 validated by e2e all-gradient PASS.
+                _v = dY1_il.view(M, I, 2)
+                dY1 = torch.cat([_v[:, :, 0], _v[:, :, 1]], dim=1).contiguous()
             if need_dprob and ds is not None:
                 grad_scales = ds.to(dtype=dtype)
         else:
@@ -337,22 +353,30 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         grad_input = None
         if fc1_ctx.input_requires_grad:
             grad_input = torch.empty(M, d, dtype=dtype, device=device)
-            grouped_grad_input = GroupedTensor(
-                shape=(M, d),
-                dtype=dtype,
-                num_tensors=num_groups,
-                quantizer=None,
-                data=grad_input.reshape(-1),
-                first_dims=split_sizes,
-                tensor_offsets=base_split_offsets * d,
-            )
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc1_weight,
-                grouped_dy1,
-                grouped_grad_input,
-                layout="NN",
-                use_split_accumulator=_2X_ACC_DGRAD,
-            )
+            if _QUACK_ZEROCOPY:
+                # STEP 2 (zero-copy): up-dgrad via QuACK gemm on the INTERLEAVED dY1 (no de-interleave).
+                # concat_layout=("B",) => W1 plain/concat (gate||up), dY1 (A) interleaved.  dX = dY1 @ W1.
+                from quack.gemm_interface import gemm as _quack_gemm  # noqa
+                _w1_3d = grouped_fc1_weight.rowwise_data.view(num_groups, two_i, d)  # [G, 2I, D]
+                _quack_gemm(dY1_il, _w1_3d, out=grad_input, cu_seqlens_m=cu,
+                            concat_layout=("B",), dynamic_scheduler=False)
+            else:
+                grouped_grad_input = GroupedTensor(
+                    shape=(M, d),
+                    dtype=dtype,
+                    num_tensors=num_groups,
+                    quantizer=None,
+                    data=grad_input.reshape(-1),
+                    first_dims=split_sizes,
+                    tensor_offsets=base_split_offsets * d,
+                )
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc1_weight,
+                    grouped_dy1,
+                    grouped_grad_input,
+                    layout="NN",
+                    use_split_accumulator=_2X_ACC_DGRAD,
+                )
             grad_input = grad_input.view(out_shape[:-1] + [d])
 
         fc1_grad_params = self._compute_grouped_wgrad(
@@ -364,6 +388,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             grouped_dy=grouped_dy1,
             dtype=dtype,
             device=device,
+            dy_interleaved=_QUACK_ZEROCOPY,  # dY1 is interleaved when zero-copy -> concat_layout=("out",)
         )
 
         # Clear saved activation buffers if possible (ref backward_grouped_mlp.py:662-673).
@@ -510,6 +535,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         grouped_dy: GroupedTensor,
         dtype: torch.dtype,
         device: torch.device,
+        dy_interleaved: bool = False,
     ) -> list[Optional[torch.Tensor]]:
         """Compute bf16 wgrad and return grad_params in registration order.
 
@@ -578,6 +604,39 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         # wgrad GEMM: dW = dY^T @ X  (layout "NT", per expert).
         delay_wgrad = fc_op.wgrad_store is not None and fc_op.wgrad_store.delay_wgrad_compute()
+
+        # STEP 2 (zero-copy): QuACK gemm wgrad (~1.2-1.3x vs CUTLASS GGT). dW^T = X^T @ dY via
+        # cu_seqlens_k (ragged token reduction); written into the per-expert dW buffers through a
+        # transposed [G,in,out] view (no extra transpose). concat_layout=("out",) de-interleaves an
+        # interleaved dY (fc1) into plain dW (Muon-safe). Only the simple path (no main_grad
+        # accumulate, no delayed wgrad, multi-weight) -- else fall back to CUTLASS below (main_grad safe).
+        if _QUACK_ZEROCOPY and not accumulate and not delay_wgrad and not single and grouped_x is not None:
+            from quack.gemm_interface import gemm as _qg  # noqa
+            cu_k = torch.nn.functional.pad(
+                grouped_x.first_dims.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
+            _xrow = grouped_x.rowwise_data.view(-1, in_features)        # [M, in]
+            _dyrow = grouped_dy.rowwise_data.view(-1, out_features)     # [M, out]
+            _wbuf = torch.empty(num_groups, out_features, in_features, dtype=dtype, device=device)
+            _qg(_xrow.transpose(0, 1), _dyrow, out=_wbuf.transpose(1, 2),
+                cu_seqlens_k=cu_k, concat_layout=(("out",) if dy_interleaved else None),
+                dynamic_scheduler=False)
+            for i in range(num_groups):
+                final_weight_grads[i] = _wbuf[i]
+            return list(final_weight_grads)
+
+        # CUTLASS GGT fallback (e.g. main_grad accumulate / delayed wgrad / single-grouped weight).
+        # If zero-copy left dY INTERLEAVED but we are NOT taking the QuACK path, de-interleave to plain
+        # first (GGT expects plain) so the fallback (incl. main_grad) is correct. gran-1, matches Step 1.
+        if dy_interleaved and grouped_dy is not None:
+            _dy = grouped_dy.rowwise_data.view(-1, out_features)
+            _vv = _dy.view(-1, out_features // 2, 2)
+            _plain = torch.cat([_vv[:, :, 0], _vv[:, :, 1]], dim=1).contiguous()
+            grouped_dy = GroupedTensor(
+                shape=grouped_dy.shape, dtype=dtype, num_tensors=num_groups, quantizer=None,
+                data=_plain.reshape(-1), first_dims=grouped_dy.first_dims,
+                tensor_offsets=grouped_dy.tensor_offsets,
+            )
+
         wgrad_gemm = functools.partial(
             general_grouped_gemm_for_grouped_tensor,
             layout="NT",

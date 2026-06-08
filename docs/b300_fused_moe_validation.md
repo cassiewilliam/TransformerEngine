@@ -249,3 +249,29 @@ The QuACK matched pair is now the **default** fused-MoE path (`NVTE_USE_FUSED_MO
 | **fused — new (gemm_dgated, DEFAULT)** | **0.9728** | **477** | **1.30×** |
 
 → new default fused: **1.30× vs cuBLAS, 1.23× vs CUTLASS, 1.09× vs the old B2 fused** (−84.5 µs). A residual `cat` de-interleave kernel (~10–30 µs) remains; STEP 2 ([[Option B]]) removes it by switching up-dgrad/wgrad to QuACK `gemm` (zero-copy, `concat_layout=("out",)` → plain dW1).
+
+### Step 2 (opt-in) — zero-copy QuACK gemm for up-dgrad + wgrads (2026-06-08)
+
+Benchmark (real Case-7 ragged, empty B200): **QuACK `gemm` is 1.2–1.3× faster than the CUTLASS grouped GEMM (GGT) on every grouped GEMM**, bit-identical vs torch (`qa/quack_wgrad_bench.py`):
+
+| op | CUTLASS GGT | QuACK gemm | speedup | note |
+|---|--:|--:|--:|---|
+| FWD_DOWN | 90.6 µs | 72.0 µs | 1.26× | but dedicated `Sm100DownGemmKernelV2`=68 µs already wins → **keep Sm100Down** |
+| BWD_UP (dgrad) | 113.2 µs | 88.8 µs | 1.27× | switch to QuACK |
+| DWgrad Up (dW1) | 120.5 µs | 94.9 µs | 1.27× | switch to QuACK |
+| DWgrad Down (dW2) | 89.2 µs | 73.6 µs | 1.21× | switch to QuACK |
+
+**Integration (`NVTE_QUACK_ZEROCOPY=1`, default 0):** keep dY1 **interleaved** (no de-interleave `cat`); up-dgrad = QuACK `gemm(dY1, W1, concat_layout=("B",))`; up/down-wgrad = QuACK `gemm(x.T, dY, cu_seqlens_k, concat_layout=("out",))` → **plain dW (Muon-safe)**, written into the per-expert dW via a transposed view (no extra transpose). `_compute_grouped_wgrad` falls back to CUTLASS GGT (with a plain de-interleave) when `accumulate` (Megatron main_grad) / delayed-wgrad / single-grouped-weight — so **main_grad fusion stays correct**.
+
+**Correctness — e2e (NVTE_QUACK_ZEROCOPY=1):** all-gradient drop-in **PASS** (d_input/d_fc1_weight/d_fc2_weight/d_prob `n_fail 0`, dW1 plain max_abs 5e-5 → the interleaved-dY→plain-dW via `concat_layout=("out",)` is correct).
+
+**Perf — cudagraph fwd+bwd (same run):**
+
+| backend | ms | TFLOP/s | vs cuBLAS |
+|---|--:|--:|--:|
+| gt_cublas | 1.2579 | 369 | 1.00× |
+| cutlass_gt | 1.1930 | 389 | 1.05× |
+| fused — Step 1 (gemm_dgated, default) | 0.9660 | 480 | 1.30× |
+| **fused — Step 2 (zero-copy QuACK, opt-in)** | **0.8350** | **556** | **1.51×** |
+
+→ Step 2 is **1.157× over Step 1 (−131 µs)**, **1.51× vs cuBLAS / 1.43× vs CUTLASS**. **Default stays Step 1** (main_grad-safe, validated); Step 2 is opt-in (`NVTE_QUACK_ZEROCOPY=1`) — validated for the non-main_grad path; the accumulate/main_grad fallback de-interleave is defensive but not yet exercised by a Megatron main_grad e2e.
