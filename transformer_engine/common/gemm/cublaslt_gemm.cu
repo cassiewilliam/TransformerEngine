@@ -1058,6 +1058,12 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
   const int current_device = transformer_engine::cuda::current_device();
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
+  // B300 (Blackwell Ultra) reports CC 10.3 (sm_arch 103), not 100 — accept the whole Blackwell
+  // CC 10.x family so NVTE_USE_CUTLASS_GROUPED_GEMM actually dispatches CUTLASS on B300. The
+  // sm_103a cubin is built and the inner launchers gate on sm_major==10; an exact `== 100` here
+  // silently fell back to cuBLAS on B300.
+  const int blackwell_sm = transformer_engine::cuda::sm_arch(current_device);
+  const bool is_blackwell = (blackwell_sm >= 100 && blackwell_sm < 110);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
@@ -1067,8 +1073,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                              workspace, accumulate, use_split_accumulator, math_sm_count, stream);
   };
 
-  // Currently only support cutlass group gemm on Hopper Arch
-  if (!(is_hopper && use_cutlass)) {
+  // CUTLASS grouped GEMM: Hopper (SM90) fwd + wgrad; Blackwell (SM100) fwd (tcgen05 Ptr-Array).
+  if (!((is_hopper || is_blackwell) && use_cutlass)) {
     cublas_path();
     return;
   }
@@ -1159,8 +1165,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       all_groups_uniform_k128(B, transb)) {
     cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
                          current_device, math_sm_count, stream);
-  } else if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_bf16_wgrad_dtype() && !transa &&
-             transb && grad && is_bf16_wgrad_shape()) {
+  } else if ((is_hopper || is_blackwell) && is_empty_arr(bias) && is_empty_arr(pre_gelu_out) &&
+             is_bf16_wgrad_dtype() && !transa && transb && grad && is_bf16_wgrad_shape()) {
     // Dedicated K-grouped (ragged-K) BF16-in / (FP32 or BF16)-out wgrad path:
     // D_i = B_i.T @ A_i, K_i = routed-token dim. Shape eligibility is guarded above, so
     // unsupported shapes fall back to cuBLAS rather than hard-erroring in the kernel.

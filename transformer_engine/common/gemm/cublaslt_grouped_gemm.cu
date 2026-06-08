@@ -22,7 +22,9 @@
 #include "../util/logging.h"
 #include "../util/vectorized_pointwise.h"
 #include "./config.h"
+#include "common/util/system.h"
 
+// SonicMoE: on-device CUTLASS grouped GEMM (defined in cutlass_grouped_gemm.cu). Lets execute_grouped_gemm
 namespace {
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {
@@ -442,10 +444,17 @@ struct GroupedGemmConfig {
   int64_t avg_m = 0;
   int64_t avg_n = 0;
   int64_t avg_k = 0;
+  // CUTLASS-dispatch host estimate (separate from the cuBLAS avg_* hints above, which the caller may
+  // override with the token avg). out_m/out_n are the REAL per-expert output dims (always from outputD);
+  // contraction_k is the REAL reduction (= the ragged token dim for the NT wgrad). These size the grouped
+  // scheduler's grid + pick the wgrad N-tile WITHOUT a per-call D2H read of the on-device setup dims.
+  int64_t out_m = 0;
+  int64_t out_n = 0;
+  int64_t contraction_k = 0;
   int sm_count = 0;
 };
 
-constexpr int kMaxGroups = 64;
+constexpr int kMaxGroups = 256;
 // Arguments for the grouped GEMM kernel that operates on multiple output tensors.
 struct MultiTensorGroupGemmOutputArgs {
   void *data_ptrs[kMaxGroups];
@@ -1636,6 +1645,11 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
   gemm_config.avg_n = config_.avg_n.value_or(compute_avg_last_dim(outputD));
   gemm_config.avg_k =
       config_.avg_k.value_or(transa ? compute_avg_first_dim(inputA) : compute_avg_last_dim(inputA));
+  // CUTLASS host estimate (never the caller's avg_* override): the REAL per-expert output dims, and the
+  // true reduction -- the ragged token dim (inputA's first dim) for the NT wgrad, else avg_k.
+  gemm_config.out_m = compute_avg_first_dim(outputD);
+  gemm_config.out_n = compute_avg_last_dim(outputD);
+  gemm_config.contraction_k = (!transa && transb) ? compute_avg_first_dim(inputA) : gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, outputD->dtype(), num_tensors,
                        gemm_config, workspace.cublas_workspace_ptr, stream);
@@ -1786,6 +1800,12 @@ void nvte_grouped_gemm_with_discrete_inputA(const NVTETensor *A_list, size_t num
   gemm_config.avg_n =
       config_.avg_n.value_or(transb ? compute_avg_first_dim(inputB) : compute_avg_last_dim(inputB));
   gemm_config.avg_k = config_.avg_k.value_or(transa ? avg_first_dim : avg_last_dim);
+  // CUTLASS host estimate: output is grouped here, so the real dims come from outputD. (inputA is discrete
+  // here; this path is not the NT wgrad -- that is nvte_grouped_gemm_with_discrete_out -- so avg_k suffices
+  // for contraction_k.)
+  gemm_config.out_m = compute_avg_first_dim(outputD);
+  gemm_config.out_n = compute_avg_last_dim(outputD);
+  gemm_config.contraction_k = gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, outputD->dtype(), num_tensors,
                        gemm_config, workspace.cublas_workspace_ptr, stream);
@@ -1874,6 +1894,12 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
       config_.avg_n.value_or(transb ? compute_avg_first_dim(inputB) : compute_avg_last_dim(inputB));
   gemm_config.avg_k =
       config_.avg_k.value_or(transa ? compute_avg_first_dim(inputA) : compute_avg_last_dim(inputA));
+  // CUTLASS host estimate: the output is DISCRETE here (avg_m/avg_n above are input-derived = the token
+  // avg, not the output dims), so read the real per-expert output M,N from D_list[0]'s shape. The NT wgrad
+  // reduction is the ragged token dim (inputA's first dim).
+  gemm_config.out_m = static_cast<int64_t>(d0->data.shape[0]);
+  gemm_config.out_n = static_cast<int64_t>(d0->data.shape[1]);
+  gemm_config.contraction_k = (!transa && transb) ? compute_avg_first_dim(inputA) : gemm_config.avg_k;
   gemm_config.sm_count = config_.sm_count;
   execute_grouped_gemm(workspace.setup_workspace, A_sel, B_sel, d_dtype, num_tensors, gemm_config,
                        workspace.cublas_workspace_ptr, stream);
