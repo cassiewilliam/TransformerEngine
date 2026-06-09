@@ -46,7 +46,6 @@ from ..basic import GroupedLinear
 from ..fuser import register_backward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
-    fused_moe_tuning_enabled,
     is_glu_activation,
     maybe_dequantize,
     validate_grouped_mlp_dims,
@@ -245,8 +244,9 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # that the forward gemm_gated stored. dY1 stays INTERLEAVED ([gate0,up0,...]) and is consumed
         # directly by the QuACK up-dgrad/wgrad below (concat_layout de-interleaves -> plain dX/dW1).
         from quack.gemm_interface import gemm as quack_gemm, gemm_dgated
-        cu = torch.nn.functional.pad(
-            split_sizes.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
+        # Reuse the prefix-sum computed once in the forward (compute_moe_offsets) and restored from
+        # ctx as base_split_offsets [G+1] int64 -- cast to int32 cu_seqlens, NO cumsum recompute.
+        cu = base_split_offsets.to(torch.int32)
         dY1 = torch.empty(M, two_i, dtype=dtype, device=device)   # INTERLEAVED [gate0,up0,...]
         a_prime = torch.empty(M, I, dtype=dtype, device=device)
         _res = gemm_dgated(
@@ -260,7 +260,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             colvec_reduce=bool(need_dprob),
             cu_seqlens_m=cu,
             dynamic_scheduler=False,
-            tuned=fused_moe_tuning_enabled(),  # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF)
+            tuned=True,  # default tuning
         )
         # colvec_reduce=True returns (preact, postact, ds_dprob); False returns 2 values.
         ds = _res[2] if (isinstance(_res, (tuple, list)) and len(_res) >= 3) else None
@@ -312,7 +312,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             grad_input = torch.empty(M, d, dtype=dtype, device=device)
             _w1_3d = grouped_fc1_weight.rowwise_data.view(num_groups, two_i, d)  # [G, 2I, D]
             quack_gemm(dY1, _w1_3d, out=grad_input, cu_seqlens_m=cu,
-                       concat_layout=("B",), dynamic_scheduler=False, tuned=fused_moe_tuning_enabled())
+                       concat_layout=("B",), dynamic_scheduler=False, tuned=True)
             grad_input = grad_input.view(out_shape[:-1] + [d])
 
         fc1_grad_params = self._compute_grouped_wgrad(
@@ -544,15 +544,17 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         if grouped_x is None:
             raise RuntimeError("Fused MoE backward: grouped_x is required for wgrad")
         from quack.gemm_interface import gemm_tuned  # noqa
-        cu_k = torch.nn.functional.pad(
-            grouped_x.first_dims.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
+        from quack.moe_offsets import compute_moe_offsets  # pylint: disable=import-outside-toplevel
+
+        # Fused QuACK Triton prefix-sum (one kernel) instead of pad(cumsum()) (DeviceScan + pad).
+        cu_k = compute_moe_offsets(grouped_x.first_dims)[0]
         xT = grouped_x.rowwise_data.view(-1, in_features).transpose(0, 1)  # [in, M] (M=K, varlen)
         dyrow = grouped_dy.rowwise_data.view(-1, out_features)             # [M, out]
         concat = ("out",) if dy_interleaved else None
 
         # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF): OFF -> gemm_tuned.fn(config=None) bypasses the
         # autotuner (default_config, no precompile workers); ON -> gemm_tuned() autotunes for best config.
-        _wgrad_fn = gemm_tuned if fused_moe_tuning_enabled() else functools.partial(gemm_tuned.fn, config=None)
+        _wgrad_fn = gemm_tuned  # default tuning (autotuned wgrad)
 
         def _wgrad_into(dst_g3, accum):
             # dst_g3: [G, out, in]. QuACK writes dW^T into the [G, in, out] transposed view.

@@ -43,7 +43,6 @@ from ..basic import GroupedLinear
 from ..fuser import register_forward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
-    fused_moe_tuning_enabled,
     is_glu_activation,
     maybe_dequantize,
     validate_grouped_mlp_dims,
@@ -220,7 +219,13 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         # base_split_offsets[i] = start row of expert i, base_split_offsets[-1]=M.
-        base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
+        # Fused QuACK Triton kernel computes the prefix-sum ONCE as both cu_seqlens (int32, for the
+        # grouped-GEMM) and base_split_offsets (int64, for GroupedTensor offsets) -- replaces the
+        # separate tex.splits_to_offsets + pad(cumsum()) (CUB DeviceScan + pad + cast). base offsets
+        # are saved to ctx and reused (cast) in the backward instead of recomputing the cumsum.
+        from quack.moe_offsets import compute_moe_offsets  # pylint: disable=import-outside-toplevel
+
+        cu_seqlens_m, base_split_offsets = compute_moe_offsets(split_sizes)
 
         # Extract per-row activation probabilities from the SwiGLU op's extra
         # input (ref forward_grouped_mlp.py:208 -> prob_tensor:337). This is the
@@ -259,13 +264,17 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # required -- the QuACK gemm_dgated backward consumes it directly (no X@W1^T recompute, no B2).
         from quack.gemm_interface import gemm as quack_gemm, gemm_gated  # QuACK is the sole backend
 
-        cu_seqlens_m = torch.nn.functional.pad(
-            split_sizes.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
-        )  # [G+1] per-expert m-offsets, on-device (no host sync)
+        # cu_seqlens_m ([G+1] int32 per-expert m-offsets) was computed above by compute_moe_offsets
+        # together with base_split_offsets (same prefix-sum) -- no separate cumsum/pad here.
         # w1 [G*2I,d] row-major == [E,2I,d] -> B=[E,d,2I] (K=d contiguous) for gemm_gated concat_layout=("B",).
         B_gated = w1.view(num_groups, two_i, d).permute(0, 2, 1)
         A = torch.empty(M, I, dtype=dtype, device=device)
         h_saved = torch.empty(M, two_i, dtype=dtype, device=device) if requires_grad else None
+        # Fuse the per-token router-prob multiply into the gemm_gated epilogue via colvec_scale
+        # (fp32, mirrors the backward gemm_dgated) -- post-activation, equivalent to mcore's
+        # `act(x) * permuted_probs`, and eliminates the separate ~269us `A = A * prob` kernel.
+        # colvec_scale scales only the postact A; preact_out (h_saved) stays the raw gate||up.
+        prob_colvec = prob.reshape(-1).to(torch.float32) if prob is not None else None
         gemm_gated(
             x,
             B_gated,
@@ -275,10 +284,9 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             preact_out=h_saved,
             store_preact=requires_grad,
             concat_layout=("B",),
-            tuned=fused_moe_tuning_enabled(),  # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF)
+            tuned=True,  # default tuning (QuACK autotuner picks best config; per-CTA>=128 filter keeps it correct)
+            colvec_scale=prob_colvec,
         )
-        if prob is not None:
-            A = A * prob.view(-1, 1).to(A.dtype)
         A = A.view(M, I)
 
         # --- FC2 (down-proj) --------------------------------------------------
@@ -292,7 +300,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # WRONG output on ragged (non-256-aligned) varlen-M (mcore's capacity dispatch); dynamic handles
         # ragged correctly. The MoE expert GEMM runs eager (outside the attn/router cudagraph scope).
         quack_gemm(A, B_down, out=out, cu_seqlens_m=cu_seqlens_m, dynamic_scheduler=True,
-                   tuned=fused_moe_tuning_enabled())
+                   tuned=True)
         out = out.view(M, H)
 
         # h (interleaved [gate0,up0,...] pre-activation) was already stored by gemm_gated above when
@@ -504,13 +512,19 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         # ---- FC1 GroupedLinear ctx (bf16 grouped-tensor backward) ----
         # grouped_x for FC1 wgrad is the FC1 input (x).
-        # TODO(Alan): this caches the GATHERED x (X̃, [M=TK, d]) -- ~K× larger than SonicMoE's
-        # compact X ([T, d]). With A' no longer cached (§ down-proj), X̃ + H are the two remaining
-        # O(TKd) activation caches; SonicMoE instead caches compact X and TMA-gather4's it on the
-        # fly inside the dW1 varlen-K GEMM, closing a ~K× gap (e.g. 2GB -> 256MB/layer on Qwen3-235B).
+        # TODO(Alan): this caches the EXPANDED, per-local-expert-permuted x (X̃), shape [M, d] where
+        # M = tokens_per_expert.sum() = this rank's total (token, local-expert) assignments. A token
+        # routed to n LOCAL experts occupies n rows. Note M is PER-RANK, not global T*K: M == T*K only
+        # at EP=1 (all E experts local); under EP>1 a token's K experts spread across ranks so the
+        # per-rank dup factor ~= K*E_local/E << K. (DeepEP dedups the *network* send -- one copy per
+        # dest rank, num_tokens_per_rank; the per-local-expert expansion is the LOCAL permute that
+        # builds this buffer, post-dispatch / pre-FC1-GEMM, fused into the HybridEP dispatch kernel.)
+        # With A' no longer cached (down-proj), X̃ + H are the two remaining O(M*d)/O(M*2I) activation
+        # caches. SonicMoE instead keeps the compact received tokens and TMA-gather4's them on the fly
+        # inside the dW1 varlen-K GEMM, avoiding materializing this expanded X̃ (~K× at EP=1).
         # NOT fixable in this fused op: it receives the already-permuted tokens from mcore's
-        # dispatcher (gather happens upstream). Closing it needs dispatcher/kernel-level gather
-        # fusion -- pass compact X + routing map in and gather in the dW1 kernel.
+        # dispatcher (gather/expand happens upstream). Closing it needs dispatcher/kernel-level gather
+        # fusion -- pass the compact tokens + routing map in and gather/expand in the dW1 kernel.
         grouped_fc1_x = None
         if weight_requires_grad:
             grouped_fc1_x = GroupedTensor(
