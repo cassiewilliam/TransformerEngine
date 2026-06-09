@@ -43,6 +43,7 @@ from ..basic import GroupedLinear
 from ..fuser import register_forward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
+    fused_moe_tuning_enabled,
     is_glu_activation,
     maybe_dequantize,
     validate_grouped_mlp_dims,
@@ -92,14 +93,14 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         """Whether this fused operation is supported on the current system.
 
         Mirrors the reference ``is_supported`` (forward_grouped_mlp.py:90-105)
-        but swaps the env flag to ``NVTE_USE_FUSED_MOE`` and probes the CUTLASS
+        but swaps the env flag to ``NVTE_USE_BF16_FUSED_MOE`` and probes the CUTLASS
         binding instead of the cuDNN-FE wrappers. SwiGLU-ness of the activation
         is validated per-instance in ``__init__`` (the reference likewise relies
         on ``fuse_grouped_mlp_ops`` to only feed it GLU triples).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        # F group is gated by NVTE_USE_FUSED_MOE (single canonical flag).
-        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
+        # F group is gated by NVTE_USE_BF16_FUSED_MOE (single canonical flag).
+        if int(os.environ.get("NVTE_USE_BF16_FUSED_MOE", "0")) <= 0:
             return False
         if get_device_compute_capability()[0] != 10:
             return False
@@ -226,40 +227,16 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # per-token router gate. The CUTLASS kernel applies A[m,:] *= prob[m].
         scales = basic_op_extra_inputs[1][0]
 
-        # --- 256-alignment contract -------------------------------------------
-        # The CUTLASS kernel m-tiles in blocks of 256 rows and requires each
-        # expert's token count to be a multiple of 256 (uniform-M when
-        # m_tile_expert=None, or per-tile expert ids for varlen-M). The SonicMoE
-        # dispatcher upstream usually pads tokens to 256 (token-rounding). For
-        # this first version we FAIL LOUDLY on ragged counts rather than
-        # silently mis-handling them.
-        #
-        # TODO(sonic-moe): general path -- pad each expert's tokens up to a
-        # multiple of 256 before this kernel + FC2, then unpad (slice) the FC2
-        # output back to the original token layout. Until then the dispatcher
-        # must hand us already-padded (mod-256) per-expert counts.
-        # --- Build m_tile_expert ON-DEVICE (no host sync) --------------------
-        # ALIGNED with forward_grouped_mlp.py, which keeps the per-expert offsets
-        # on-device (split_points, ~:203) and never reads them to host. Each
-        # expert e contributes split_e//256 m-tiles, all tagged expert id e
-        # (varlen-M). repeat_interleave with output_size=ceil(M/256) does NOT
-        # sync, and it enforces 256-alignment loudly: if any split is not a
-        # multiple of 256, sum(split//256) != ceil(M/256) and it raises (no
-        # silent mis-handling). The previous version read split_sizes.tolist()
-        # (a ~21us CPU<->GPU sync) + looped on the host -- removed.
-        # TODO(sonic-moe): a Ptr-Array W1 kernel could take the per-expert
-        # offsets directly (like the reference's padded_offsets) and skip this.
-        num_tiles = (M + _CUTLASS_TILE_M - 1) // _CUTLASS_TILE_M
-        tiles_per_expert = torch.div(split_sizes, _CUTLASS_TILE_M, rounding_mode="floor")
-        m_tile_expert = torch.repeat_interleave(
-            torch.arange(num_groups, device=device, dtype=torch.int32),
-            tiles_per_expert,
-            output_size=num_tiles,
-        )
-        M_varlen = M
-        Me = 0  # unused by the kernel in varlen-M mode (m_tile_expert != None)
+        # NOTE: the QuACK gemm_gated varlen-M path below is driven purely by
+        # ``cu_seqlens_m`` (cumsum of split_sizes, built just before the call) and
+        # handles ragged, non-256-aligned per-expert token counts -- exactly what
+        # mcore's capacity-based dispatcher hands us. The old CUTLASS kernel needed
+        # an on-device ``m_tile_expert`` tag-array built from ``split//256`` with a
+        # ``repeat_interleave(output_size=ceil(M/256))`` that ASSERTED on any
+        # non-mod-256 split; that build (and its mod-256 contract) is dead under
+        # QuACK and was removed -- it was the device-side assert in real training.
 
-        # --- FC1 (up-proj) + SwiGLU via the CUTLASS kernel --------------------
+        # --- FC1 (up-proj) + SwiGLU via the QuACK gemm_gated kernel -----------
         # w1: bf16 [G*2I, d] per-expert gate||up stacked. The GroupedLinear
         # stores its weight either as a single GroupedTensor (single_grouped_weight)
         # or as per-expert weight{idx} params -- both are logically [G, 2I, d].
@@ -298,6 +275,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             preact_out=h_saved,
             store_preact=requires_grad,
             concat_layout=("B",),
+            tuned=fused_moe_tuning_enabled(),  # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF)
         )
         if prob is not None:
             A = A * prob.view(-1, 1).to(A.dtype)
@@ -310,7 +288,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
         B_down = w2_2d.view(num_groups, H, I).transpose(1, 2)  # [E,I,H] = W2^T per expert
         out = torch.empty(M, H, dtype=dtype, device=device)
-        quack_gemm(A, B_down, out=out, cu_seqlens_m=cu_seqlens_m, dynamic_scheduler=False)
+        # dynamic_scheduler=True: the static scheduler assumes tile-aligned per-expert M and produces
+        # WRONG output on ragged (non-256-aligned) varlen-M (mcore's capacity dispatch); dynamic handles
+        # ragged correctly. The MoE expert GEMM runs eager (outside the attn/router cudagraph scope).
+        quack_gemm(A, B_down, out=out, cu_seqlens_m=cu_seqlens_m, dynamic_scheduler=True,
+                   tuned=fused_moe_tuning_enabled())
         out = out.view(M, H)
 
         # h (interleaved [gate0,up0,...] pre-activation) was already stored by gemm_gated above when
@@ -335,7 +317,6 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 base_split_offsets=base_split_offsets,
                 x=x,
                 w1_input=input_,
-                A=A,
                 h_saved=h_saved,
                 scales=scales,
                 dtype=dtype,
@@ -491,7 +472,6 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         base_split_offsets: torch.Tensor,
         x: torch.Tensor,
         w1_input: torch.Tensor,
-        A: torch.Tensor,
         h_saved: Optional[torch.Tensor],
         scales: Optional[torch.Tensor],
         dtype: torch.dtype,
@@ -511,8 +491,9 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
           * SwiGLU (_ScaledGLU) -> saves (swiglu_in, scales)
             (swiglu.py:469-472); we save the FC1 up-proj output as swiglu_in.
           * FC2 GroupedLinear  -> same grouped-tensor layout
-            [split_sizes, base_split_offsets, split_points, grouped_x, *weights]
-            with grouped_x = the activation output A.
+            [split_sizes, base_split_offsets, split_points, None, *weights];
+            the grouped_x (A') slot is None -- SonicMoE recomputes A' (a_prime) in
+            the backward gemm_dgated from cached H, so the down-proj input is NOT cached.
         See backward_fused_moe.py for how these ctxs are consumed.
         """
         out_features_1, in_features_1 = fc1_weight_shape
@@ -523,6 +504,13 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         # ---- FC1 GroupedLinear ctx (bf16 grouped-tensor backward) ----
         # grouped_x for FC1 wgrad is the FC1 input (x).
+        # TODO(Alan): this caches the GATHERED x (X̃, [M=TK, d]) -- ~K× larger than SonicMoE's
+        # compact X ([T, d]). With A' no longer cached (§ down-proj), X̃ + H are the two remaining
+        # O(TKd) activation caches; SonicMoE instead caches compact X and TMA-gather4's it on the
+        # fly inside the dW1 varlen-K GEMM, closing a ~K× gap (e.g. 2GB -> 256MB/layer on Qwen3-235B).
+        # NOT fixable in this fused op: it receives the already-permuted tokens from mcore's
+        # dispatcher (gather happens upstream). Closing it needs dispatcher/kernel-level gather
+        # fusion -- pass compact X + routing map in and gather in the dW1 kernel.
         grouped_fc1_x = None
         if weight_requires_grad:
             grouped_fc1_x = GroupedTensor(
@@ -570,18 +558,14 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         activation_ctx.dtype = dtype
 
         # ---- FC2 GroupedLinear ctx (bf16 grouped-tensor backward) ----
-        # grouped_x for FC2 wgrad is the activation output A [M, I].
+        # SonicMoE design: do NOT cache the down-proj input A' [M, I] here. dW2 is computed in the
+        # backward from `a_prime` (= s*SwiGLU(h)), which the gemm_dgated recomputes from the cached
+        # pre-activation H -- so only X and H are cached and the O(TKd) A' cache is dropped. The
+        # fused backward (BackwardFusedMoE_CutlassSwiGLU_BF16) always co-occurs with this forward op
+        # (same NVTE_USE_BF16_FUSED_MOE gate), so the generic GroupedLinear backward -- the only
+        # consumer that would need a cached A -- never runs. Keep grouped_fc2_x as a None slot so the
+        # saved-tensor layout (weights at index 4:) stays stable.
         grouped_fc2_x = None
-        if weight_requires_grad:
-            grouped_fc2_x = GroupedTensor(
-                shape=(M, in_features_2),
-                dtype=dtype,
-                num_tensors=num_groups,
-                quantizer=None,
-                data=A.reshape(-1),
-                first_dims=split_sizes,
-                tensor_offsets=base_split_offsets_i64 * in_features_2,
-            )
         fc2_weight_tensors = fc2_op._get_weight_tensors()
         fc2_saved: list[Optional[torch.Tensor]] = [
             split_sizes,

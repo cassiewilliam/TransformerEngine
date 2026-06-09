@@ -46,6 +46,7 @@ from ..basic import GroupedLinear
 from ..fuser import register_backward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
+    fused_moe_tuning_enabled,
     is_glu_activation,
     maybe_dequantize,
     validate_grouped_mlp_dims,
@@ -70,13 +71,13 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         """Whether this fused backward op is supported on the current system.
 
         Mirrors the reference ``is_supported`` (backward_grouped_mlp.py:289-304)
-        but swaps the env flag to ``NVTE_USE_FUSED_MOE`` and does NOT require any
+        but swaps the env flag to ``NVTE_USE_BF16_FUSED_MOE`` and does NOT require any
         cuDNN-FE backward kernel (there is no fused backward kernel; we fall back
         to per-op bf16 grouped GEMM, which is always available on SM100).
         """
         # bf16: SonicMoE gate flag, not NVTE_CUTEDSL_FUSED_GROUPED_MLP.
-        # F group is gated by NVTE_USE_FUSED_MOE (single canonical flag).
-        if int(os.environ.get("NVTE_USE_FUSED_MOE", "0")) <= 0:
+        # F group is gated by NVTE_USE_BF16_FUSED_MOE (single canonical flag).
+        if int(os.environ.get("NVTE_USE_BF16_FUSED_MOE", "0")) <= 0:
             return False
         if get_device_compute_capability()[0] != 10:
             return False
@@ -161,14 +162,10 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # the per-token router prob.
         swiglu_in_saved, scales = activation_ctx.saved_tensors
 
-        # FC2 ctx layout: [split_sizes, base_split_offsets, split_points,
-        #                  grouped_fc2_x, *fc2_weights]; grouped_fc2_x == A.
-        fc2_saved = fc2_ctx.saved_tensors
-        grouped_fc2_x, fc2_saved = fc2_saved[3], fc2_saved[4:]
-        if fc2_op.single_grouped_weight:
-            fc2_weight = fc2_saved[0]
-        else:
-            fc2_weight = fc2_saved[:num_groups]
+        # FC2 ctx layout: [split_sizes, base_split_offsets, split_points, None, *fc2_weights].
+        # The fused backward does NOT read the ctx-saved FC2 weights: dW2's wgrad fetches them from
+        # the live fc2_op (_compute_grouped_wgrad -> _get_weight_tensors / _get_fc2_weight_2d), and
+        # the A' slot (index 3) is None (SonicMoE recomputes a_prime). So we skip reading them here.
 
         if int(split_sizes.numel()) != num_groups:
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
@@ -185,9 +182,6 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # the GEMMs directly to keep the fallback self-contained and to obtain
         # dA (needed by the SwiGLU+FC1 backward).
         # ======================================================================
-        grouped_fc2_weight = self._wrap_weight_grouped(
-            fc2_op, fc2_weight, num_groups, fc2_weight_shape, dtype, device
-        )
         grouped_dy2 = GroupedTensor(
             shape=(M, fc2_weight_shape[0]),
             dtype=dtype,
@@ -198,18 +192,9 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             tensor_offsets=base_split_offsets * fc2_weight_shape[0],
         )
 
-        # dW2 = dY2^T @ A   (NT, per expert), using saved activation output A. Independent of dA
-        # (uses A + dY2), so it runs the same in the B2-fused and fallback paths below.
-        fc2_grad_params = self._compute_grouped_wgrad(
-            fc_op=fc2_op,
-            ctx=fc2_ctx,
-            num_groups=num_groups,
-            weight_shape=fc2_weight_shape,
-            grouped_x=grouped_fc2_x,
-            grouped_dy=grouped_dy2,
-            dtype=dtype,
-            device=device,
-        )
+        # dW2 = sum_t dO_t^T @ A'_{e,t} is computed in Step 2 below, AFTER the gemm_dgated recomputes
+        # A' as `a_prime` from cached H (SonicMoE design -- no cached A'). grouped_dy2 (= dO) is built
+        # above; the wgrad runs once a_prime exists.
 
         # ======================================================================
         # Step 2: FC2 dgrad + SwiGLU backward -> dY1 [M, 2I] = dgate||dup, and dprob (router-prob grad).
@@ -246,15 +231,10 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
 
-        # m_tile_expert: per-tile expert id for varlen-M (each expert's tokens a multiple of 256),
-        # built ON-DEVICE exactly like the forward (no host sync); raises if a split isn't 256-aligned.
-        tile_m = 256
-        num_tiles = (M + tile_m - 1) // tile_m
-        m_tile_expert = torch.repeat_interleave(
-            torch.arange(num_groups, device=device, dtype=torch.int32),
-            torch.div(split_sizes, tile_m, rounding_mode="floor"),
-            output_size=num_tiles,
-        )
+        # The QuACK gemm_dgated / wgrad path below is driven by ``cu`` (cumsum of split_sizes,
+        # built just below) and handles ragged, non-256-aligned per-expert counts. The old CUTLASS
+        # ``m_tile_expert`` tag-array (split//256 + repeat_interleave(output_size=ceil(M/256))) that
+        # ASSERTED on non-mod-256 splits is dead under QuACK and was removed.
         w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
         prob_f32 = (
             maybe_dequantize(scales, torch.float32).reshape(-1).contiguous()
@@ -280,11 +260,36 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             colvec_reduce=bool(need_dprob),
             cu_seqlens_m=cu,
             dynamic_scheduler=False,
+            tuned=fused_moe_tuning_enabled(),  # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF)
         )
         # colvec_reduce=True returns (preact, postact, ds_dprob); False returns 2 values.
         ds = _res[2] if (isinstance(_res, (tuple, list)) and len(_res) >= 3) else None
         if need_dprob and ds is not None:
             grad_scales = ds.to(dtype=dtype)
+
+        # ---- dW2 = sum_t dO_t^T @ A'_{e,t}  (NT, varlen-K) ----------------------------------------
+        # SonicMoE: A' = `a_prime` (= s*SwiGLU(h)) was just recomputed by the gemm_dgated from the
+        # cached pre-activation H, so no forward A' cache is needed. a_prime equals the forward's
+        # prob-scaled activation, so this dW2 matches the previous `dO^T @ (cached A')`.
+        grouped_a_prime = GroupedTensor(
+            shape=(M, I),
+            dtype=dtype,
+            num_tensors=num_groups,
+            quantizer=None,
+            data=a_prime.reshape(-1),
+            first_dims=split_sizes,
+            tensor_offsets=base_split_offsets * I,
+        )
+        fc2_grad_params = self._compute_grouped_wgrad(
+            fc_op=fc2_op,
+            ctx=fc2_ctx,
+            num_groups=num_groups,
+            weight_shape=fc2_weight_shape,
+            grouped_x=grouped_a_prime,
+            grouped_dy=grouped_dy2,
+            dtype=dtype,
+            device=device,
+        )
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
         #   dX      = dY1 @ W1            (layout "NN")  -> grad wrt MoE input
@@ -307,7 +312,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             grad_input = torch.empty(M, d, dtype=dtype, device=device)
             _w1_3d = grouped_fc1_weight.rowwise_data.view(num_groups, two_i, d)  # [G, 2I, D]
             quack_gemm(dY1, _w1_3d, out=grad_input, cu_seqlens_m=cu,
-                       concat_layout=("B",), dynamic_scheduler=False)
+                       concat_layout=("B",), dynamic_scheduler=False, tuned=fused_moe_tuning_enabled())
             grad_input = grad_input.view(out_shape[:-1] + [d])
 
         fc1_grad_params = self._compute_grouped_wgrad(
@@ -323,12 +328,9 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         )
 
         # Clear saved activation buffers if possible (ref backward_grouped_mlp.py:662-673).
-        if grouped_fc2_x is not None and not (
-            fc2_ctx.weight_requires_grad
-            and fc2_op.wgrad_store is not None
-            and fc2_op.wgrad_store.delay_wgrad_compute()
-        ):
-            clear_tensor_data(grouped_fc2_x.rowwise_data)
+        # No FC2 activation cache to clear: SonicMoE recomputes A' (a_prime) in the gemm_dgated
+        # rather than caching it. a_prime is backward-local -- freed naturally, or held by the
+        # wgrad_store closure until the deferred dW2 runs.
         if grouped_fc1_x is not None and not (
             fc1_ctx.weight_requires_grad
             and fc1_op.wgrad_store is not None
@@ -548,15 +550,19 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         dyrow = grouped_dy.rowwise_data.view(-1, out_features)             # [M, out]
         concat = ("out",) if dy_interleaved else None
 
+        # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF): OFF -> gemm_tuned.fn(config=None) bypasses the
+        # autotuner (default_config, no precompile workers); ON -> gemm_tuned() autotunes for best config.
+        _wgrad_fn = gemm_tuned if fused_moe_tuning_enabled() else functools.partial(gemm_tuned.fn, config=None)
+
         def _wgrad_into(dst_g3, accum):
             # dst_g3: [G, out, in]. QuACK writes dW^T into the [G, in, out] transposed view.
             dstT = dst_g3.transpose(1, 2)
             if accum:
-                gemm_tuned(xT, dyrow, dstT, C=dstT, beta=1.0, cu_seqlens_k=cu_k,
-                           concat_layout=concat, dynamic_scheduler=False)
+                _wgrad_fn(xT, dyrow, dstT, C=dstT, beta=1.0, cu_seqlens_k=cu_k,
+                          concat_layout=concat, dynamic_scheduler=False)
             else:
-                gemm_tuned(xT, dyrow, dstT, cu_seqlens_k=cu_k,
-                           concat_layout=concat, dynamic_scheduler=False)
+                _wgrad_fn(xT, dyrow, dstT, cu_seqlens_k=cu_k,
+                          concat_layout=concat, dynamic_scheduler=False)
 
         def _run_wgrad():
             if single:

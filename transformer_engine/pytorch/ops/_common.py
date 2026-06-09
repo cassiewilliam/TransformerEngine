@@ -7,6 +7,7 @@
 from __future__ import annotations
 import functools
 import math
+import os
 from importlib.metadata import PackageNotFoundError, version as get_pkg_version
 from typing import Optional
 
@@ -19,6 +20,18 @@ from ..quantization import FP8GlobalStateManager
 from ..tensor.float8_tensor import Float8Tensor
 from ..quantized_tensor import QuantizedTensorStorage
 from ..utils import canonicalize_dtype
+
+
+def fused_moe_tuning_enabled() -> bool:
+    """Whether the SonicMoE QuACK fused MoE should let QuACK autotune its grouped GEMMs.
+
+    Gated by ``NVTE_USE_BF16_FUSED_MOE_TUNNING`` (default OFF). When OFF, all QuACK gemms in the
+    fused MoE run with ``tuned=False`` (default kernel config) -- no autotuner search, so NO
+    per-rank precompile subprocess workers (the extra GPU process) and NO slow first-iter
+    autotuning. When ON, QuACK autotunes for the best config (the per-CTA>=128 filter keeps it
+    correct), at the cost of a transient precompile worker + slower first iter.
+    """
+    return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_TUNNING", "0")) > 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -246,7 +259,14 @@ def validate_grouped_mlp_dims(fc1, activation_op, fc2) -> None:
             f"and FC2 (num_groups={fc2.num_groups}, in_features={fc2.in_features}, "
             f"out_features={fc2.out_features}) do not match."
         )
-    if is_glu_activation(activation_op) and activation_op.glu_interleave_size != 32:
+    # The SonicMoE BF16 QuACK fused MoE (NVTE_USE_BF16_FUSED_MOE=1) consumes PLAIN gate||up via
+    # gemm_gated(concat_layout=("B",)), so it does NOT require the 32-wide GLU interleave the MXFP8
+    # CuTe DSL kernel needs -- accept any glu_interleave_size (incl. None=plain) under that flag.
+    if (
+        is_glu_activation(activation_op)
+        and activation_op.glu_interleave_size != 32
+        and int(os.environ.get("NVTE_USE_BF16_FUSED_MOE", "0")) <= 0
+    ):
         raise ValueError(
             "Fused kernel requires 32-wide GLU interleaving, "
             f"but got glu_interleave_size={activation_op.glu_interleave_size}."

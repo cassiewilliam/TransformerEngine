@@ -42,7 +42,7 @@ from .backward_grouped_mlp import (  # pylint: disable=wrong-import-position
 
 # BF16 SonicMoE fused MoE (CUTLASS fused up-proj+SwiGLU). Like the MXFP8 grouped
 # MLP above, each submodule registers its own forward/backward fusion internally
-# (guarded by ``is_supported()`` + the ``NVTE_USE_FUSED_MOE`` env flag).
+# (guarded by ``is_supported()`` + the ``NVTE_USE_BF16_FUSED_MOE`` env flag).
 from .forward_fused_moe import (  # pylint: disable=wrong-import-position
     ForwardFusedMoE_CutlassSwiGLU_BF16,
 )
