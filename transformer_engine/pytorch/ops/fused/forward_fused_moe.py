@@ -269,7 +269,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # w1 [G*2I,d] row-major == [E,2I,d] -> B=[E,d,2I] (K=d contiguous) for gemm_gated concat_layout=("B",).
         B_gated = w1.view(num_groups, two_i, d).permute(0, 2, 1)
         A = torch.empty(M, I, dtype=dtype, device=device)
-        h_saved = torch.empty(M, two_i, dtype=dtype, device=device) if requires_grad else None
+        h_saved = torch.empty(M, two_i, dtype=dtype, device=device) if (requires_grad and int(os.environ.get("NVTE_FUSED_MOE_RECOMPUTE_H", "0")) == 0) else None
         # Fuse the per-token router-prob multiply into the gemm_gated epilogue via colvec_scale
         # (fp32, mirrors the backward gemm_dgated) -- post-activation, equivalent to mcore's
         # `act(x) * permuted_probs`, and eliminates the separate ~269us `A = A * prob` kernel.
@@ -282,7 +282,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             cu_seqlens_m=cu_seqlens_m,
             postact_out=A,
             preact_out=h_saved,
-            store_preact=requires_grad,
+            store_preact=(h_saved is not None),
             concat_layout=("B",),
             tuned=True,  # default tuning (QuACK autotuner picks best config; per-CTA>=128 filter keeps it correct)
             colvec_scale=prob_colvec,

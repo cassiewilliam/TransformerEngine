@@ -228,7 +228,18 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         need_dprob = scales is not None and activation_ctx.extra_input_requires_grad
         grad_scales = None
 
-        h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
+        if swiglu_in_saved is not None:
+            h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
+        else:
+            # NVTE_FUSED_MOE_RECOMPUTE_H: forward skipped h_saved (~20GiB/rank). Recompute h by
+            # replicating the forward gemm_gated preact from saved x@W1 -- bit-identical, +1 up gemm.
+            from quack.gemm_interface import gemm as _quack_gemm_rc
+            _w1_rc = fc1_weight if fc1_op.single_grouped_weight else torch.cat(list(fc1_weight), dim=0)
+            _B_rc = _w1_rc.view(num_groups, two_i, d).permute(0, 2, 1)
+            h = torch.empty(M, two_i, dtype=dtype, device=device)
+            _quack_gemm_rc(x, _B_rc, out=h,
+                           cu_seqlens_m=base_split_offsets.to(torch.int32),
+                           dynamic_scheduler=True, tuned=True)
 
         # The QuACK gemm_dgated / wgrad path below is driven by ``cu`` (cumsum of split_sizes,
         # built just below) and handles ragged, non-256-aligned per-expert counts. The old CUTLASS
