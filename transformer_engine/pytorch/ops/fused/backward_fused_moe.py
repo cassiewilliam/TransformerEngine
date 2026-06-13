@@ -300,6 +300,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             grouped_dy=grouped_dy2,
             dtype=dtype,
             device=device,
+            cu_seqlens_k=cu,  # reuse forward's prefix-sum (no redundant compute_moe_offsets)
         )
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
@@ -336,6 +337,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             dtype=dtype,
             device=device,
             dy_interleaved=True,  # dY1 is interleaved -> concat_layout=("out",) de-interleaves to plain dW1
+            cu_seqlens_k=cu,  # reuse forward's prefix-sum (no redundant compute_moe_offsets)
         )
 
         # Clear saved activation buffers if possible (ref backward_grouped_mlp.py:662-673).
@@ -480,6 +482,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         dtype: torch.dtype,
         device: torch.device,
         dy_interleaved: bool = False,
+        cu_seqlens_k: Optional[torch.Tensor] = None,
     ) -> list[Optional[torch.Tensor]]:
         """Compute bf16 wgrad and return grad_params in registration order.
 
@@ -555,10 +558,16 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         if grouped_x is None:
             raise RuntimeError("Fused MoE backward: grouped_x is required for wgrad")
         from quack.gemm_interface import gemm_tuned  # noqa
-        from quack.moe_offsets import compute_moe_offsets  # pylint: disable=import-outside-toplevel
 
-        # Fused QuACK Triton prefix-sum (one kernel) instead of pad(cumsum()) (DeviceScan + pad).
-        cu_k = compute_moe_offsets(grouped_x.first_dims)[0]
+        # Reuse the int32 cu_seqlens the caller already built from the ctx-saved base_split_offsets
+        # (cu_seqlens_k == prefix-sum of split_sizes == compute_moe_offsets(first_dims)[0]); only fall
+        # back to the Triton prefix-sum if a caller did not pass it. Saves 2 redundant Triton launches
+        # per backward (dW1 + dW2) -- pure CPU/launch-overhead win on the overhead-bound expert path.
+        if cu_seqlens_k is not None:
+            cu_k = cu_seqlens_k
+        else:
+            from quack.moe_offsets import compute_moe_offsets  # pylint: disable=import-outside-toplevel
+            cu_k = compute_moe_offsets(grouped_x.first_dims)[0]
         xT = grouped_x.rowwise_data.view(-1, in_features).transpose(0, 1)  # [in, M] (M=K, varlen)
         dyrow = grouped_dy.rowwise_data.view(-1, out_features)             # [M, out]
         concat = ("out",) if dy_interleaved else None
