@@ -32,9 +32,6 @@ from typing import Any, Optional
 
 import torch
 
-import transformer_engine_torch as tex
-from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor
-from ...module.base import _2X_ACC_FPROP
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
@@ -52,6 +49,11 @@ from .._common import (
 # uniform-M (m_tile_expert=None) and varlen-M m-tiling. See the 256-alignment
 # assert in ``fuser_forward``.
 _CUTLASS_TILE_M = 256
+
+
+def _del_tensor_enabled() -> bool:
+    """Whether to explicitly drop temporary tensors after QuACK launches."""
+    return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_DEL_TENSOR", "0")) > 0
 
 
 class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
@@ -288,6 +290,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             colvec_scale=prob_colvec,
         )
         A = A.view(M, I)
+        if _del_tensor_enabled():
+            del w1, B_gated
 
         # --- FC2 (down-proj) --------------------------------------------------
         # H = fc2 out_features (= model dim d); I = fc2 in_features (the ffn half, == K for the kernel).
@@ -302,6 +306,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         quack_gemm(A, B_down, out=out, cu_seqlens_m=cu_seqlens_m, dynamic_scheduler=True,
                    tuned=True)
         out = out.view(M, H)
+        if _del_tensor_enabled():
+            del A, w2_2d, B_down
 
         # h (interleaved [gate0,up0,...] pre-activation) was already stored by gemm_gated above when
         # grad is required -- the QuACK gemm_dgated backward consumes it directly (no recompute, no B2).
@@ -372,48 +378,6 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         weight_params = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
         return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
-
-    def _get_fc2_weight(
-        self,
-        fc2_op: GroupedLinear,
-        num_groups: int,
-        fc2_weight_shape: tuple[int, int],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> GroupedTensor:
-        """Return FC2 weight as a uniform bf16 GroupedTensor for grouped GEMM.
-
-        Mirrors ``GroupedLinear._get_grouped_weight_for_gemm`` /
-        ``_get_discrete_weights_for_gemm`` for the unquantized (bf16) case
-        (grouped_linear.py:791-804), producing a [G*out, in] packed buffer.
-        """
-        out_features, in_features = fc2_weight_shape
-
-        def _make_grouped(weight_data: torch.Tensor) -> GroupedTensor:
-            return GroupedTensor(
-                shape=(num_groups * out_features, in_features),
-                dtype=dtype,
-                num_tensors=num_groups,
-                shapes=[(out_features, in_features)] * num_groups,
-                quantizer=None,
-                data=weight_data,
-            )
-
-        if fc2_op.single_grouped_weight:
-            # ALIGNED with the reference: reuse the packed buffer as a view (no copy).
-            if not isinstance(fc2_op.weight, GroupedTensor):
-                raise RuntimeError(
-                    "FC2 expected GroupedTensor weight with single_grouped_weight=True."
-                )
-            w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
-            return _make_grouped(w.reshape(-1))
-        # Per-expert: stack + wrap. Keep the stack temporary for the same reason as
-        # _get_fc1_weight_2d: a persistent duplicate of every local expert weight
-        # makes the fused path use more memory than the unfused/CUTLASS grouped path.
-        weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
-        weights = [maybe_dequantize(w, dtype) for w in weight_params]
-        weight_data = torch.stack(weights, dim=0).contiguous().reshape(-1)
-        return _make_grouped(weight_data)
 
     def _get_fc2_weight_2d(
         self,

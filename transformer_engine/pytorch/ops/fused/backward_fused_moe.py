@@ -35,9 +35,6 @@ from typing import Any, Optional
 
 import torch
 
-import transformer_engine_torch as tex
-from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor
-from ...module.base import _2X_ACC_DGRAD, _2X_ACC_FPROP, _2X_ACC_WGRAD
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
@@ -53,6 +50,11 @@ from .._common import (
 
 # Mirror the forward's tile constant (kept local to avoid a forward import).
 _CUTLASS_TILE_M = 256
+
+
+def _del_tensor_enabled() -> bool:
+    """Whether to explicitly drop temporary tensors after QuACK launches."""
+    return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_DEL_TENSOR", "0")) > 0
 
 
 class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
@@ -209,10 +211,6 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # FALLBACK (h not saved, or binding absent): materialize dA via a grouped GEMM, use the saved h
         #   or recompute h = x@W1^T, then the per-op dswiglu + (optional) swiglu-for-dprob.
         # ======================================================================
-        grouped_fc1_weight = self._wrap_weight_grouped(
-            fc1_op, fc1_weight, num_groups, fc1_weight_shape, dtype, device
-        )
-
         # x / grouped_x are needed for: (a) the FC1 wgrad dW1 = dY1^T @ x (only if weight_requires_grad),
         # and (b) the recompute fallback. Build only when needed -- Design B with saved h and frozen
         # weights needs NEITHER (h saved + no wgrad).
@@ -227,6 +225,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
 
         need_dprob = scales is not None and activation_ctx.extra_input_requires_grad
         grad_scales = None
+        w1_for_b: Optional[torch.Tensor] = None
 
         if swiglu_in_saved is not None:
             h = maybe_dequantize(swiglu_in_saved, dtype).reshape(M, two_i).contiguous()
@@ -234,16 +233,16 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # NVTE_FUSED_MOE_RECOMPUTE_H: forward skipped h_saved (~20GiB/rank). Recompute h by
             # replicating the forward gemm_gated preact from saved x@W1 -- bit-identical, +1 up gemm.
             from quack.gemm_interface import gemm as _quack_gemm_rc
-            _w1_rc = (
-                fc1_weight
-                if fc1_op.single_grouped_weight
-                else torch.cat(list(fc1_weight), dim=0)
+            w1_for_b = self._get_fc1_weight_2d_from_saved(
+                fc1_op, fc1_weight, num_groups, fc1_weight_shape, dtype
             )
-            _B_rc = _w1_rc.view(num_groups, two_i, d).permute(0, 2, 1)
+            _B_rc = w1_for_b.view(num_groups, two_i, d).permute(0, 2, 1)
             h = torch.empty(M, two_i, dtype=dtype, device=device)
             _quack_gemm_rc(x, _B_rc, out=h,
                            cu_seqlens_m=base_split_offsets.to(torch.int32),
                            dynamic_scheduler=True, tuned=True)
+            if _del_tensor_enabled():
+                del _B_rc
 
         # The QuACK gemm_dgated / wgrad path below is driven by ``cu`` (cumsum of split_sizes,
         # built just below) and handles ragged, non-256-aligned per-expert counts. The old CUTLASS
@@ -277,6 +276,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             dynamic_scheduler=False,
             tuned=True,  # default tuning
         )
+        if _del_tensor_enabled():
+            del w2_2d
         # colvec_reduce=True returns (preact, postact, ds_dprob); False returns 2 values.
         ds = _res[2] if (isinstance(_res, (tuple, list)) and len(_res) >= 3) else None
         if need_dprob and ds is not None:
@@ -306,6 +307,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             device=device,
             cu_seqlens_k=cu,  # reuse forward's prefix-sum (no redundant compute_moe_offsets)
         )
+        if _del_tensor_enabled():
+            del grouped_a_prime, a_prime
         # ======================================================================
         # Step 3: FC1 backward (up-proj).  out h = x @ W1^T (TN in forward).
         #   dX      = dY1 @ W1            (layout "NN")  -> grad wrt MoE input
@@ -326,10 +329,18 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # up-dgrad via QuACK gemm on the INTERLEAVED dY1.  concat_layout=("B",) => W1 plain (gate||up),
             # dY1 (A) interleaved.  dX = dY1 @ W1  -> [M, d].
             grad_input = torch.empty(M, d, dtype=dtype, device=device)
-            _w1_3d = grouped_fc1_weight.rowwise_data.view(num_groups, two_i, d)  # [G, 2I, D]
+            if w1_for_b is None:
+                w1_for_b = self._get_fc1_weight_2d_from_saved(
+                    fc1_op, fc1_weight, num_groups, fc1_weight_shape, dtype
+                )
+            _w1_3d = w1_for_b.view(num_groups, two_i, d)  # [G, 2I, D]
             quack_gemm(dY1, _w1_3d, out=grad_input, cu_seqlens_m=cu,
                        concat_layout=("B",), dynamic_scheduler=False, tuned=True)
             grad_input = grad_input.view(out_shape[:-1] + [d])
+            if _del_tensor_enabled():
+                del _w1_3d
+        if _del_tensor_enabled() and w1_for_b is not None:
+            del w1_for_b
 
         fc1_grad_params = self._compute_grouped_wgrad(
             fc_op=fc1_op,
@@ -371,15 +382,14 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     # Helpers (bf16-only).
     # ----------------------------------------------------------------------
     @staticmethod
-    def _wrap_weight_grouped(
+    def _get_fc1_weight_2d_from_saved(
         fc_op: GroupedLinear,
         weight,
         num_groups: int,
         weight_shape: tuple[int, int],
         dtype: torch.dtype,
-        device: torch.device,
-    ) -> GroupedTensor:
-        """Return a uniform bf16 GroupedTensor [G*out, in] for grouped GEMM.
+    ) -> torch.Tensor:
+        """Return FC1 weight as a bf16 [G*out, in] tensor/view for B operands.
 
         Accepts the saved weight as either a single GroupedTensor (when
         single_grouped_weight) or a list/tuple of per-expert tensors, mirroring
@@ -387,29 +397,16 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         (grouped_linear.py:791-804).
         """
         out_features, in_features = weight_shape
-
-        def _make(weight_data: torch.Tensor) -> GroupedTensor:
-            return GroupedTensor(
-                shape=(num_groups * out_features, in_features),
-                dtype=dtype,
-                num_tensors=num_groups,
-                shapes=[(out_features, in_features)] * num_groups,
-                quantizer=None,
-                data=weight_data,
-            )
-
         if fc_op.single_grouped_weight:
-            # ALIGNED with the reference: reuse the packed buffer as a view (no copy).
             w = (
                 maybe_dequantize(weight.rowwise_data, dtype)
                 if isinstance(weight, GroupedTensor)
                 else maybe_dequantize(weight, dtype)
             )
-            return _make(w.reshape(-1))
-        # Per-expert: stack + wrap. Keep the packed buffer temporary. Caching it
-        # duplicates all local expert weights for every MoE layer and can OOM at EP4.
+            return w.view(num_groups * out_features, in_features)
+        # Per-expert: stack only when a W1 B operand is actually needed.
         weights = [maybe_dequantize(w, dtype) for w in weight]
-        return _make(torch.stack(weights, dim=0).contiguous().reshape(-1))
+        return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
 
     def _get_fc2_weight_2d(
         self,
@@ -502,7 +499,6 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         final_weight_grads: list[Optional[torch.Tensor]] = [None] if single else [None] * num_groups
         grouped_wgrad: Optional[GroupedTensor] = None
         wgrad_output: Any = None
-        grouped_shape = (num_groups, out_features, in_features)
 
         if single:
             if fc_op._accumulate_into_main_grad:
