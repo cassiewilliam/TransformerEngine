@@ -358,7 +358,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         if fc1_op.single_grouped_weight:
             # ALIGNED with the reference (forward_grouped_mlp.py:365-368): the packed
             # [G, 2I, d] buffer is reused as a VIEW -> [G*2I, d]. No copy (the buffer is
-            # already contiguous so .view() suffices; the old .contiguous() was a no-op).
+            # already contiguous so .view() suffices. If storage is SGW, we must use
+            # the view because per-expert weight{i} params do not exist.
             if not isinstance(fc1_op.weight, GroupedTensor):
                 raise RuntimeError(
                     "FC1 expected GroupedTensor weight with single_grouped_weight=True."
@@ -366,19 +367,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             w = maybe_dequantize(fc1_op.weight.rowwise_data, dtype)
             return w.view(num_groups * out_features, in_features)
         # Per-expert params: the kernel needs ONE contiguous [G*2I, d] buffer, so we
-        # stack. The reference avoids this with a device pointer array, but our kernel
-        # uses a single W1 TMA descriptor. CACHE the stack keyed on the source weights'
-        # (id, _version): weights are constant across micro-batches, so the 134MB copy
-        # only re-runs when the optimizer updates them in-place (bumps _version).
+        # stack. Keep the stack temporary. Caching it across steps/layers duplicates
+        # all local expert weights and becomes prohibitive when EP is small (e.g. EP4).
         weight_params = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
-        key = tuple((id(w), w._version) for w in weight_params)
-        cache = getattr(self, "_fc1_w_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
-        stacked = torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
-        self._fc1_w_cache = (key, stacked)
-        return stacked
+        return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
 
     def _get_fc2_weight(
         self,
@@ -414,19 +407,13 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 )
             w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
             return _make_grouped(w.reshape(-1))
-        # Per-expert: stack + wrap. CACHE the GroupedTensor keyed on the source weights'
-        # (id, _version) -- the FC2 weight GroupedTensor depends only on the weights (not
-        # the splits), so it rebuilds only when the optimizer updates them.
+        # Per-expert: stack + wrap. Keep the stack temporary for the same reason as
+        # _get_fc1_weight_2d: a persistent duplicate of every local expert weight
+        # makes the fused path use more memory than the unfused/CUTLASS grouped path.
         weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
-        key = tuple((id(w), w._version) for w in weight_params)
-        cache = getattr(self, "_fc2_w_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
         weight_data = torch.stack(weights, dim=0).contiguous().reshape(-1)
-        gt = _make_grouped(weight_data)
-        self._fc2_w_cache = (key, gt)
-        return gt
+        return _make_grouped(weight_data)
 
     def _get_fc2_weight_2d(
         self,
@@ -452,19 +439,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 )
             w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
             return w.view(num_groups * out_features, in_features)
-        # Per-expert params: the kernel needs ONE contiguous [G*H, I] buffer, so we stack. CACHE the
-        # stack keyed on the source weights' (id, _version): weights are constant across micro-batches,
-        # so the copy only re-runs when the optimizer updates them in-place (bumps _version). Separate
-        # cache from _get_fc2_weight (that one returns a GroupedTensor; this returns a raw 2D tensor).
+        # Per-expert params: the kernel needs ONE contiguous [G*H, I] buffer, so we stack. Keep this
+        # buffer temporary instead of caching a full duplicate of FC2 weights for every MoE layer.
         weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
-        key = tuple((id(w), w._version) for w in weight_params)
-        cache = getattr(self, "_fc2_w2d_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
-        stacked = torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
-        self._fc2_w2d_cache = (key, stacked)
-        return stacked
+        return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
 
     @staticmethod
     def _save_backward_ctx(

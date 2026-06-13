@@ -234,7 +234,11 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             # NVTE_FUSED_MOE_RECOMPUTE_H: forward skipped h_saved (~20GiB/rank). Recompute h by
             # replicating the forward gemm_gated preact from saved x@W1 -- bit-identical, +1 up gemm.
             from quack.gemm_interface import gemm as _quack_gemm_rc
-            _w1_rc = fc1_weight if fc1_op.single_grouped_weight else torch.cat(list(fc1_weight), dim=0)
+            _w1_rc = (
+                fc1_weight
+                if fc1_op.single_grouped_weight
+                else torch.cat(list(fc1_weight), dim=0)
+            )
             _B_rc = _w1_rc.view(num_groups, two_i, d).permute(0, 2, 1)
             h = torch.empty(M, two_i, dtype=dtype, device=device)
             _quack_gemm_rc(x, _B_rc, out=h,
@@ -402,17 +406,10 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 else maybe_dequantize(weight, dtype)
             )
             return _make(w.reshape(-1))
-        # Per-expert: stack + wrap, mirroring the forward op-wrapper fix. CACHE on
-        # fc_op (distinct for FC1 vs FC2) keyed on the source weights' (id, _version)
-        # so the stack only re-runs when the optimizer updates them.
-        key = tuple((id(w), w._version) for w in weight)
-        cache = getattr(fc_op, "_fused_moe_bwd_wcache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
+        # Per-expert: stack + wrap. Keep the packed buffer temporary. Caching it
+        # duplicates all local expert weights for every MoE layer and can OOM at EP4.
         weights = [maybe_dequantize(w, dtype) for w in weight]
-        gt = _make(torch.stack(weights, dim=0).contiguous().reshape(-1))
-        fc_op._fused_moe_bwd_wcache = (key, gt)
-        return gt
+        return _make(torch.stack(weights, dim=0).contiguous().reshape(-1))
 
     def _get_fc2_weight_2d(
         self,
@@ -435,19 +432,13 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 )
             w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
             return w.view(num_groups * out_features, in_features)
-        # Per-expert params: stack into one contiguous [G*d, I]; CACHE keyed on (id, _version) so the
-        # copy only re-runs when the optimizer updates the weights in-place.
+        # Per-expert params: stack into one contiguous [G*d, I]. Keep the stack temporary instead of
+        # retaining a full duplicate of W2 across the lifetime of the fused op.
         weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
-        key = tuple((id(w), w._version) for w in weight_params)
-        cache = getattr(self, "_fc2_w2d_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
-        stacked = (
+        return (
             torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
         )
-        self._fc2_w2d_cache = (key, stacked)
-        return stacked
 
     @staticmethod
     def _grouped_x_data(
