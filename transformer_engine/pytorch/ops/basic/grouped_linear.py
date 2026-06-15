@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Sequence
 import contextlib
 import functools
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -109,6 +110,11 @@ class GroupedLinear(BasicOperation):
     # Operation expects input split sizes (and optionally scales tensor)
     num_extra_inputs: int = 1
 
+    @staticmethod
+    def _bf16_fused_moe_sgw_enabled() -> bool:
+        """Whether the BF16 fused-MoE shared-grouped-weight optimization is enabled."""
+        return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_SGW", "0")) > 0
+
     def __init__(
         self,
         num_groups: int,
@@ -171,17 +177,36 @@ class GroupedLinear(BasicOperation):
         # We do not want to reset params later as it wipes off
         # main_grad and related attributes.
         self.weight0: torch.nn.Parameter
-        for group_idx in range(self.num_groups):
-            weight_tensor = torch.empty(
+        if (
+            not self.single_grouped_weight
+            and not self._with_quantized_weight
+            and dtype == torch.bfloat16
+            and self._bf16_fused_moe_sgw_enabled()
+        ):
+            packed_weight_tensor = torch.empty(
+                self.num_groups,
                 self.out_features,
                 self.in_features,
                 device=device,
                 dtype=dtype,
             )
-            self.register_parameter(
-                f"weight{group_idx}",
-                torch.nn.Parameter(weight_tensor),
-            )
+            for group_idx in range(self.num_groups):
+                self.register_parameter(
+                    f"weight{group_idx}",
+                    torch.nn.Parameter(packed_weight_tensor[group_idx]),
+                )
+        else:
+            for group_idx in range(self.num_groups):
+                weight_tensor = torch.empty(
+                    self.out_features,
+                    self.in_features,
+                    device=device,
+                    dtype=dtype,
+                )
+                self.register_parameter(
+                    f"weight{group_idx}",
+                    torch.nn.Parameter(weight_tensor),
+                )
 
         # Register biases
         self.bias0: Optional[torch.nn.Parameter]

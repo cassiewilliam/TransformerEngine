@@ -56,6 +56,11 @@ def _del_tensor_enabled() -> bool:
     return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_DEL_TENSOR", "0")) > 0
 
 
+def _sgw_optimization_enabled() -> bool:
+    """Whether to use QuACK pointer/list-B instead of stacking per-expert weights."""
+    return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_SGW", "0")) > 0
+
+
 def _plain_grouped_tensor_data(tensor: torch.Tensor) -> torch.Tensor:
     """Return the backing data tensor for grouped weights."""
     while isinstance(tensor, GroupedTensor):
@@ -63,6 +68,112 @@ def _plain_grouped_tensor_data(tensor: torch.Tensor) -> torch.Tensor:
         if tensor is None:
             raise RuntimeError("GroupedTensor weight does not have rowwise_data initialized.")
     return tensor
+
+
+_packed_weight_cache = {}
+
+
+def _validate_packed_weights(
+    weights: list[torch.Tensor],
+    num_groups: int,
+    weight_shape: tuple[int, int],
+) -> bool:
+    if len(weights) != num_groups or num_groups <= 0:
+        return False
+
+    out_features, in_features = weight_shape
+    expert_elems = out_features * in_features
+
+    first = _plain_grouped_tensor_data(weights[0])
+
+    if first.ndim != 2:
+        return False
+    if tuple(first.shape) != (out_features, in_features):
+        return False
+    if first.stride() != (in_features, 1):
+        return False
+
+    storage_ptr = first.untyped_storage().data_ptr()
+    base_offset = first.storage_offset()
+    dtype = first.dtype
+    device = first.device
+    stride = first.stride()
+
+    for idx, weight in enumerate(weights):
+        weight = _plain_grouped_tensor_data(weight)
+
+        if weight.ndim != 2:
+            return False
+
+        if tuple(weight.shape) != (out_features, in_features):
+            return False
+
+        if weight.dtype != dtype:
+            return False
+
+        if weight.device != device:
+            return False
+
+        if weight.stride() != stride:
+            return False
+
+        if weight.untyped_storage().data_ptr() != storage_ptr:
+            return False
+
+        expected_offset = base_offset + idx * expert_elems
+        if weight.storage_offset() != expected_offset:
+            return False
+
+    return True
+
+def _try_rebuild_packed_grouped_weight(
+    weights: list[torch.Tensor],
+    *,
+    num_groups: int,
+    weight_shape: tuple[int, int],
+) -> Optional[torch.Tensor]:
+    if len(weights) != num_groups or num_groups <= 0:
+        return None
+
+    first = _plain_grouped_tensor_data(weights[0])
+
+    if first.ndim != 2:
+        return None
+
+    storage_ptr = first.untyped_storage().data_ptr()
+    base_offset = first.storage_offset()
+
+    key = (
+        storage_ptr,
+        base_offset,
+        num_groups,
+        weight_shape,
+        first.dtype,
+        first.device,
+    )
+
+    cached = _packed_weight_cache.get(key)
+    if cached is not None:
+        return cached
+
+    out_features, in_features = weight_shape
+
+    if tuple(first.shape) != (out_features, in_features):
+        return None
+    if first.stride() != (in_features, 1):
+        return None
+
+    if not _validate_packed_weights(weights, num_groups, weight_shape):
+        return None
+
+    dense = first.as_strided(
+        size=(num_groups * out_features, in_features),
+        stride=(in_features, 1),
+        storage_offset=base_offset,
+    )
+
+    _packed_weight_cache[key] = dense
+    return dense
 
 class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     """Fused op for BF16 GroupedLinear + SwiGLU + GroupedLinear (CUTLASS).
@@ -257,7 +368,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # or as per-expert weight{idx} params -- both are logically [G, 2I, d].
         # We materialize a contiguous bf16 [G*2I, d] view for the kernel.
         x = maybe_dequantize(input_, dtype).contiguous()
-        w1 = self._get_fc1_weight_2d(fc1_op, num_groups, fc1_weight_shape, dtype)
+        w1 = self._get_fc1_weight_for_quack(fc1_op, num_groups, fc1_weight_shape, dtype)
 
         # prob: fp32 CUDA [M] per-token router gate, or None when absent.
         prob = None
@@ -277,7 +388,11 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # cu_seqlens_m ([G+1] int32 per-expert m-offsets) was computed above by compute_moe_offsets
         # together with base_split_offsets (same prefix-sum) -- no separate cumsum/pad here.
         # w1 [G*2I,d] row-major == [E,2I,d] -> B=[E,d,2I] (K=d contiguous) for gemm_gated concat_layout=("B",).
-        B_gated = w1.view(num_groups, two_i, d).permute(0, 2, 1)
+        B_gated = (
+            w1
+            if isinstance(w1, list)
+            else w1.view(num_groups, two_i, d).permute(0, 2, 1)
+        )
         A = torch.empty(M, I, dtype=dtype, device=device)
         h_saved = torch.empty(M, two_i, dtype=dtype, device=device) if (requires_grad and int(os.environ.get("NVTE_FUSED_MOE_RECOMPUTE_H", "0")) == 0) else None
         # Fuse the per-token router-prob multiply into the gemm_gated epilogue via colvec_scale
@@ -306,8 +421,12 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         # H = fc2 out_features (= model dim d); I = fc2 in_features (the ffn half, == K for the kernel).
         H = fc2_weight_shape[0]
         # FC2 down-proj via QuACK gemm: Y[M,H] = A[M,I] @ W2[G*H,I]^T per expert.  B = W2^T = [E,I,H].
-        w2_2d = self._get_fc2_weight_2d(fc2_op, num_groups, fc2_weight_shape, dtype)
-        B_down = w2_2d.view(num_groups, H, I).transpose(1, 2)  # [E,I,H] = W2^T per expert
+        w2_2d = self._get_fc2_weight_for_quack(fc2_op, num_groups, fc2_weight_shape, dtype)
+        B_down = (
+            w2_2d
+            if isinstance(w2_2d, list)
+            else w2_2d.view(num_groups, H, I).transpose(1, 2)
+        )  # [E,I,H] = W2^T per expert, or list of [I,H]
         out = torch.empty(M, H, dtype=dtype, device=device)
         # dynamic_scheduler=True: the static scheduler assumes tile-aligned per-expert M and produces
         # WRONG output on ragged (non-256-aligned) varlen-M (mcore's capacity dispatch); dynamic handles
@@ -357,17 +476,20 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     # ----------------------------------------------------------------------
     # Helpers (bf16-only; the reference inlines these with fp8 packing).
     # ----------------------------------------------------------------------
-    def _get_fc1_weight_2d(
+    def _get_fc1_weight_for_quack(
         self,
         fc1_op: GroupedLinear,
         num_groups: int,
         fc1_weight_shape: tuple[int, int],
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Return FC1 weight as a contiguous bf16 [G*2I, d] tensor.
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Return FC1 B operand source for QuACK.
 
-        gate = rows [e*2I : e*2I + I], up = rows [+I : +2I] per expert, exactly
-        the layout the CUTLASS kernel expects (qa/te_cutlass_swiglu_test.py:21-24).
+        Macro semantics:
+          * NVTE_USE_BF16_FUSED_MOE_SGW=0: stack per-expert weights into the current dense
+            grouped-B path.
+          * NVTE_USE_BF16_FUSED_MOE_SGW=1: pass a list of per-expert B views so QuACK can
+            consume pointer-array/list B without changing checkpoint weight layout.
         """
         out_features, in_features = fc1_weight_shape
         if fc1_op.single_grouped_weight:
@@ -382,26 +504,30 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             w = maybe_dequantize(_plain_grouped_tensor_data(fc1_op.weight), dtype)
             w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
-        # Per-expert params: the kernel needs ONE contiguous [G*2I, d] buffer, so we
-        # stack. Keep the stack temporary. Caching it across steps/layers duplicates
-        # all local expert weights and becomes prohibitive when EP is small (e.g. EP4).
         weight_params = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        if _sgw_optimization_enabled():
+            packed = _try_rebuild_packed_grouped_weight(
+                weights,
+                num_groups=num_groups,
+                weight_shape=fc1_weight_shape,
+            )
+            if packed is not None:
+                return packed
+
+        # Current path: stack into one dense grouped-B tensor.
         return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
 
-    def _get_fc2_weight_2d(
+    def _get_fc2_weight_for_quack(
         self,
         fc2_op: GroupedLinear,
         num_groups: int,
         fc2_weight_shape: tuple[int, int],
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Return FC2 weight as a contiguous bf16 [G*H, I] tensor for the CUTLASS down kernel.
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Return FC2 B operand source for QuACK.
 
-        Mirrors ``_get_fc1_weight_2d`` (which returns [G*2I, d]). The CUTLASS down kernel
-        ``cutlass_grouped_down`` wants ONE contiguous [G*N, K] = [G*H, I] buffer (per-expert
-        [H, I] = [out_features, in_features] blocks stacked over experts), used as the B operand
-        (Y = A @ W2^T). ``fc2_weight_shape`` is (out_features=H, in_features=I).
+        See ``_get_fc1_weight_for_quack`` for macro semantics.
         """
         out_features, in_features = fc2_weight_shape  # (H, I)
         if fc2_op.single_grouped_weight:
@@ -414,10 +540,18 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             w = maybe_dequantize(_plain_grouped_tensor_data(fc2_op.weight), dtype)
             w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
-        # Per-expert params: the kernel needs ONE contiguous [G*H, I] buffer, so we stack. Keep this
-        # buffer temporary instead of caching a full duplicate of FC2 weights for every MoE layer.
         weight_params = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
         weights = [maybe_dequantize(w, dtype) for w in weight_params]
+        if _sgw_optimization_enabled():
+            packed = _try_rebuild_packed_grouped_weight(
+                weights,
+                num_groups=num_groups,
+                weight_shape=fc2_weight_shape,
+            )
+            if packed is not None:
+                return packed
+
+        # Current path: stack into one dense grouped-B tensor.
         return torch.stack(weights, dim=0).view(num_groups * out_features, in_features).contiguous()
 
     @staticmethod

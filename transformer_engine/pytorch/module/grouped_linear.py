@@ -1240,6 +1240,11 @@ class GroupedLinear(TransformerEngineBaseModule):
     The TP communication should be handled in the dispatch and combine stages of MoE models.
     """
 
+    @staticmethod
+    def _bf16_fused_moe_sgw_enabled() -> bool:
+        """Whether the BF16 fused-MoE shared-grouped-weight optimization is enabled."""
+        return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_SGW", "0")) > 0
+
     def __init__(
         self,
         num_gemms: int,
@@ -1334,17 +1339,34 @@ class GroupedLinear(TransformerEngineBaseModule):
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
 
+        packed_weight_tensor = None
+        if (
+            not self.single_grouped_weight
+            and not self.primary_weights_in_fp8
+            and self.params_dtype == torch.bfloat16
+            and self._bf16_fused_moe_sgw_enabled()
+        ):
+            packed_weight_tensor = torch.empty(
+                self.num_gemms,
+                self.out_features,
+                self.in_features,
+                device=device,
+                dtype=self.params_dtype,
+            )
+
         for i in range(self.num_gemms):
             # Construct weight parameter
             self.register_parameter(
                 f"weight{i}",
                 torch.nn.Parameter(
-                    torch.empty(
+                    packed_weight_tensor[i]
+                    if packed_weight_tensor is not None
+                    else torch.empty(
                         self.out_features,
                         self.in_features,
                         device=device,
                         dtype=self.params_dtype,
-                    ),
+                    )
                 ),
                 init_fn=init_method,
                 get_rng_state_tracker=get_rng_state_tracker,
