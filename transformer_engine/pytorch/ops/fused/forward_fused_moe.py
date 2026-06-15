@@ -56,6 +56,14 @@ def _del_tensor_enabled() -> bool:
     return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_DEL_TENSOR", "0")) > 0
 
 
+def _plain_grouped_tensor_data(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the backing data tensor for grouped weights."""
+    while isinstance(tensor, GroupedTensor):
+        tensor = tensor.rowwise_data
+        if tensor is None:
+            raise RuntimeError("GroupedTensor weight does not have rowwise_data initialized.")
+    return tensor
+
 class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     """Fused op for BF16 GroupedLinear + SwiGLU + GroupedLinear (CUTLASS).
 
@@ -286,6 +294,7 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             preact_out=h_saved,
             store_preact=(h_saved is not None),
             concat_layout=("B",),
+            dynamic_scheduler=True,
             tuned=True,  # default tuning (QuACK autotuner picks best config; per-CTA>=128 filter keeps it correct)
             colvec_scale=prob_colvec,
         )
@@ -370,7 +379,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 raise RuntimeError(
                     "FC1 expected GroupedTensor weight with single_grouped_weight=True."
                 )
-            w = maybe_dequantize(fc1_op.weight.rowwise_data, dtype)
+            w = maybe_dequantize(_plain_grouped_tensor_data(fc1_op.weight), dtype)
+            w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
         # Per-expert params: the kernel needs ONE contiguous [G*2I, d] buffer, so we
         # stack. Keep the stack temporary. Caching it across steps/layers duplicates
@@ -401,7 +411,8 @@ class ForwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 raise RuntimeError(
                     "FC2 expected GroupedTensor weight with single_grouped_weight=True."
                 )
-            w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
+            w = maybe_dequantize(_plain_grouped_tensor_data(fc2_op.weight), dtype)
+            w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
         # Per-expert params: the kernel needs ONE contiguous [G*H, I] buffer, so we stack. Keep this
         # buffer temporary instead of caching a full duplicate of FC2 weights for every MoE layer.

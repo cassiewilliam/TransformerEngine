@@ -57,6 +57,15 @@ def _del_tensor_enabled() -> bool:
     return int(os.environ.get("NVTE_USE_BF16_FUSED_MOE_DEL_TENSOR", "0")) > 0
 
 
+def _plain_grouped_tensor_data(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the backing data tensor for grouped weights."""
+    while isinstance(tensor, GroupedTensor):
+        tensor = tensor.rowwise_data
+        if tensor is None:
+            raise RuntimeError("GroupedTensor weight does not have rowwise_data initialized.")
+    return tensor
+
+
 class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
     """Backward fused op for BF16 GroupedLinear + SwiGLU + GroupedLinear.
 
@@ -273,7 +282,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             colvec_scale=prob_f32,
             colvec_reduce=bool(need_dprob),
             cu_seqlens_m=cu,
-            dynamic_scheduler=False,
+            dynamic_scheduler=True,
             tuned=True,  # default tuning
         )
         if _del_tensor_enabled():
@@ -335,7 +344,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 )
             _w1_3d = w1_for_b.view(num_groups, two_i, d)  # [G, 2I, D]
             quack_gemm(dY1, _w1_3d, out=grad_input, cu_seqlens_m=cu,
-                       concat_layout=("B",), dynamic_scheduler=False, tuned=True)
+                       concat_layout=("B",), dynamic_scheduler=True, tuned=True)
             grad_input = grad_input.view(out_shape[:-1] + [d])
             if _del_tensor_enabled():
                 del _w1_3d
@@ -398,11 +407,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         """
         out_features, in_features = weight_shape
         if fc_op.single_grouped_weight:
-            w = (
-                maybe_dequantize(weight.rowwise_data, dtype)
-                if isinstance(weight, GroupedTensor)
-                else maybe_dequantize(weight, dtype)
-            )
+            w = maybe_dequantize(_plain_grouped_tensor_data(weight), dtype)
+            w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
         # Per-expert: stack only when a W1 B operand is actually needed.
         weights = [maybe_dequantize(w, dtype) for w in weight]
@@ -427,7 +433,8 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 raise RuntimeError(
                     "FC2 expected GroupedTensor weight with single_grouped_weight=True."
                 )
-            w = maybe_dequantize(fc2_op.weight.rowwise_data, dtype)
+            w = maybe_dequantize(_plain_grouped_tensor_data(fc2_op.weight), dtype)
+            w = _plain_grouped_tensor_data(w)
             return w.view(num_groups * out_features, in_features)
         # Per-expert params: stack into one contiguous [G*d, I]. Keep the stack temporary instead of
         # retaining a full duplicate of W2 across the lifetime of the fused op.
@@ -456,7 +463,9 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 "but the SwiGLU-input recompute requires it. This first version requires "
                 "weight grads; the future fused dH kernel will avoid the recompute."
             )
-        return maybe_dequantize(grouped_x.rowwise_data, dtype).reshape(M, in_features)
+        x = maybe_dequantize(_plain_grouped_tensor_data(grouped_x.rowwise_data), dtype)
+        x = _plain_grouped_tensor_data(x)
+        return x.reshape(M, in_features)
 
     @staticmethod
     def _compute_grouped_wgrad(
@@ -509,7 +518,7 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                 grouped_wgrad = GroupedTensor.make_grouped_tensor_from_rowwise_data(
                     num_tensors=num_groups,
                     tensor_shape=weight_shape,
-                    rowwise_data=main_grad.view(-1),
+                    rowwise_data=_plain_grouped_tensor_data(main_grad).view(-1),
                     dtype=main_grad.dtype,
                 )
                 accumulate = get_accumulate_flag_in_param(weights[0])
@@ -521,7 +530,9 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
                     device=device,
                     dtype=dtype,
                 )
-            final_weight_grads[0] = grouped_wgrad.rowwise_data.view(num_groups, *weight_shape)
+            final_weight_grads[0] = _plain_grouped_tensor_data(
+                grouped_wgrad.rowwise_data
+            ).view(num_groups, *weight_shape)
             wgrad_output = grouped_wgrad
         else:
             if fc_op._accumulate_into_main_grad:
@@ -555,8 +566,12 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
         else:
             from quack.moe_offsets import compute_moe_offsets  # pylint: disable=import-outside-toplevel
             cu_k = compute_moe_offsets(grouped_x.first_dims)[0]
-        xT = grouped_x.rowwise_data.view(-1, in_features).transpose(0, 1)  # [in, M] (M=K, varlen)
-        dyrow = grouped_dy.rowwise_data.view(-1, out_features)             # [M, out]
+        xT = _plain_grouped_tensor_data(grouped_x.rowwise_data).view(
+            -1, in_features
+        ).transpose(0, 1)  # [in, M] (M=K, varlen)
+        dyrow = _plain_grouped_tensor_data(grouped_dy.rowwise_data).view(
+            -1, out_features
+        )  # [M, out]
         concat = ("out",) if dy_interleaved else None
 
         # NVTE_USE_BF16_FUSED_MOE_TUNNING (default OFF): OFF -> gemm_tuned.fn(config=None) bypasses the
@@ -568,16 +583,20 @@ class BackwardFusedMoE_CutlassSwiGLU_BF16(FusedOperation):
             dstT = dst_g3.transpose(1, 2)
             if accum:
                 _wgrad_fn(xT, dyrow, dstT, C=dstT, beta=1.0, cu_seqlens_k=cu_k,
-                          concat_layout=concat, dynamic_scheduler=False)
+                          concat_layout=concat, dynamic_scheduler=True)
             else:
                 _wgrad_fn(xT, dyrow, dstT, cu_seqlens_k=cu_k,
-                          concat_layout=concat, dynamic_scheduler=False)
+                          concat_layout=concat, dynamic_scheduler=True)
 
         def _run_wgrad():
             if single:
                 # contiguous [G*out,in] buffer (main_grad when accumulate) -> in-place += via C=out.
-                _wgrad_into(grouped_wgrad.rowwise_data.view(num_groups, out_features, in_features),
-                            accum=accumulate)
+                _wgrad_into(
+                    _plain_grouped_tensor_data(grouped_wgrad.rowwise_data).view(
+                        num_groups, out_features, in_features
+                    ),
+                    accum=accumulate,
+                )
             else:
                 _tmp = torch.empty(num_groups, out_features, in_features, dtype=dtype, device=device)
                 _wgrad_into(_tmp, accum=False)
